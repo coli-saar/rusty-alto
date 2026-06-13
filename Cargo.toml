@@ -1,0 +1,23 @@
+[package]
+name = "rusty-alto"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+fixedbitset = "0.5"
+hashbrown = { version = "0.15", features = ["raw-entry"] }
+rustc-hash = "2"
+rusty-tree = { path = "../rusty-tree" }
+smallvec = "1"
+thiserror = "2"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[features]
+default = []
+stats = []
+
+[[bench]]
+name = "phase1"
+harness = false
