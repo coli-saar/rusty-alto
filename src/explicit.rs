@@ -1,11 +1,12 @@
 use crate::{
     BottomUpTa, DetBottomUpTa, FxHashMap, FxHashSet, IndexedBottomUpTa, StateId, Symbol, TopDownTa,
-    traits::{CondensedTa, StateUniverse, SymbolSet},
+    traits::{CondensedTa, CondensedTopDownTa, StateUniverse, SymbolSet},
 };
 use fixedbitset::FixedBitSet;
 use smallvec::SmallVec;
 use std::cell::OnceCell;
 use std::hash::{BuildHasher, Hash, Hasher};
+use thiserror::Error;
 
 type Results = SmallVec<[StateId; 2]>;
 
@@ -16,8 +17,8 @@ type Results = SmallVec<[StateId; 2]>;
 /// automaton has been materialized. Rules with arity 0, 1, and 2 use separate
 /// compact tables because those are the common hot paths.
 ///
-/// Build values with [`ExplicitBuilder`]. The builder deduplicates repeated
-/// rules, so `step` never emits the same result state twice for one query.
+/// Build values with [`ExplicitBuilder`]. Every transition rule has a weight;
+/// callers that do not have natural weights can use `1.0`.
 #[derive(Clone, Debug)]
 pub struct Explicit {
     num_states: u32,
@@ -28,6 +29,7 @@ pub struct Explicit {
     higher: FxHashMap<HigherKey, Results>,
     rules: Vec<StoredRule>,
     reachable_cache: OnceCell<FixedBitSet>,
+    result_index: OnceCell<Vec<Vec<usize>>>,
     indexes: OnceCell<Indexes>,
     condensed_cache: OnceCell<Vec<CondensedRule>>,
 }
@@ -48,10 +50,18 @@ impl Hash for HigherKey {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug)]
 struct StoredRule {
     symbol: Symbol,
-    children: Box<[StateId]>,
+    children: SmallVec<[StateId; 2]>,
+    result: StateId,
+    weight: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct RuleKey {
+    symbol: Symbol,
+    children: SmallVec<[StateId; 2]>,
     result: StateId,
 }
 
@@ -65,14 +75,13 @@ struct CondensedRule {
 #[derive(Clone, Debug, Default)]
 struct Indexes {
     by_child: FxHashMap<(Symbol, usize, StateId), Vec<usize>>,
-    by_result: FxHashMap<StateId, Vec<usize>>,
 }
 
 /// Borrowed view of one transition rule in an [`Explicit`] automaton.
 ///
 /// A rule means: when a node has `symbol` and its children have exactly
 /// `children`, the node may receive `result`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rule<'a> {
     /// Symbol on the tree node matched by this rule.
     pub symbol: Symbol,
@@ -80,6 +89,23 @@ pub struct Rule<'a> {
     pub children: &'a [StateId],
     /// State assigned to the parent node when the rule applies.
     pub result: StateId,
+    /// Weight assigned to this transition rule.
+    pub weight: f64,
+}
+
+/// Error returned when an explicit automaton cannot be built.
+#[derive(Clone, Debug, Error, PartialEq)]
+pub enum ExplicitBuildError {
+    /// The same transition was added more than once.
+    #[error("duplicate transition for symbol {symbol:?}, children {children:?}, result {result:?}")]
+    DuplicateTransition {
+        /// Symbol on the duplicated transition.
+        symbol: Symbol,
+        /// Child-state tuple on the duplicated transition.
+        children: Vec<StateId>,
+        /// Parent/result state on the duplicated transition.
+        result: StateId,
+    },
 }
 
 /// Builder for [`Explicit`] automata.
@@ -94,7 +120,7 @@ pub struct Rule<'a> {
 pub struct ExplicitBuilder {
     next_state: u32,
     accepting: Vec<StateId>,
-    rules: Vec<(Symbol, Vec<StateId>, StateId)>,
+    rules: Vec<(Symbol, SmallVec<[StateId; 2]>, StateId, f64)>,
 }
 
 impl ExplicitBuilder {
@@ -128,19 +154,59 @@ impl ExplicitBuilder {
     /// creates a nullary rule, suitable for leaf symbols. Passing `STUCK` or a
     /// state not allocated by this builder panics.
     pub fn add_rule(&mut self, f: Symbol, children: Vec<StateId>, q: StateId) {
+        self.add_weighted_rule(f, children, q, 1.0);
+    }
+
+    /// Add a weighted bottom-up transition rule.
+    ///
+    /// `children` is the exact child-state tuple for the rule. An empty vector
+    /// creates a nullary rule, suitable for leaf symbols. Passing `STUCK` or a
+    /// state not allocated by this builder panics.
+    pub fn add_weighted_rule(
+        &mut self,
+        f: Symbol,
+        children: Vec<StateId>,
+        q: StateId,
+        weight: f64,
+    ) {
         self.check_state(q);
         for &child in &children {
             self.check_state(child);
         }
-        self.rules.push((f, children, q));
+        self.rules
+            .push((f, SmallVec::from_vec(children), q, weight));
     }
 
     /// Build the explicit automaton.
     ///
-    /// Repeated identical rules are removed. Multiple rules with the same
-    /// symbol and children but different result states are preserved, making
-    /// the automaton nondeterministic for that query.
+    /// Panics if duplicate transitions were added. Use [`Self::try_build`] to
+    /// receive a typed error instead.
     pub fn build(self) -> Explicit {
+        self.try_build()
+            .expect("explicit automaton contains duplicate transitions")
+    }
+
+    /// Build the explicit automaton, rejecting duplicate transitions.
+    ///
+    /// Multiple rules with the same symbol and children but different result
+    /// states are preserved, making the automaton nondeterministic for that
+    /// query. The exact same `(symbol, children, result)` transition may not be
+    /// added twice, regardless of weight.
+    pub fn try_build(self) -> Result<Explicit, ExplicitBuildError> {
+        self.finish(true)
+    }
+
+    /// Build without checking for duplicate transitions.
+    ///
+    /// This is for internal algorithms that already enforce uniqueness while
+    /// generating rules. External parsers and callers should use [`Self::build`]
+    /// or [`Self::try_build`] so duplicates are rejected.
+    pub(crate) fn build_trusted(self) -> Explicit {
+        self.finish(false)
+            .expect("trusted explicit automaton build cannot fail")
+    }
+
+    fn finish(self, check_duplicates: bool) -> Result<Explicit, ExplicitBuildError> {
         let mut accepting = FixedBitSet::with_capacity(self.next_state as usize);
         for q in self.accepting {
             accepting.set(q.index(), true);
@@ -153,15 +219,27 @@ impl ExplicitBuilder {
         let mut higher = FxHashMap::default();
         let mut stored = Vec::new();
 
-        for (symbol, children, result) in self.rules {
+        for (symbol, children, result, weight) in self.rules {
+            if check_duplicates {
+                let key = RuleKey {
+                    symbol,
+                    children: children.clone(),
+                    result,
+                };
+                if !seen.insert(key) {
+                    return Err(ExplicitBuildError::DuplicateTransition {
+                        symbol,
+                        children: children.into_vec(),
+                        result,
+                    });
+                }
+            }
             let rule = StoredRule {
                 symbol,
-                children: children.into_boxed_slice(),
+                children,
                 result,
+                weight,
             };
-            if !seen.insert(rule.clone()) {
-                continue;
-            }
             match rule.children.len() {
                 0 => push_result(nullary.entry(symbol).or_default(), result),
                 1 => push_result(unary.entry((symbol, rule.children[0])).or_default(), result),
@@ -173,7 +251,10 @@ impl ExplicitBuilder {
                 ),
                 _ => push_result(
                     higher
-                        .entry(HigherKey(symbol, rule.children.clone()))
+                        .entry(HigherKey(
+                            symbol,
+                            rule.children.clone().into_vec().into_boxed_slice(),
+                        ))
                         .or_default(),
                     result,
                 ),
@@ -181,11 +262,7 @@ impl ExplicitBuilder {
             stored.push(rule);
         }
 
-        stored.sort_by(|a, b| {
-            (a.symbol, &a.children, a.result).cmp(&(b.symbol, &b.children, b.result))
-        });
-
-        Explicit {
+        Ok(Explicit {
             num_states: self.next_state,
             accepting,
             nullary,
@@ -194,9 +271,10 @@ impl ExplicitBuilder {
             higher,
             rules: stored,
             reachable_cache: OnceCell::new(),
+            result_index: OnceCell::new(),
             indexes: OnceCell::new(),
             condensed_cache: OnceCell::new(),
-        }
+        })
     }
 
     fn check_state(&self, q: StateId) {
@@ -290,8 +368,32 @@ impl Explicit {
     pub fn rules(&self) -> impl Iterator<Item = Rule<'_>> {
         self.rules.iter().map(|rule| Rule {
             symbol: rule.symbol,
-            children: &rule.children,
+            children: rule.children.as_slice(),
             result: rule.result,
+            weight: rule.weight,
+        })
+    }
+
+    /// Iterate over rules with the given parent/result state.
+    pub fn rules_topdown(&self, parent: StateId) -> impl Iterator<Item = Rule<'_>> {
+        self.result_index()[parent.index()].iter().map(|&rule_idx| {
+            let rule = &self.rules[rule_idx];
+            Rule {
+                symbol: rule.symbol,
+                children: rule.children.as_slice(),
+                result: rule.result,
+                weight: rule.weight,
+            }
+        })
+    }
+
+    fn result_index(&self) -> &[Vec<usize>] {
+        self.result_index.get_or_init(|| {
+            let mut by_result = vec![Vec::new(); self.num_states as usize];
+            for (rule_idx, rule) in self.rules.iter().enumerate() {
+                by_result[rule.result.index()].push(rule_idx);
+            }
+            by_result
         })
     }
 
@@ -310,11 +412,6 @@ impl Explicit {
         self.indexes.get_or_init(|| {
             let mut indexes = Indexes::default();
             for (rule_idx, rule) in self.rules.iter().enumerate() {
-                indexes
-                    .by_result
-                    .entry(rule.result)
-                    .or_default()
-                    .push(rule_idx);
                 for (position, &child) in rule.children.iter().enumerate() {
                     indexes
                         .by_child
@@ -419,7 +516,7 @@ impl TopDownTa for Explicit {
         if parent.is_stuck() {
             return;
         }
-        let Some(rule_indexes) = self.indexes().by_result.get(parent) else {
+        let Some(rule_indexes) = self.result_index().get(parent.index()) else {
             return;
         };
         for &rule_idx in rule_indexes {
@@ -472,6 +569,24 @@ impl CondensedTa for Explicit {
     }
 }
 
+impl CondensedTopDownTa for Explicit {
+    fn condensed_rules_by_parent(
+        &self,
+        parent: &StateId,
+        out: &mut dyn FnMut(&SymbolSet, &[StateId]),
+    ) {
+        for rule in self.condensed_cache() {
+            if &rule.result == parent {
+                out(&rule.symbols, &rule.children);
+            }
+        }
+    }
+
+    fn condensed_initial_states(&self, out: &mut dyn FnMut(StateId)) {
+        self.initial_states(out);
+    }
+}
+
 fn push_result(results: &mut Results, q: StateId) {
     if !results.contains(&q) {
         results.push(q);
@@ -495,18 +610,50 @@ mod tests {
     use std::collections::hash_map::DefaultHasher;
 
     #[test]
-    fn builder_dedupes_rules() {
-        // Adding the same rule twice must not produce a duplicate entry: `rules()`
-        // should iterate exactly one rule, and `step` should emit the state once.
+    fn add_rule_defaults_to_unit_weight() {
         let mut b = ExplicitBuilder::new();
         let q = b.new_state();
         b.add_rule(Symbol(1), vec![], q);
-        b.add_rule(Symbol(1), vec![], q);
         let e = b.build();
-        assert_eq!(e.rules().count(), 1);
+        let rule = e.rules().next().unwrap();
+        assert_eq!(rule.weight, 1.0);
         let mut out = Vec::new();
         e.step(Symbol(1), &[], &mut |q| out.push(q));
         assert_eq!(out, vec![q]);
+    }
+
+    #[test]
+    fn add_weighted_rule_stores_weight() {
+        let mut b = ExplicitBuilder::new();
+        let q = b.new_state();
+        b.add_weighted_rule(Symbol(1), vec![], q, 0.25);
+        let e = b.build();
+        let rule = e.rules().next().unwrap();
+        assert_eq!(rule.weight, 0.25);
+    }
+
+    #[test]
+    fn builder_rejects_duplicate_transition_with_same_weight() {
+        let mut b = ExplicitBuilder::new();
+        let q = b.new_state();
+        b.add_weighted_rule(Symbol(1), vec![], q, 0.5);
+        b.add_weighted_rule(Symbol(1), vec![], q, 0.5);
+        assert!(matches!(
+            b.try_build(),
+            Err(ExplicitBuildError::DuplicateTransition { .. })
+        ));
+    }
+
+    #[test]
+    fn builder_rejects_duplicate_transition_with_different_weight() {
+        let mut b = ExplicitBuilder::new();
+        let q = b.new_state();
+        b.add_weighted_rule(Symbol(1), vec![], q, 0.5);
+        b.add_weighted_rule(Symbol(1), vec![], q, 0.75);
+        assert!(matches!(
+            b.try_build(),
+            Err(ExplicitBuildError::DuplicateTransition { .. })
+        ));
     }
 
     #[test]

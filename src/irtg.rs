@@ -1,11 +1,11 @@
 //! Interpreted regular tree grammars.
 
 use crate::{
-    Algebra, Explicit, ExplicitBuilder, FxHashMap, Homomorphism, HomomorphismError,
-    IndexedCondensedIntersectionStats, Interner, InvHom, Signature, SignatureError, StateId,
-    StringAlgebra, Symbol,
-    alto_ast::{AstAutoRule, AstHomTerm, AstIrtg, AstState, LexError, Tok, lex},
-    alto_grammar, materialize_indexed_condensed_intersection,
+    Algebra, Explicit, ExplicitBuildError, ExplicitBuilder, FxHashMap, Homomorphism,
+    HomomorphismError, IndexedCondensedIntersectionStats, Interner, InvHom, Signature,
+    SignatureError, StateId, StringAlgebra, Symbol,
+    alto_ast::{AstHomTerm, AstIrtg, AstState, LexError, Tok, lex},
+    alto_grammar, materialize_topdown_condensed_intersection,
 };
 use lalrpop_util::ParseError;
 use rusty_tree::tree::Tree;
@@ -20,7 +20,6 @@ pub struct Irtg {
     grammar: Explicit,
     states: Interner<String>,
     grammar_signature: Signature,
-    rules: Vec<IrtgRule>,
     interpretations: FxHashMap<String, Interpretation>,
 }
 
@@ -40,9 +39,16 @@ impl Irtg {
         &self.states
     }
 
-    /// Return the parsed grammar rules.
-    pub fn rules(&self) -> &[IrtgRule] {
-        &self.rules
+    /// Return the names of interpretations backed by [`StringAlgebra`].
+    pub fn string_interpretation_names(&self) -> Vec<&str> {
+        let mut names: Vec<_> = self
+            .interpretations
+            .values()
+            .filter(|interpretation| interpretation.kind == InterpretationKind::String)
+            .map(|interpretation| interpretation.name.as_str())
+            .collect();
+        names.sort_unstable();
+        names
     }
 
     /// Return a typed handle for a named interpretation.
@@ -95,7 +101,7 @@ impl Irtg {
                     let decomp = algebra.decompose(value);
                     let invhom = InvHom::new(decomp, &interpretation.homomorphism);
                     let (next_chart, _right_interner, stat) =
-                        materialize_indexed_condensed_intersection(&chart, &invhom);
+                        materialize_topdown_condensed_intersection(&chart, &invhom);
                     chart = next_chart;
                     stats.push(stat);
                 }
@@ -223,25 +229,6 @@ pub struct ParseChart {
     pub stats: Vec<IndexedCondensedIntersectionStats>,
 }
 
-/// A parsed IRTG grammar rule with optional weight metadata.
-#[derive(Clone, Debug, PartialEq)]
-pub struct IrtgRule {
-    /// Parent grammar state.
-    pub parent: StateId,
-    /// Grammar terminal symbol.
-    pub symbol: Symbol,
-    /// Child grammar states.
-    pub children: Vec<StateId>,
-    /// Optional Alto rule weight, defaulting to 1.0.
-    pub weight: f64,
-    /// Original parent state name.
-    pub parent_name: String,
-    /// Original grammar symbol name.
-    pub symbol_name: String,
-    /// Original child state names.
-    pub child_names: Vec<String>,
-}
-
 /// Errors returned by IRTG parsing, construction, and parsing.
 #[derive(Debug, Error)]
 pub enum IrtgError {
@@ -260,6 +247,9 @@ pub enum IrtgError {
     /// A homomorphism rejected an image.
     #[error("{0}")]
     Homomorphism(#[from] HomomorphismError),
+    /// The grammar automaton could not be built.
+    #[error("{0}")]
+    Automaton(#[from] ExplicitBuildError),
     /// A named interpretation was not found.
     #[error("unknown interpretation {0:?}")]
     UnknownInterpretation(String),
@@ -314,7 +304,6 @@ fn build_irtg(ast: AstIrtg) -> Result<Irtg, IrtgError> {
     let mut states = Interner::new();
     let mut state_ids = FxHashMap::default();
     let mut grammar_signature = Signature::new();
-    let mut rules = Vec::new();
     let mut homs = FxHashMap::default();
     let mut algebra_signatures = FxHashMap::default();
 
@@ -324,7 +313,6 @@ fn build_irtg(ast: AstIrtg) -> Result<Irtg, IrtgError> {
     }
 
     for rule in ast.rules {
-        let parent_name = rule.auto.parent.name.clone();
         let parent = state_id(&mut builder, &mut states, &mut state_ids, &rule.auto.parent);
         if rule.auto.parent.is_final {
             builder.add_accepting(parent);
@@ -341,22 +329,8 @@ fn build_irtg(ast: AstIrtg) -> Result<Irtg, IrtgError> {
                 id
             })
             .collect();
-        let child_names: Vec<_> = rule
-            .auto
-            .children
-            .iter()
-            .map(|child| child.name.clone())
-            .collect();
         let symbol = grammar_signature.intern(rule.auto.symbol.clone(), child_ids.len())?;
-        builder.add_rule(symbol, child_ids.clone(), parent);
-        rules.push(irtg_rule(
-            &rule.auto,
-            parent,
-            symbol,
-            child_ids,
-            parent_name,
-            child_names,
-        ));
+        builder.add_weighted_rule(symbol, child_ids, parent, rule.auto.weight.unwrap_or(1.0));
 
         for hom_rule in rule.homs {
             let Some(hom) = homs.get_mut(&hom_rule.interpretation) else {
@@ -399,31 +373,11 @@ fn build_irtg(ast: AstIrtg) -> Result<Irtg, IrtgError> {
     }
 
     Ok(Irtg {
-        grammar: builder.build(),
+        grammar: builder.try_build()?,
         states,
         grammar_signature,
-        rules,
         interpretations,
     })
-}
-
-fn irtg_rule(
-    rule: &AstAutoRule,
-    parent: StateId,
-    symbol: Symbol,
-    children: Vec<StateId>,
-    parent_name: String,
-    child_names: Vec<String>,
-) -> IrtgRule {
-    IrtgRule {
-        parent,
-        symbol,
-        children,
-        weight: rule.weight.unwrap_or(1.0),
-        parent_name,
-        symbol_name: rule.symbol.clone(),
-        child_names,
-    }
 }
 
 fn state_id(
@@ -573,7 +527,7 @@ mod tests {
             .unwrap();
         let chart = irtg.parse([interpretation.input(value)]).unwrap();
         assert!(!chart.automaton.is_empty());
-        assert_eq!(irtg.rules().len(), 12);
+        assert_eq!(irtg.grammar().rules().count(), 12);
     }
 
     #[test]
@@ -592,10 +546,16 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(irtg.rules().len(), 2);
-        assert_eq!(irtg.rules()[0].parent_name, "S root");
-        assert_eq!(irtg.rules()[0].symbol_name, "r root");
-        assert!((irtg.rules()[0].weight - 3.3921302578018993E-4).abs() < 1e-12);
+        assert_eq!(irtg.grammar().rules().count(), 2);
+        let parent = irtg.states().get(&"S root".to_owned()).unwrap();
+        let symbol = irtg.grammar_signature().get("r root").unwrap();
+        let rule = irtg
+            .grammar()
+            .rules()
+            .find(|rule| rule.symbol == symbol)
+            .unwrap();
+        assert_eq!(rule.result, parent);
+        assert!((rule.weight - 3.3921302578018993E-4).abs() < 1e-12);
         let surface = irtg.interpretation::<StringAlgebra>("surface").unwrap();
         assert!(surface.algebra_signature().get("wrap").is_some());
         assert!(surface.algebra_signature().get("hello world").is_some());
@@ -631,5 +591,18 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, IrtgError::Syntax(message) if message.contains("?0")));
+    }
+
+    #[test]
+    fn rejects_duplicate_grammar_transitions() {
+        let err = parse_irtg(
+            br#"
+            interpretation i: de.up.ling.irtg.algebra.StringAlgebra
+            S! -> r [1.0]
+            S! -> r [2.0]
+            "# as &[u8],
+        )
+        .unwrap_err();
+        assert!(matches!(err, IrtgError::Automaton(_)));
     }
 }

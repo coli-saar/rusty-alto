@@ -1,5 +1,5 @@
 use rusty_alto::{
-    AltoAutomaton, Arena, BottomUpTa, DetBottomUpTa, Signature, StateId, Symbol, TestArena,
+    Arena, BottomUpTa, DetBottomUpTa, ParsedTreeAutomaton, Signature, StateId, Symbol, TestArena,
     TestNode, parse_alto,
 };
 use std::collections::HashSet;
@@ -69,17 +69,17 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn is_deterministic(parsed: &AltoAutomaton) -> bool {
+fn is_deterministic(parsed: &ParsedTreeAutomaton) -> bool {
     let mut seen = HashSet::new();
-    for rule in &parsed.rules {
-        if !seen.insert((rule.symbol, rule.children.clone())) {
+    for rule in parsed.automaton.rules() {
+        if !seen.insert((rule.symbol, rule.children.to_vec())) {
             return false;
         }
     }
     true
 }
 
-fn run_all_det(parsed: &AltoAutomaton, trees: &[ParsedTree]) -> RunSummary {
+fn run_all_det(parsed: &ParsedTreeAutomaton, trees: &[ParsedTree]) -> RunSummary {
     let mut accepted = 0usize;
     let mut root_states = 0usize;
     for tree in trees {
@@ -118,7 +118,7 @@ fn run_all_det(parsed: &AltoAutomaton, trees: &[ParsedTree]) -> RunSummary {
     }
 }
 
-fn run_all_nondet(parsed: &AltoAutomaton, trees: &[ParsedTree]) -> RunSummary {
+fn run_all_nondet(parsed: &ParsedTreeAutomaton, trees: &[ParsedTree]) -> RunSummary {
     let mut accepted = 0usize;
     let mut root_states = 0usize;
     for tree in trees {
@@ -191,7 +191,7 @@ struct ParsedTree {
     postorder: Vec<usize>,
 }
 
-fn parse_tree_file(input: &str, auto: &AltoAutomaton) -> Result<Vec<ParsedTree>, String> {
+fn parse_tree_file(input: &str, auto: &ParsedTreeAutomaton) -> Result<Vec<ParsedTree>, String> {
     let mut signature = auto.signature.clone();
     let mut trees = Vec::new();
     for (line_idx, line) in input.lines().enumerate() {

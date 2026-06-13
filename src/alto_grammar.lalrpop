@@ -27,7 +27,7 @@ extern {
 }
 
 pub Irtg: AstIrtg = {
-    <interpretations:InterpretationDecl*> <features:FeatureDecl*> <rules:IrtgRule*> => {
+    <interpretations:InterpretationDecl*> <features:FeatureDecl*> <rules:GrammarRule*> => {
         AstIrtg { interpretations, features, rules }
     }
 };
@@ -49,7 +49,7 @@ FeatureDecl: AstFeatureDecl = {
     }
 };
 
-IrtgRule: AstRule = {
+GrammarRule: AstRule = {
     <auto:AutoRule> <homs:HomRule*> => AstRule { auto, homs }
 };
 

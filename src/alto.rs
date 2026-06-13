@@ -1,51 +1,25 @@
 use crate::{
-    Explicit, ExplicitBuilder, FxHashMap, Interner, Signature, SignatureError, StateId, Symbol,
-    alto_ast::{AstAutoRule, AstFta, AstState, LexError, Tok, lex},
+    Explicit, ExplicitBuildError, ExplicitBuilder, FxHashMap, Interner, Signature, SignatureError,
+    StateId,
+    alto_ast::{AstFta, AstState, LexError, Tok, lex},
     alto_grammar,
 };
 use lalrpop_util::ParseError;
 use thiserror::Error;
 
-/// Parsed Alto tree automaton.
+/// Parsed tree automaton.
 ///
 /// Alto's `.auto` format writes rules top-down, for example
 /// `S! -> f(A,A) [1.0]`. This reader builds the equivalent bottom-up
 /// [`Explicit`] automaton, i.e. the rule above becomes `f(A,A) -> S`.
-///
-/// The current core automaton is unweighted, so weights are stored in
-/// [`AltoAutomaton::rules`] as metadata.
 #[derive(Clone, Debug)]
-pub struct AltoAutomaton {
+pub struct ParsedTreeAutomaton {
     /// Bottom-up explicit automaton built from the Alto rules.
     pub automaton: Explicit,
     /// Mapping from Alto state names to dense state IDs.
     pub states: Interner<String>,
     /// Mapping from Alto terminal symbols to symbol IDs.
-    pub signature: AltoSignature,
-    /// Parsed rules, including source names and weights.
-    pub rules: Vec<AltoRule>,
-}
-
-/// Backwards-compatible name for the shared label signature.
-pub type AltoSignature = Signature;
-
-/// One rule parsed from an Alto file.
-#[derive(Clone, Debug, PartialEq)]
-pub struct AltoRule {
-    /// Parent state on the left-hand side of the Alto rule.
-    pub parent: StateId,
-    /// Terminal symbol on the right-hand side.
-    pub symbol: Symbol,
-    /// Child states inside the symbol term.
-    pub children: Vec<StateId>,
-    /// Rule weight, defaulting to `1.0` when omitted.
-    pub weight: f64,
-    /// Original Alto parent-state name.
-    pub parent_name: String,
-    /// Original Alto terminal-symbol name.
-    pub symbol_name: String,
-    /// Original Alto child-state names.
-    pub child_names: Vec<String>,
+    pub signature: Signature,
 }
 
 /// Error returned when parsing Alto `.auto` input.
@@ -108,6 +82,9 @@ pub enum AltoParseError {
     /// LALRPOP reported a syntax error.
     #[error("{0}")]
     Syntax(String),
+    /// The automaton contained a duplicate transition.
+    #[error("{0}")]
+    Automaton(#[from] ExplicitBuildError),
 }
 
 impl From<SignatureError> for AltoParseError {
@@ -151,7 +128,7 @@ impl From<LexError> for AltoParseError {
 /// - quoted names with single or double quotes
 /// - optional weights, defaulting to `1.0`
 /// - `// ...` line comments and `/* ... */` block comments
-pub fn parse_alto(input: &str) -> Result<AltoAutomaton, AltoParseError> {
+pub fn parse_alto(input: &str) -> Result<ParsedTreeAutomaton, AltoParseError> {
     let mut signature = Signature::new();
     parse_alto_with_signature(input, &mut signature)
 }
@@ -159,13 +136,13 @@ pub fn parse_alto(input: &str) -> Result<AltoAutomaton, AltoParseError> {
 /// Parse an Alto `.auto` file using a caller-owned shared signature.
 ///
 /// This is useful when automata and input trees should be compiled into the
-/// same raw [`Symbol`] space. The returned [`AltoAutomaton`] contains a clone of
-/// the signature after parsing; the caller can keep using `signature` to parse
-/// or validate trees before running the automaton.
+/// same raw [`crate::Symbol`] space. The returned [`ParsedTreeAutomaton`]
+/// contains a clone of the signature after parsing; the caller can keep using
+/// `signature` to parse or validate trees before running the automaton.
 pub fn parse_alto_with_signature(
     input: &str,
     signature: &mut Signature,
-) -> Result<AltoAutomaton, AltoParseError> {
+) -> Result<ParsedTreeAutomaton, AltoParseError> {
     let tokens = lex(input)?;
     let ast = alto_grammar::FtaParser::new()
         .parse(tokens.into_iter().map(Ok))
@@ -173,14 +150,15 @@ pub fn parse_alto_with_signature(
     build_alto(ast, signature)
 }
 
-fn build_alto(ast: AstFta, signature: &mut Signature) -> Result<AltoAutomaton, AltoParseError> {
+fn build_alto(
+    ast: AstFta,
+    signature: &mut Signature,
+) -> Result<ParsedTreeAutomaton, AltoParseError> {
     let mut builder = ExplicitBuilder::new();
     let mut states = Interner::new();
     let mut state_ids = FxHashMap::default();
-    let mut rules = Vec::new();
 
     for rule in ast.rules {
-        let parent_name = rule.parent.name.clone();
         let parent = state_id(&mut builder, &mut states, &mut state_ids, &rule.parent);
         if rule.parent.is_final {
             builder.add_accepting(parent);
@@ -196,48 +174,15 @@ fn build_alto(ast: AstFta, signature: &mut Signature) -> Result<AltoAutomaton, A
                 id
             })
             .collect();
-        let child_names: Vec<_> = rule
-            .children
-            .iter()
-            .map(|child| child.name.clone())
-            .collect();
         let symbol = signature.intern(rule.symbol.clone(), child_ids.len())?;
-        builder.add_rule(symbol, child_ids.clone(), parent);
-        rules.push(alto_rule(
-            rule,
-            parent,
-            symbol,
-            child_ids,
-            parent_name,
-            child_names,
-        ));
+        builder.add_weighted_rule(symbol, child_ids, parent, rule.weight.unwrap_or(1.0));
     }
 
-    Ok(AltoAutomaton {
-        automaton: builder.build(),
+    Ok(ParsedTreeAutomaton {
+        automaton: builder.try_build()?,
         states,
         signature: signature.clone(),
-        rules,
     })
-}
-
-fn alto_rule(
-    rule: AstAutoRule,
-    parent: StateId,
-    symbol: Symbol,
-    children: Vec<StateId>,
-    parent_name: String,
-    child_names: Vec<String>,
-) -> AltoRule {
-    AltoRule {
-        parent,
-        symbol,
-        children,
-        weight: rule.weight.unwrap_or(1.0),
-        parent_name,
-        symbol_name: rule.symbol,
-        child_names,
-    }
 }
 
 fn state_id(
@@ -332,7 +277,13 @@ mod tests {
         assert_eq!(out, vec![a_state]);
         assert_eq!(parsed.automaton.step_det(f, &[a_state, a_state]), Some(s));
         assert!(parsed.automaton.is_accepting(&s));
-        assert_eq!(parsed.rules[1].weight, 0.5);
+        let g = parsed.signature.get("g").unwrap();
+        let g_rule = parsed
+            .automaton
+            .rules()
+            .find(|rule| rule.symbol == g)
+            .unwrap();
+        assert_eq!(g_rule.weight, 0.5);
     }
 
     #[test]
@@ -349,9 +300,15 @@ mod tests {
     fn parses_quoted_names_and_scientific_weights() {
         let parsed =
             parse_alto("'S,0-1'! -> r('A,0-1', \"B state\") [3.3921302578018993E-4]").unwrap();
-        assert_eq!(parsed.rules[0].parent_name, "S,0-1");
-        assert_eq!(parsed.rules[0].child_names, vec!["A,0-1", "B state"]);
-        assert!((parsed.rules[0].weight - 3.3921302578018993E-4).abs() < 1e-12);
+        let parent = parsed.states.get(&"S,0-1".to_owned()).unwrap();
+        let left = parsed.states.get(&"A,0-1".to_owned()).unwrap();
+        let right = parsed.states.get(&"B state".to_owned()).unwrap();
+        let symbol = parsed.signature.get("r").unwrap();
+        let rule = parsed.automaton.rules().next().unwrap();
+        assert_eq!(rule.result, parent);
+        assert_eq!(rule.children, &[left, right]);
+        assert_eq!(rule.symbol, symbol);
+        assert!((rule.weight - 3.3921302578018993E-4).abs() < 1e-12);
     }
 
     #[test]
@@ -372,8 +329,9 @@ mod tests {
     #[test]
     fn parses_nullary_empty_parens() {
         let parsed = parse_alto("S! -> a()").unwrap();
-        assert_eq!(parsed.rules[0].child_names, Vec::<String>::new());
-        assert_eq!(parsed.signature.arity(parsed.rules[0].symbol), 0);
+        let rule = parsed.automaton.rules().next().unwrap();
+        assert!(rule.children.is_empty());
+        assert_eq!(parsed.signature.arity(rule.symbol), 0);
     }
 
     #[test]
@@ -393,5 +351,11 @@ mod tests {
     fn lalrpop_rejects_trailing_junk() {
         let err = parse_alto("S -> a [oops]").unwrap_err();
         assert!(matches!(err, AltoParseError::Unexpected { .. }));
+    }
+
+    #[test]
+    fn rejects_duplicate_transitions() {
+        let err = parse_alto("S -> a [1.0] S -> a [2.0]").unwrap_err();
+        assert!(matches!(err, AltoParseError::Automaton(_)));
     }
 }

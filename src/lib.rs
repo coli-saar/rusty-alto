@@ -58,33 +58,36 @@ pub mod irtg;
 pub mod materialize;
 pub mod memo;
 pub mod run;
+pub mod set_trie;
 pub mod signature;
+pub mod sorted_language;
 pub mod traits;
 
 pub use algebras::{
     Algebra, EvaluatingDecompositionAutomaton, Span, StringAlgebra, StringDecompositionAutomaton,
 };
-pub use alto::{
-    AltoAutomaton, AltoParseError, AltoRule, AltoSignature, parse_alto, parse_alto_with_signature,
-};
+pub use alto::{AltoParseError, ParsedTreeAutomaton, parse_alto, parse_alto_with_signature};
 pub use arena::{Arena, NodeId, TestArena, TestNode};
 pub use combinators::{Determinized, InvHom, Mapped, Product};
-pub use explicit::{Explicit, ExplicitBuilder, Rule};
+pub use explicit::{Explicit, ExplicitBuildError, ExplicitBuilder, Rule};
 pub use homomorphism::{HomLabel, HomTerm, Homomorphism, HomomorphismError};
 pub use ids::{Arity, StateId, Symbol};
 pub use interner::Interner;
 pub use irtg::{
-    Interpretation, Irtg, IrtgError, IrtgRule, ParseChart, ParseInput, TypedInterpretation,
-    parse_irtg,
+    Interpretation, Irtg, IrtgError, ParseChart, ParseInput, TypedInterpretation, parse_irtg,
 };
 pub use materialize::{
     IndexedCondensedIntersectionStats, materialize, materialize_indexed_condensed_intersection,
+    materialize_topdown_condensed_intersection,
 };
 pub use memo::{Memo, MemoStats};
 pub use run::{DetRun, NonDetRun, StateSet, run_det, run_nondet};
+pub use set_trie::{KeySet, SetTrie};
 pub use signature::{Signature, SignatureError};
+pub use sorted_language::{SortedLanguageIterator, WeightedTree};
 pub use traits::{
-    BottomUpTa, CondensedTa, DetBottomUpTa, IndexedBottomUpTa, StateUniverse, SymbolSet, TopDownTa,
+    BottomUpTa, CondensedTa, CondensedTopDownTa, DetBottomUpTa, IndexedBottomUpTa, StateUniverse,
+    SymbolSet, TopDownTa,
 };
 
 pub(crate) type FxHashMap<K, V> = hashbrown::HashMap<K, V, rustc_hash::FxBuildHasher>;

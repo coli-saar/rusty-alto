@@ -2,7 +2,7 @@ use crate::{
     BottomUpTa, DetBottomUpTa, FxHashMap, FxHashSet, Symbol,
     homomorphism::{HomLabel, HomTerm, Homomorphism},
     run::cartesian_product,
-    traits::{CondensedTa, StateUniverse, SymbolSet},
+    traits::{CondensedTa, CondensedTopDownTa, StateUniverse, SymbolSet, TopDownTa},
 };
 use rusty_tree::tree::TreeArena;
 use smallvec::SmallVec;
@@ -171,6 +171,111 @@ fn direct_linear_term(
     }
 
     Some(DirectTerm { symbol, variables })
+}
+
+fn match_topdown_term<A>(
+    arena: &TreeArena<HomLabel>,
+    term: HomTerm,
+    state: &A::State,
+    arity: usize,
+    inner: &A,
+    subst: &mut [Option<A::State>],
+    out: &mut dyn FnMut(&mut [Option<A::State>]),
+) where
+    A: TopDownTa,
+{
+    match *arena.get_label(term) {
+        HomLabel::Var(variable) => {
+            if variable >= arity {
+                return;
+            }
+
+            match &subst[variable] {
+                Some(existing) if existing == state => out(subst),
+                Some(_) => {}
+                None => {
+                    subst[variable] = Some(state.clone());
+                    out(subst);
+                    subst[variable] = None;
+                }
+            }
+        }
+        HomLabel::Symbol(symbol) => {
+            let term_children = arena.get_children(term);
+            inner.step_topdown(state, &mut |rule_symbol, rule_children| {
+                if rule_symbol != symbol || rule_children.len() != term_children.len() {
+                    return;
+                }
+                match_topdown_children(
+                    arena,
+                    term_children,
+                    rule_children,
+                    arity,
+                    inner,
+                    subst,
+                    0,
+                    out,
+                );
+            });
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn match_topdown_children<A>(
+    arena: &TreeArena<HomLabel>,
+    term_children: &[HomTerm],
+    rule_children: &[A::State],
+    arity: usize,
+    inner: &A,
+    subst: &mut [Option<A::State>],
+    position: usize,
+    out: &mut dyn FnMut(&mut [Option<A::State>]),
+) where
+    A: TopDownTa,
+{
+    if position == term_children.len() {
+        out(subst);
+        return;
+    }
+
+    match_topdown_term(
+        arena,
+        term_children[position],
+        &rule_children[position],
+        arity,
+        inner,
+        subst,
+        &mut |subst| {
+            match_topdown_children(
+                arena,
+                term_children,
+                rule_children,
+                arity,
+                inner,
+                subst,
+                position + 1,
+                out,
+            );
+        },
+    );
+}
+
+fn emit_if_complete<S: Clone>(
+    subst: &[Option<S>],
+    children_scratch: &mut SmallVec<[S; 4]>,
+    symbols: &SymbolSet,
+    out: &mut dyn FnMut(&SymbolSet, &[S]),
+) {
+    children_scratch.clear();
+    for state in subst {
+        let Some(state) = state else {
+            children_scratch.clear();
+            return;
+        };
+        children_scratch.push(state.clone());
+    }
+    out(symbols, children_scratch);
 }
 
 fn merge_assignments<S: Clone + Eq>(
@@ -501,6 +606,73 @@ where
     }
 }
 
+impl<A> CondensedTopDownTa for InvHom<'_, A>
+where
+    A: TopDownTa,
+{
+    fn condensed_rules_by_parent(
+        &self,
+        parent: &A::State,
+        out: &mut dyn FnMut(&SymbolSet, &[A::State]),
+    ) {
+        let arena = self.hom.arena();
+        let mut source_symbols = SymbolSet::new();
+        let mut subst = SmallVec::<[Option<A::State>; 4]>::new();
+        let mut children_scratch = SmallVec::<[A::State; 4]>::new();
+
+        for (term_id, labels, term) in self.hom.term_sets() {
+            let Some(&first_label) = labels.first() else {
+                continue;
+            };
+            let Some(arity) = self.hom.source_arity(first_label) else {
+                continue;
+            };
+
+            source_symbols.clear();
+            for &label in self.hom.label_set(term_id) {
+                source_symbols.insert(label);
+            }
+
+            subst.clear();
+            subst.resize_with(arity, || None);
+
+            if let Some(direct) = direct_linear_term(arena, term, arity) {
+                self.inner
+                    .step_topdown(parent, &mut |target_symbol, target_children| {
+                        if target_symbol != direct.symbol
+                            || target_children.len() != direct.variables.len()
+                        {
+                            return;
+                        }
+
+                        subst.fill(None);
+                        for (&variable, child) in direct.variables.iter().zip(target_children) {
+                            subst[variable] = Some(child.clone());
+                        }
+                        emit_if_complete(&subst, &mut children_scratch, &source_symbols, out);
+                    });
+                continue;
+            }
+
+            match_topdown_term(
+                arena,
+                term,
+                parent,
+                arity,
+                &self.inner,
+                &mut subst,
+                &mut |subst| {
+                    emit_if_complete(subst, &mut children_scratch, &source_symbols, out);
+                },
+            );
+        }
+    }
+
+    fn condensed_initial_states(&self, out: &mut dyn FnMut(A::State)) {
+        self.inner.initial_states(out);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -702,6 +874,32 @@ mod tests {
     }
 
     #[test]
+    fn topdown_condensed_depth1_uses_hom_label_sets() {
+        let (inner, q0, q1, qr) = make_inner();
+        let mut arena = TreeArena::new();
+        let v0 = var(&mut arena, 0);
+        let v1 = var(&mut arena, 1);
+        let rhs = node(&mut arena, sym(10), vec![v0, v1]);
+        let same_v0 = var(&mut arena, 0);
+        let same_v1 = var(&mut arena, 1);
+        let same = node(&mut arena, sym(10), vec![same_v0, same_v1]);
+        let mut hom = Homomorphism::with_arena(arena);
+        hom.add(sym(0), 2, rhs).unwrap();
+        hom.add(sym(1), 2, same).unwrap();
+        let inv = InvHom::new(inner, &hom);
+
+        let mut groups = Vec::new();
+        inv.condensed_rules_by_parent(&qr, &mut |symbols, children| {
+            groups.push((children.to_vec(), symbols.clone()));
+        });
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, vec![q0, q1]);
+        assert!(groups[0].1.contains(sym(0)));
+        assert!(groups[0].1.contains(sym(1)));
+    }
+
+    #[test]
     fn condensed_nested_rhs_matches_step_enumeration() {
         let mut b = ExplicitBuilder::new();
         let q_leaf = b.new_state();
@@ -735,6 +933,36 @@ mod tests {
         condensed.sort();
         stepped.sort();
         assert_eq!(condensed, stepped);
+    }
+
+    #[test]
+    fn topdown_condensed_nested_rhs_streams_matches() {
+        let mut b = ExplicitBuilder::new();
+        let q_leaf = b.new_state();
+        let q_inner = b.new_state();
+        let q1 = b.new_state();
+        let qr = b.new_state();
+        b.add_rule(sym(5), vec![q_leaf], q_inner);
+        b.add_rule(sym(6), vec![q_inner, q1], qr);
+        let inner = b.build();
+
+        let mut arena = TreeArena::new();
+        let wrapped_v0 = var(&mut arena, 0);
+        let wrapped = node(&mut arena, sym(5), vec![wrapped_v0]);
+        let v1 = var(&mut arena, 1);
+        let rhs = node(&mut arena, sym(6), vec![wrapped, v1]);
+        let mut hom = Homomorphism::with_arena(arena);
+        hom.add(sym(0), 2, rhs).unwrap();
+        let inv = InvHom::new(inner, &hom);
+
+        let mut groups = Vec::new();
+        inv.condensed_rules_by_parent(&qr, &mut |symbols, children| {
+            groups.push((children.to_vec(), symbols.clone()));
+        });
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, vec![q_leaf, q1]);
+        assert!(groups[0].1.contains(sym(0)));
     }
 
     #[test]

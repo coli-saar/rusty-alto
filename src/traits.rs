@@ -186,6 +186,11 @@ impl SymbolSet {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    /// Remove all symbols from the set.
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
 }
 
 impl FromIterator<Symbol> for SymbolSet {
@@ -245,5 +250,40 @@ pub trait CondensedTa: BottomUpTa {
                 out(children, symbols, result);
             }
         });
+    }
+}
+
+/// Optional parent-indexed view of a condensed automaton.
+///
+/// This is the condensed analogue of [`TopDownTa`]: given a parent state,
+/// enumerate all outgoing rule shapes, grouping all compatible symbols in a
+/// [`SymbolSet`]. Implementations should stream results and avoid materializing
+/// the whole condensed relation.
+pub trait CondensedTopDownTa: BottomUpTa {
+    /// Report every condensed rule `symbols(children...) -> parent`.
+    ///
+    /// `children` and `symbols` are borrowed from the implementation and are
+    /// valid only for the duration of the callback.
+    fn condensed_rules_by_parent(
+        &self,
+        parent: &Self::State,
+        out: &mut dyn FnMut(&SymbolSet, &[Self::State]),
+    );
+
+    /// Report initial states of the top-down view.
+    fn condensed_initial_states(&self, out: &mut dyn FnMut(Self::State));
+}
+
+impl<A: CondensedTopDownTa + ?Sized> CondensedTopDownTa for &A {
+    fn condensed_rules_by_parent(
+        &self,
+        parent: &Self::State,
+        out: &mut dyn FnMut(&SymbolSet, &[Self::State]),
+    ) {
+        (**self).condensed_rules_by_parent(parent, out);
+    }
+
+    fn condensed_initial_states(&self, out: &mut dyn FnMut(Self::State)) {
+        (**self).condensed_initial_states(out);
     }
 }
