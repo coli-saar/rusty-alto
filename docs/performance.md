@@ -79,6 +79,18 @@ to matching rules, and a parent-state index from `result state` to matching
 rules. Users who only run ordinary bottom-up recognition do not pay this
 construction cost.
 
+Condensed rule enumeration is cached lazily as well. `Explicit::condensed_rules`
+groups rules by `(children, result)` and stores the corresponding `SymbolSet`
+after the first request. This avoids rebuilding a hash map every time condensed
+algorithms, especially inverse homomorphism, enumerate the same explicit
+automaton.
+
+`Explicit` implements `StateUniverse` by enumerating dense
+`StateId(0)..StateId(num_states-1)`. This is intentionally separate from
+ordinary bottom-up querying: most runs never need a full state universe, but
+complete condensed inverse homomorphism needs it for image terms that are just a
+bare variable.
+
 ## Implicit Automata And Memoization
 
 Implicit automata can expose arbitrary state types. [`Memo`](../src/memo.rs)
@@ -160,6 +172,34 @@ bottom-up, deterministic, and indexed bottom-up queries. It intentionally does
 not implement top-down enumeration because that would require an inverse symbol
 map.
 
+[`Homomorphism`](../src/homomorphism.rs) stores right-hand side terms as roots
+in a caller-owned `TreeArena<HomLabel>`. The homomorphism itself stores raw
+`Symbol`s, source arities, structural term IDs, and label sets. This keeps RHS
+terms compatible with external signatures and tree arenas, and it makes the
+normal run path equivalent to Alto-style raw-symbol execution: there is no
+separate string-labeled `run` mode.
+
+Construction validates the nondeleting invariant once. For a source symbol of
+arity `k`, variables `?0 .. ?{k-1}` must occur exactly once in the RHS tree.
+After that, inverse-homomorphism evaluation can substitute child states without
+rechecking variable coverage on every transition query.
+
+Structurally identical RHS trees are deduplicated even if they are represented
+by different arena nodes. Each unique term has a label set containing all source
+symbols with that image. Condensed inverse homomorphism uses these label sets to
+emit one grouped rule for many source labels instead of evaluating the same RHS
+once per label.
+
+[`InvHom`](../src/combinators/invhom.rs) keeps complete bottom-up,
+deterministic bottom-up, and condensed implementations. Its old indexed and
+top-down implementations were removed because they only handled a subset of RHS
+shapes. Complete condensed evaluation recursively matches RHS symbol nodes
+against inner condensed rules, merges partial variable assignments, handles
+ground subterms, and uses `StateUniverse` for bare-variable roots. The generic
+`step` implementation deduplicates result states before invoking the caller's
+callback, preserving the `BottomUpTa` no-duplicates contract even when an inner
+oracle emits duplicates.
+
 ## Top-Down Enumeration
 
 [`TopDownTa`](../src/traits.rs) is the Phase 2 top-down refinement. It
@@ -196,11 +236,30 @@ The Rust runner detects deterministic automata by checking whether any
 use the dense `run_det`-style path; nondeterministic inputs use sorted state
 sets.
 
+[`compare_condensed_parsing`](../src/bin/compare_condensed_parsing.rs) is the
+current parser-like comparison benchmark. It builds a source tree automaton,
+maps its labels into `StringAlgebra` terms with a homomorphism, wraps a string
+decomposition automaton in condensed inverse homomorphism, and materializes the
+intersection. The Rust materializer uses fast hash tables and inline arity <= 2
+child tuples because the output chart can contain millions of binary rules.
+The companion script,
+[`compare-condensed-parsing.sh`](../scripts/compare-condensed-parsing.sh),
+compares this path against Alto's `CondensedNondeletingInverseHomAutomaton` and
+`intersectCondensed`.
+
 ## Current Bottlenecks
 
-High-performance parsing still needs algorithms that consume
-`IndexedBottomUpTa`. The automata engine now exposes the sibling-finder-style
-primitive, but parser-style chart construction has not been built on top of it.
+The condensed parsing benchmark now supports both explicit CKY-style string
+decomposition and lazy `StringAlgebra` decomposition. Its indexed-condensed
+intersection path avoids eagerly collecting the full inverse-hom rule relation;
+the next benchmark gap is less-saturating grammars where this can translate
+right-side query reductions into larger wall-clock wins.
+
+High-performance parsing still needs reusable library algorithms, not only
+benchmark-local materializers, that consume `IndexedBottomUpTa` and
+`CondensedTa`. The automata engine exposes the sibling-finder-style and
+condensed primitives, but chart construction, Viterbi, and EM still need
+library-level APIs.
 
 Generic determinization still uses `BTreeSet`. This is simple and correct, but
 not the intended final representation for dense-state workloads.

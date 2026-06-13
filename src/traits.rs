@@ -1,4 +1,5 @@
 use crate::Symbol;
+use smallvec::SmallVec;
 use std::hash::Hash;
 
 /// A bottom-up tree automaton queried as an oracle.
@@ -65,6 +66,24 @@ impl<A: DetBottomUpTa + ?Sized> DetBottomUpTa for &A {
     }
 }
 
+/// Finite enumeration of an automaton's state space.
+///
+/// Most oracle-style automata only need to answer local transition queries.
+/// Some complete algorithms, such as condensed inverse homomorphism for a bare
+/// variable image, also need to enumerate every possible inner state. Keep this
+/// as a separate refinement so infinite or very large implicit automata can
+/// still implement [`BottomUpTa`] without promising finite enumeration.
+pub trait StateUniverse: BottomUpTa {
+    /// Report every state in the finite universe exactly once.
+    fn all_states(&self, out: &mut dyn FnMut(Self::State));
+}
+
+impl<A: StateUniverse + ?Sized> StateUniverse for &A {
+    fn all_states(&self, out: &mut dyn FnMut(Self::State)) {
+        (**self).all_states(out);
+    }
+}
+
 /// Indexed bottom-up rule enumeration for sibling-finder-style joins.
 ///
 /// [`BottomUpTa::step`] answers a complete transition query. This refinement
@@ -124,5 +143,107 @@ impl<A: TopDownTa + ?Sized> TopDownTa for &A {
 
     fn initial_states(&self, out: &mut dyn FnMut(Self::State)) {
         (**self).initial_states(out);
+    }
+}
+
+/// Compact sorted set of symbols, used by [`CondensedTa`] to group rules.
+///
+/// Internally a sorted, deduplicated inline vector. Lookup is O(log n) via
+/// binary search. Most label sets are tiny (1–4 symbols).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct SymbolSet(SmallVec<[Symbol; 4]>);
+
+impl SymbolSet {
+    /// Create an empty set.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert a symbol, maintaining sorted and deduplicated order.
+    pub fn insert(&mut self, s: Symbol) {
+        match self.0.binary_search(&s) {
+            Ok(_) => {}
+            Err(idx) => self.0.insert(idx, s),
+        }
+    }
+
+    /// Return whether the set contains `s`.
+    pub fn contains(&self, s: Symbol) -> bool {
+        self.0.binary_search(&s).is_ok()
+    }
+
+    /// Iterate over symbols in sorted order.
+    pub fn iter(&self) -> impl Iterator<Item = Symbol> + '_ {
+        self.0.iter().copied()
+    }
+
+    /// Return the number of symbols.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Return whether the set is empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl FromIterator<Symbol> for SymbolSet {
+    fn from_iter<I: IntoIterator<Item = Symbol>>(iter: I) -> Self {
+        let mut set = Self::new();
+        for s in iter {
+            set.insert(s);
+        }
+        set
+    }
+}
+
+/// Refinement of [`BottomUpTa`] that enumerates rules grouped by transition shape.
+///
+/// For each distinct `(children, result)` pair that occurs in any rule, the
+/// automaton collects all symbols `f` such that `f(children) -> result` into a
+/// [`SymbolSet`] and emits them together.
+///
+/// The main use case is efficient materialization when multiple source symbols
+/// share the same homomorphic image: rather than invoking the term evaluator
+/// once per symbol, a single evaluation covers the entire label set.
+pub trait CondensedTa: BottomUpTa {
+    /// Enumerate every distinct `(children, result)` pair, reporting the set of
+    /// symbols that have that shape.
+    ///
+    /// Each shape is emitted exactly once. `children` is borrowed from the
+    /// implementation; the slice is only valid for the duration of the callback.
+    #[allow(clippy::type_complexity)]
+    fn condensed_rules(&self, out: &mut dyn FnMut(&[Self::State], &SymbolSet, Self::State));
+
+    /// Enumerate condensed nullary rules.
+    ///
+    /// The default implementation filters [`CondensedTa::condensed_rules`].
+    /// Implementations on hot paths should override this when nullary rules can
+    /// be produced or indexed more cheaply than the full condensed relation.
+    fn condensed_nullary_rules(&self, out: &mut dyn FnMut(&SymbolSet, Self::State)) {
+        self.condensed_rules(&mut |children, symbols, result| {
+            if children.is_empty() {
+                out(symbols, result);
+            }
+        });
+    }
+
+    /// Enumerate condensed rules whose child at `position` is `state`.
+    ///
+    /// The default implementation filters [`CondensedTa::condensed_rules`].
+    /// Implementations on hot paths should override this to avoid materializing
+    /// or scanning unrelated condensed rules.
+    fn condensed_rules_by_child(
+        &self,
+        position: usize,
+        state: &Self::State,
+        out: &mut dyn FnMut(&[Self::State], &SymbolSet, Self::State),
+    ) {
+        self.condensed_rules(&mut |children, symbols, result| {
+            if children.get(position) == Some(state) {
+                out(children, symbols, result);
+            }
+        });
     }
 }

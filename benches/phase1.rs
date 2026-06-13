@@ -2,10 +2,11 @@ use criterion::{
     BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
 };
 use rusty_alto::{
-    Arena, BottomUpTa, DetBottomUpTa, Determinized, Explicit, ExplicitBuilder, IndexedBottomUpTa,
-    Memo, Product, StateId, Symbol, TestArena, TestNode, TopDownTa, materialize, run_det,
-    run_nondet,
+    Arena, BottomUpTa, CondensedTa, DetBottomUpTa, Determinized, Explicit, ExplicitBuilder,
+    HomLabel, Homomorphism, IndexedBottomUpTa, InvHom, Memo, Product, Span, StateId, StringAlgebra,
+    Symbol, TestArena, TestNode, TopDownTa, materialize, run_det, run_nondet,
 };
+use rusty_tree::tree::TreeArena;
 
 const A: Symbol = Symbol(0);
 const U: Symbol = Symbol(1);
@@ -261,6 +262,81 @@ fn reachability(c: &mut Criterion) {
     group.finish();
 }
 
+fn string_decomposition(c: &mut Criterion) {
+    let mut algebra = StringAlgebra::new();
+    let words: Vec<_> = (0..8)
+        .map(|i| algebra.intern_word(format!("w{i}")))
+        .collect();
+    let sentence: Vec<_> = (0..32).map(|i| words[i % words.len()]).collect();
+    let decomp = algebra.decompose(sentence);
+    let concat = algebra.concat_symbol();
+    let repeated_word = words[0];
+
+    let mut group = c.benchmark_group("string_decomposition");
+    group.throughput(Throughput::Elements(decomp.len() as u64));
+
+    group.bench_function("lexical_lookup_repeated_word", |b| {
+        b.iter(|| {
+            let mut count = 0usize;
+            decomp.step(black_box(repeated_word), black_box(&[]), &mut |_| {
+                count += 1
+            });
+            black_box(count)
+        })
+    });
+
+    group.bench_function("concat_adjacency", |b| {
+        b.iter(|| {
+            let mut count = 0usize;
+            decomp.step(
+                black_box(concat),
+                black_box(&[Span::new(3, 11), Span::new(11, 19)]),
+                &mut |_| count += 1,
+            );
+            black_box(count)
+        })
+    });
+
+    group.bench_function("indexed_partial_concat_left", |b| {
+        b.iter(|| {
+            let mut count = 0usize;
+            decomp.step_partial(
+                black_box(concat),
+                0,
+                black_box(&Span::new(3, 11)),
+                &mut |_, _| count += 1,
+            );
+            black_box(count)
+        })
+    });
+
+    group.bench_function("condensed_rules", |b| {
+        b.iter(|| {
+            let mut count = 0usize;
+            decomp.condensed_rules(&mut |_, _, _| count += 1);
+            black_box(count)
+        })
+    });
+
+    let mut arena = TreeArena::new();
+    let v0 = arena.add_node(HomLabel::Var(0), vec![]);
+    let v1 = arena.add_node(HomLabel::Var(1), vec![]);
+    let concat_term = arena.add_node(HomLabel::Symbol(concat), vec![v0, v1]);
+    let mut hom = Homomorphism::new(&arena);
+    hom.add(Symbol(1_000), 2, concat_term).unwrap();
+    let inv = InvHom::new(decomp, hom);
+
+    group.bench_function("condensed_invhom_concat", |b| {
+        b.iter(|| {
+            let mut count = 0usize;
+            inv.condensed_rules(&mut |_, _, _| count += 1);
+            black_box(count)
+        })
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     explicit_lookup,
@@ -268,6 +344,7 @@ criterion_group!(
     memo_behavior,
     combinators,
     materialization,
-    reachability
+    reachability,
+    string_decomposition
 );
 criterion_main!(benches);

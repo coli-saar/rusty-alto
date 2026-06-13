@@ -1,5 +1,6 @@
 use crate::{
     BottomUpTa, DetBottomUpTa, FxHashMap, FxHashSet, IndexedBottomUpTa, StateId, Symbol, TopDownTa,
+    traits::{CondensedTa, StateUniverse, SymbolSet},
 };
 use fixedbitset::FixedBitSet;
 use smallvec::SmallVec;
@@ -28,6 +29,7 @@ pub struct Explicit {
     rules: Vec<StoredRule>,
     reachable_cache: OnceCell<FixedBitSet>,
     indexes: OnceCell<Indexes>,
+    condensed_cache: OnceCell<Vec<CondensedRule>>,
 }
 
 #[derive(Clone, Debug, Eq)]
@@ -50,6 +52,13 @@ impl Hash for HigherKey {
 struct StoredRule {
     symbol: Symbol,
     children: Box<[StateId]>,
+    result: StateId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CondensedRule {
+    children: Box<[StateId]>,
+    symbols: SymbolSet,
     result: StateId,
 }
 
@@ -186,6 +195,7 @@ impl ExplicitBuilder {
             rules: stored,
             reachable_cache: OnceCell::new(),
             indexes: OnceCell::new(),
+            condensed_cache: OnceCell::new(),
         }
     }
 
@@ -316,6 +326,35 @@ impl Explicit {
             indexes
         })
     }
+
+    fn condensed_cache(&self) -> &[CondensedRule] {
+        self.condensed_cache.get_or_init(|| {
+            let mut groups: FxHashMap<(Vec<StateId>, StateId), SymbolSet> = FxHashMap::default();
+            for rule in &self.rules {
+                groups
+                    .entry((rule.children.to_vec(), rule.result))
+                    .or_default()
+                    .insert(rule.symbol);
+            }
+
+            let mut condensed: Vec<_> = groups
+                .into_iter()
+                .map(|((children, result), symbols)| CondensedRule {
+                    children: children.into_boxed_slice(),
+                    symbols,
+                    result,
+                })
+                .collect();
+            condensed.sort_by(|a, b| {
+                (&a.children, a.result, a.symbols.iter().collect::<Vec<_>>()).cmp(&(
+                    &b.children,
+                    b.result,
+                    b.symbols.iter().collect::<Vec<_>>(),
+                ))
+            });
+            condensed
+        })
+    }
 }
 
 impl BottomUpTa for Explicit {
@@ -396,6 +435,43 @@ impl TopDownTa for Explicit {
     }
 }
 
+impl StateUniverse for Explicit {
+    fn all_states(&self, out: &mut dyn FnMut(StateId)) {
+        for idx in 0..self.num_states {
+            out(StateId(idx));
+        }
+    }
+}
+
+impl CondensedTa for Explicit {
+    fn condensed_rules(&self, out: &mut dyn FnMut(&[StateId], &SymbolSet, StateId)) {
+        for rule in self.condensed_cache() {
+            out(&rule.children, &rule.symbols, rule.result);
+        }
+    }
+
+    fn condensed_nullary_rules(&self, out: &mut dyn FnMut(&SymbolSet, StateId)) {
+        for rule in self.condensed_cache() {
+            if rule.children.is_empty() {
+                out(&rule.symbols, rule.result);
+            }
+        }
+    }
+
+    fn condensed_rules_by_child(
+        &self,
+        position: usize,
+        state: &StateId,
+        out: &mut dyn FnMut(&[StateId], &SymbolSet, StateId),
+    ) {
+        for rule in self.condensed_cache() {
+            if rule.children.get(position) == Some(state) {
+                out(&rule.children, &rule.symbols, rule.result);
+            }
+        }
+    }
+}
+
 fn push_result(results: &mut Results, q: StateId) {
     if !results.contains(&q) {
         results.push(q);
@@ -420,6 +496,8 @@ mod tests {
 
     #[test]
     fn builder_dedupes_rules() {
+        // Adding the same rule twice must not produce a duplicate entry: `rules()`
+        // should iterate exactly one rule, and `step` should emit the state once.
         let mut b = ExplicitBuilder::new();
         let q = b.new_state();
         b.add_rule(Symbol(1), vec![], q);
@@ -433,6 +511,8 @@ mod tests {
 
     #[test]
     fn deterministic_matches_step_for_single_result() {
+        // When only one result state exists for a query, `step_det` must return
+        // it as `Some`, agreeing with `step`.
         let mut b = ExplicitBuilder::new();
         let q = b.new_state();
         b.add_rule(Symbol(1), vec![], q);
@@ -442,6 +522,9 @@ mod tests {
 
     #[test]
     fn nondeterministic_step_det_returns_none() {
+        // If two rules share the same symbol and children but have different
+        // results, the automaton is nondeterministic for that query and
+        // `step_det` must return `None`.
         let mut b = ExplicitBuilder::new();
         let q0 = b.new_state();
         let q1 = b.new_state();
@@ -453,6 +536,9 @@ mod tests {
 
     #[test]
     fn reachable_saturates_rules() {
+        // Both states must be reachable once the leaf nullary rule fires and
+        // the binary rule's children are satisfied. `is_empty` returns false
+        // because the reachable set includes the accepting state.
         let mut b = ExplicitBuilder::new();
         let leaf = b.new_state();
         let root = b.new_state();
@@ -468,6 +554,9 @@ mod tests {
 
     #[test]
     fn higher_key_hash_matches_borrowed_tuple() {
+        // The `HigherKey` stored type must hash identically to the borrowed
+        // `(Symbol, &[StateId])` tuple used for allocation-free lookups.
+        // Divergence here would silently break higher-arity rule lookup.
         let children = [StateId(1), StateId(2), StateId(3)];
         let key = HigherKey(Symbol(7), Box::from(children));
         let mut a = DefaultHasher::new();
@@ -480,6 +569,8 @@ mod tests {
 
     #[test]
     fn higher_arity_lookup_works() {
+        // A ternary rule (arity 3, stored in the `higher` table) must be
+        // reachable via both `step` and `step_det` without allocation.
         let mut b = ExplicitBuilder::new();
         let q0 = b.new_state();
         let q1 = b.new_state();
@@ -492,6 +583,9 @@ mod tests {
 
     #[test]
     fn indexed_step_partial_finds_matching_binary_rules() {
+        // Given a known state at position 0, `step_partial` must return only
+        // the rules where that position actually holds that state — not the
+        // rule where position 0 holds a different state.
         let mut b = ExplicitBuilder::new();
         let left = b.new_state();
         let right = b.new_state();
@@ -511,6 +605,9 @@ mod tests {
 
     #[test]
     fn indexed_step_partial_supports_higher_arity_rules() {
+        // `step_partial` must also index rules stored in the `higher` table
+        // (arity ≥ 3). Querying an interior position (1 of 3) must return the
+        // full child tuple and result.
         let mut b = ExplicitBuilder::new();
         let q0 = b.new_state();
         let q1 = b.new_state();
@@ -529,6 +626,8 @@ mod tests {
 
     #[test]
     fn topdown_enumerates_rules_by_parent() {
+        // `step_topdown` must enumerate every rule whose result is the queried
+        // parent state. `initial_states` must yield every accepting state.
         let mut b = ExplicitBuilder::new();
         let leaf = b.new_state();
         let root = b.new_state();
@@ -546,5 +645,44 @@ mod tests {
 
         assert_eq!(rules, vec![(Symbol(1), vec![leaf, leaf])]);
         assert_eq!(initials, vec![root]);
+    }
+
+    #[test]
+    fn condensed_rules_groups_symbols_by_shape() {
+        // Two symbols with identical (children, result) should appear together
+        // in one condensed rule. A third symbol with a different children tuple
+        // must appear in a separate group. Every rule must be covered exactly once.
+        let mut b = ExplicitBuilder::new();
+        let q0 = b.new_state();
+        let q1 = b.new_state();
+        let qr = b.new_state();
+        // sym(0) and sym(1) both map (q0, q1) -> qr
+        b.add_rule(Symbol(0), vec![q0, q1], qr);
+        b.add_rule(Symbol(1), vec![q0, q1], qr);
+        // sym(2) maps (q1, q0) -> qr  (different children order)
+        b.add_rule(Symbol(2), vec![q1, q0], qr);
+        let e = b.build();
+
+        let mut groups: Vec<(Vec<StateId>, SymbolSet, StateId)> = Vec::new();
+        e.condensed_rules(&mut |children, sym_set, result| {
+            groups.push((children.to_vec(), sym_set.clone(), result));
+        });
+
+        // Find the group for (q0, q1) -> qr and verify both symbols are present.
+        let shared = groups
+            .iter()
+            .find(|(c, _, _)| c.as_slice() == [q0, q1])
+            .expect("group (q0,q1)->qr must exist");
+        assert!(shared.1.contains(Symbol(0)));
+        assert!(shared.1.contains(Symbol(1)));
+        assert_eq!(shared.2, qr);
+
+        // The (q1, q0) group must exist separately with only sym(2).
+        let solo = groups
+            .iter()
+            .find(|(c, _, _)| c.as_slice() == [q1, q0])
+            .expect("group (q1,q0)->qr must exist");
+        assert!(solo.1.contains(Symbol(2)));
+        assert_eq!(solo.1.len(), 1);
     }
 }

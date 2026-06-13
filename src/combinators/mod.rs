@@ -6,9 +6,11 @@
 //! versions later.
 
 mod determinized;
+mod invhom;
 mod mapped;
 mod product;
 
 pub use determinized::Determinized;
+pub use invhom::InvHom;
 pub use mapped::Mapped;
 pub use product::Product;
