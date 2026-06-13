@@ -64,3 +64,65 @@ impl<A: DetBottomUpTa + ?Sized> DetBottomUpTa for &A {
         (**self).step_det(f, children)
     }
 }
+
+/// Indexed bottom-up rule enumeration for sibling-finder-style joins.
+///
+/// [`BottomUpTa::step`] answers a complete transition query. This refinement
+/// answers a partial query: given a symbol, child position, and state at that
+/// position, enumerate the full rules that match. Product and parsing
+/// algorithms can use this to join compatible rules without enumerating child
+/// tuples that never occur in either component.
+pub trait IndexedBottomUpTa: BottomUpTa {
+    /// Report every rule `f(children...) -> q` where `children[position]`
+    /// equals `state_at_position`.
+    ///
+    /// `children` is borrowed from the implementation and is valid only for
+    /// the callback. Implementations must not emit duplicate rules.
+    fn step_partial(
+        &self,
+        f: Symbol,
+        position: usize,
+        state_at_position: &Self::State,
+        out: &mut dyn FnMut(&[Self::State], Self::State),
+    );
+}
+
+impl<A: IndexedBottomUpTa + ?Sized> IndexedBottomUpTa for &A {
+    fn step_partial(
+        &self,
+        f: Symbol,
+        position: usize,
+        state_at_position: &Self::State,
+        out: &mut dyn FnMut(&[Self::State], Self::State),
+    ) {
+        (**self).step_partial(f, position, state_at_position, out);
+    }
+}
+
+/// Optional top-down view of a bottom-up automaton.
+///
+/// Not every automaton can enumerate rules by parent state. Implement this
+/// refinement when algorithms need to ask: given a parent state, which symbols
+/// and child-state tuples can produce it?
+pub trait TopDownTa: BottomUpTa {
+    /// Report every rule `f(children...) -> parent`.
+    ///
+    /// `children` is borrowed from the implementation and is valid only for
+    /// the callback.
+    fn step_topdown(&self, parent: &Self::State, out: &mut dyn FnMut(Symbol, &[Self::State]));
+
+    /// Report the initial states of the top-down view.
+    ///
+    /// For bottom-up automata these are exactly the accepting states.
+    fn initial_states(&self, out: &mut dyn FnMut(Self::State));
+}
+
+impl<A: TopDownTa + ?Sized> TopDownTa for &A {
+    fn step_topdown(&self, parent: &Self::State, out: &mut dyn FnMut(Symbol, &[Self::State])) {
+        (**self).step_topdown(parent, out);
+    }
+
+    fn initial_states(&self, out: &mut dyn FnMut(Self::State)) {
+        (**self).initial_states(out);
+    }
+}

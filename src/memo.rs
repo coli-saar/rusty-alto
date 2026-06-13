@@ -1,5 +1,6 @@
 use crate::{
-    BottomUpTa, DetBottomUpTa, Explicit, ExplicitBuilder, FxHashMap, Interner, StateId, Symbol,
+    BottomUpTa, DetBottomUpTa, Explicit, ExplicitBuilder, FxHashMap, IndexedBottomUpTa, Interner,
+    StateId, Symbol, TopDownTa,
 };
 use smallvec::SmallVec;
 use std::cell::{Ref, RefCell};
@@ -261,6 +262,72 @@ impl<A: DetBottomUpTa> DetBottomUpTa for Memo<A> {
     }
 }
 
+impl<A: IndexedBottomUpTa> IndexedBottomUpTa for Memo<A> {
+    fn step_partial(
+        &self,
+        f: Symbol,
+        position: usize,
+        state_at_position: &StateId,
+        out: &mut dyn FnMut(&[StateId], StateId),
+    ) {
+        if state_at_position.is_stuck() {
+            return;
+        }
+
+        let inner_state = self.interner.borrow().resolve(*state_at_position).clone();
+        let mut raw = Vec::new();
+        self.inner
+            .step_partial(f, position, &inner_state, &mut |children, result| {
+                raw.push((children.to_vec(), result));
+            });
+
+        for (children, result) in raw {
+            let mut interner = self.interner.borrow_mut();
+            let dense_children: SmallVec<[StateId; 4]> = children
+                .into_iter()
+                .map(|child| interner.intern(child))
+                .collect();
+            let dense_result = interner.intern(result);
+            drop(interner);
+            out(&dense_children, dense_result);
+        }
+    }
+}
+
+impl<A: TopDownTa> TopDownTa for Memo<A> {
+    fn step_topdown(&self, parent: &StateId, out: &mut dyn FnMut(Symbol, &[StateId])) {
+        if parent.is_stuck() {
+            return;
+        }
+
+        let inner_parent = self.interner.borrow().resolve(*parent).clone();
+        let mut raw = Vec::new();
+        self.inner
+            .step_topdown(&inner_parent, &mut |symbol, children| {
+                raw.push((symbol, children.to_vec()));
+            });
+
+        for (symbol, children) in raw {
+            let mut interner = self.interner.borrow_mut();
+            let dense_children: SmallVec<[StateId; 4]> = children
+                .into_iter()
+                .map(|child| interner.intern(child))
+                .collect();
+            drop(interner);
+            out(symbol, &dense_children);
+        }
+    }
+
+    fn initial_states(&self, out: &mut dyn FnMut(StateId)) {
+        let mut raw = Vec::new();
+        self.inner.initial_states(&mut |q| raw.push(q));
+        let mut interner = self.interner.borrow_mut();
+        for q in raw {
+            out(interner.intern(q));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,6 +349,38 @@ mod tests {
 
         fn is_accepting(&self, q: &Self::State) -> bool {
             *q == "root"
+        }
+    }
+
+    impl IndexedBottomUpTa for Leaf {
+        fn step_partial(
+            &self,
+            f: Symbol,
+            position: usize,
+            state_at_position: &&'static str,
+            out: &mut dyn FnMut(&[&'static str], &'static str),
+        ) {
+            if f == Symbol(1) && position < 2 && *state_at_position == "leaf" {
+                out(&["leaf", "leaf"], "root");
+            }
+        }
+    }
+
+    impl TopDownTa for Leaf {
+        fn step_topdown(
+            &self,
+            parent: &&'static str,
+            out: &mut dyn FnMut(Symbol, &[&'static str]),
+        ) {
+            match *parent {
+                "leaf" => out(Symbol(0), &[]),
+                "root" => out(Symbol(1), &["leaf", "leaf"]),
+                _ => {}
+            }
+        }
+
+        fn initial_states(&self, out: &mut dyn FnMut(&'static str)) {
+            out("root");
         }
     }
 
@@ -310,5 +409,38 @@ mod tests {
             Some(roots[0])
         );
         assert!(explicit.is_accepting(&roots[0]));
+    }
+
+    #[test]
+    fn indexed_partial_forwards_through_memo() {
+        let memo = Memo::new(Leaf);
+        let mut leaves = Vec::new();
+        memo.step(Symbol(0), &[], &mut |q| leaves.push(q));
+
+        let mut found = Vec::new();
+        memo.step_partial(Symbol(1), 0, &leaves[0], &mut |children, result| {
+            found.push((children.to_vec(), result));
+        });
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, vec![leaves[0], leaves[0]]);
+        assert_eq!(memo.resolve(found[0].1), "root");
+    }
+
+    #[test]
+    fn topdown_forwards_through_memo() {
+        let memo = Memo::new(Leaf);
+        let mut initials = Vec::new();
+        memo.initial_states(&mut |q| initials.push(q));
+
+        let mut rules = Vec::new();
+        memo.step_topdown(&initials[0], &mut |symbol, children| {
+            rules.push((symbol, children.to_vec()));
+        });
+
+        assert_eq!(memo.resolve(initials[0]), "root");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].0, Symbol(1));
+        assert_eq!(rules[0].1.len(), 2);
     }
 }

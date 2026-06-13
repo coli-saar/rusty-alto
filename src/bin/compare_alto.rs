@@ -1,8 +1,8 @@
 use rusty_alto::{
-    AltoAutomaton, Arena, BottomUpTa, DetBottomUpTa, StateId, Symbol, TestArena, TestNode,
-    parse_alto,
+    AltoAutomaton, Arena, BottomUpTa, DetBottomUpTa, Signature, StateId, Symbol, TestArena,
+    TestNode, parse_alto,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::process;
@@ -192,7 +192,7 @@ struct ParsedTree {
 }
 
 fn parse_tree_file(input: &str, auto: &AltoAutomaton) -> Result<Vec<ParsedTree>, String> {
-    let mut symbol_overrides = HashMap::new();
+    let mut signature = auto.signature.clone();
     let mut trees = Vec::new();
     for (line_idx, line) in input.lines().enumerate() {
         let trimmed = line.trim();
@@ -200,7 +200,7 @@ fn parse_tree_file(input: &str, auto: &AltoAutomaton) -> Result<Vec<ParsedTree>,
             continue;
         }
         trees.push(
-            TreeParser::new(trimmed, auto, &mut symbol_overrides)
+            TreeParser::new(trimmed, &mut signature)
                 .parse()
                 .map_err(|e| format!("tree line {}: {e}", line_idx + 1))?,
         );
@@ -211,24 +211,18 @@ fn parse_tree_file(input: &str, auto: &AltoAutomaton) -> Result<Vec<ParsedTree>,
 struct TreeParser<'a, 'b> {
     input: &'a str,
     pos: usize,
-    auto: &'a AltoAutomaton,
-    unknown_symbols: &'b mut HashMap<String, Symbol>,
+    signature: &'b mut Signature,
     arena: TestArena,
     symbols: Vec<Symbol>,
     children: Vec<Vec<usize>>,
 }
 
 impl<'a, 'b> TreeParser<'a, 'b> {
-    fn new(
-        input: &'a str,
-        auto: &'a AltoAutomaton,
-        unknown_symbols: &'b mut HashMap<String, Symbol>,
-    ) -> Self {
+    fn new(input: &'a str, signature: &'b mut Signature) -> Self {
         Self {
             input,
             pos: 0,
-            auto,
-            unknown_symbols,
+            signature,
             arena: TestArena::new(),
             symbols: Vec::new(),
             children: Vec::new(),
@@ -273,7 +267,7 @@ impl<'a, 'b> TreeParser<'a, 'b> {
             }
         }
 
-        let symbol = self.symbol_for(&label);
+        let symbol = self.symbol_for(&label, children.len())?;
         let child_indices: Vec<usize> = children.iter().map(|node| node.0).collect();
         let node = self.arena.add_node(symbol, children);
         self.symbols.push(symbol);
@@ -281,15 +275,10 @@ impl<'a, 'b> TreeParser<'a, 'b> {
         Ok(node)
     }
 
-    fn symbol_for(&mut self, label: &str) -> Symbol {
-        if let Some(symbol) = self.auto.signature.get(label) {
-            return symbol;
-        }
-        let next = self.auto.signature.len() + self.unknown_symbols.len();
-        *self
-            .unknown_symbols
-            .entry(label.to_owned())
-            .or_insert(Symbol(next as u32))
+    fn symbol_for(&mut self, label: &str, arity: usize) -> Result<Symbol, String> {
+        self.signature
+            .intern(label.to_owned(), arity)
+            .map_err(|e| e.to_string())
     }
 
     fn name(&mut self) -> Result<String, String> {

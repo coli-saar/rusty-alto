@@ -50,18 +50,22 @@ pub mod interner;
 pub mod materialize;
 pub mod memo;
 pub mod run;
+pub mod signature;
 pub mod traits;
 
-pub use alto::{AltoAutomaton, AltoParseError, AltoRule, AltoSignature, parse_alto};
+pub use alto::{
+    AltoAutomaton, AltoParseError, AltoRule, AltoSignature, parse_alto, parse_alto_with_signature,
+};
 pub use arena::{Arena, NodeId, TestArena, TestNode};
-pub use combinators::{Determinized, Product};
+pub use combinators::{Determinized, Mapped, Product};
 pub use explicit::{Explicit, ExplicitBuilder, Rule};
 pub use ids::{Arity, StateId, Symbol};
 pub use interner::Interner;
 pub use materialize::materialize;
 pub use memo::{Memo, MemoStats};
 pub use run::{DetRun, NonDetRun, StateSet, run_det, run_nondet};
-pub use traits::{BottomUpTa, DetBottomUpTa};
+pub use signature::{Signature, SignatureError};
+pub use traits::{BottomUpTa, DetBottomUpTa, IndexedBottomUpTa, TopDownTa};
 
 pub(crate) type FxHashMap<K, V> = hashbrown::HashMap<K, V, rustc_hash::FxBuildHasher>;
 pub(crate) type FxHashSet<T> = hashbrown::HashSet<T, rustc_hash::FxBuildHasher>;

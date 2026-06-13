@@ -1,4 +1,6 @@
-use crate::{BottomUpTa, DetBottomUpTa, FxHashMap, FxHashSet, StateId, Symbol};
+use crate::{
+    BottomUpTa, DetBottomUpTa, FxHashMap, FxHashSet, IndexedBottomUpTa, StateId, Symbol, TopDownTa,
+};
 use fixedbitset::FixedBitSet;
 use smallvec::SmallVec;
 use std::cell::OnceCell;
@@ -25,6 +27,7 @@ pub struct Explicit {
     higher: FxHashMap<HigherKey, Results>,
     rules: Vec<StoredRule>,
     reachable_cache: OnceCell<FixedBitSet>,
+    indexes: OnceCell<Indexes>,
 }
 
 #[derive(Clone, Debug, Eq)]
@@ -48,6 +51,12 @@ struct StoredRule {
     symbol: Symbol,
     children: Box<[StateId]>,
     result: StateId,
+}
+
+#[derive(Clone, Debug, Default)]
+struct Indexes {
+    by_child: FxHashMap<(Symbol, usize, StateId), Vec<usize>>,
+    by_result: FxHashMap<StateId, Vec<usize>>,
 }
 
 /// Borrowed view of one transition rule in an [`Explicit`] automaton.
@@ -176,6 +185,7 @@ impl ExplicitBuilder {
             higher,
             rules: stored,
             reachable_cache: OnceCell::new(),
+            indexes: OnceCell::new(),
         }
     }
 
@@ -285,6 +295,27 @@ impl Explicit {
             .from_hash(hash, |k| k.0 == f && &*k.1 == children)
             .map(|(_, v)| v)
     }
+
+    fn indexes(&self) -> &Indexes {
+        self.indexes.get_or_init(|| {
+            let mut indexes = Indexes::default();
+            for (rule_idx, rule) in self.rules.iter().enumerate() {
+                indexes
+                    .by_result
+                    .entry(rule.result)
+                    .or_default()
+                    .push(rule_idx);
+                for (position, &child) in rule.children.iter().enumerate() {
+                    indexes
+                        .by_child
+                        .entry((rule.symbol, position, child))
+                        .or_default()
+                        .push(rule_idx);
+                }
+            }
+            indexes
+        })
+    }
 }
 
 impl BottomUpTa for Explicit {
@@ -318,6 +349,50 @@ impl DetBottomUpTa for Explicit {
             _ => self.lookup_higher(f, children),
         }?;
         (results.len() == 1).then_some(results[0])
+    }
+}
+
+impl IndexedBottomUpTa for Explicit {
+    fn step_partial(
+        &self,
+        f: Symbol,
+        position: usize,
+        state_at_position: &StateId,
+        out: &mut dyn FnMut(&[StateId], StateId),
+    ) {
+        let Some(rule_indexes) = self
+            .indexes()
+            .by_child
+            .get(&(f, position, *state_at_position))
+        else {
+            return;
+        };
+
+        for &rule_idx in rule_indexes {
+            let rule = &self.rules[rule_idx];
+            out(&rule.children, rule.result);
+        }
+    }
+}
+
+impl TopDownTa for Explicit {
+    fn step_topdown(&self, parent: &StateId, out: &mut dyn FnMut(Symbol, &[StateId])) {
+        if parent.is_stuck() {
+            return;
+        }
+        let Some(rule_indexes) = self.indexes().by_result.get(parent) else {
+            return;
+        };
+        for &rule_idx in rule_indexes {
+            let rule = &self.rules[rule_idx];
+            out(rule.symbol, &rule.children);
+        }
+    }
+
+    fn initial_states(&self, out: &mut dyn FnMut(StateId)) {
+        for idx in self.accepting.ones() {
+            out(StateId(idx as u32));
+        }
     }
 }
 
@@ -413,5 +488,63 @@ mod tests {
         b.add_rule(Symbol(9), vec![q0, q1, q2], q3);
         let e = b.build();
         assert_eq!(e.step_det(Symbol(9), &[q0, q1, q2]), Some(q3));
+    }
+
+    #[test]
+    fn indexed_step_partial_finds_matching_binary_rules() {
+        let mut b = ExplicitBuilder::new();
+        let left = b.new_state();
+        let right = b.new_state();
+        let root = b.new_state();
+        let other = b.new_state();
+        b.add_rule(Symbol(3), vec![left, right], root);
+        b.add_rule(Symbol(3), vec![other, right], other);
+        let e = b.build();
+
+        let mut found = Vec::new();
+        e.step_partial(Symbol(3), 0, &left, &mut |children, result| {
+            found.push((children.to_vec(), result));
+        });
+
+        assert_eq!(found, vec![(vec![left, right], root)]);
+    }
+
+    #[test]
+    fn indexed_step_partial_supports_higher_arity_rules() {
+        let mut b = ExplicitBuilder::new();
+        let q0 = b.new_state();
+        let q1 = b.new_state();
+        let q2 = b.new_state();
+        let q3 = b.new_state();
+        b.add_rule(Symbol(9), vec![q0, q1, q2], q3);
+        let e = b.build();
+
+        let mut found = Vec::new();
+        e.step_partial(Symbol(9), 1, &q1, &mut |children, result| {
+            found.push((children.to_vec(), result));
+        });
+
+        assert_eq!(found, vec![(vec![q0, q1, q2], q3)]);
+    }
+
+    #[test]
+    fn topdown_enumerates_rules_by_parent() {
+        let mut b = ExplicitBuilder::new();
+        let leaf = b.new_state();
+        let root = b.new_state();
+        b.add_rule(Symbol(0), vec![], leaf);
+        b.add_rule(Symbol(1), vec![leaf, leaf], root);
+        b.add_accepting(root);
+        let e = b.build();
+
+        let mut rules = Vec::new();
+        e.step_topdown(&root, &mut |symbol, children| {
+            rules.push((symbol, children.to_vec()));
+        });
+        let mut initials = Vec::new();
+        e.initial_states(&mut |q| initials.push(q));
+
+        assert_eq!(rules, vec![(Symbol(1), vec![leaf, leaf])]);
+        assert_eq!(initials, vec![root]);
     }
 }

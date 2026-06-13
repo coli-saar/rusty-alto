@@ -27,9 +27,10 @@ cargo bench --bench phase1 -- --sample-size 10
 The suite currently covers:
 
 - explicit `step_det` lookup for arity 0, 1, 2, and higher arity
+- explicit indexed `step_partial` and top-down rule enumeration
 - deterministic and nondeterministic tree runs
 - cold and warm `Memo` runs over an implicit automaton
-- generic and deterministic product steps
+- generic, deterministic, and indexed product steps
 - generic determinization
 - materialization over a finite implicit automaton
 - repeated explicit reachability queries
@@ -97,6 +98,37 @@ This harness is an end-to-end comparison. It includes parsing, tree-run
 machinery, runtime effects, and JVM behavior, so it complements Criterion rather
 than replacing it.
 
+## Intersection Comparison Harness
+
+The intersection harness compares materializing the product of a generated
+explicit grammar automaton and an explicit CKY-style string-span automaton. The
+right automaton follows Alto's `StringAlgebra` decomposition shape: word labels
+create length-1 spans, and the binary `*` label combines adjacent spans.
+
+Run it with:
+
+```bash
+scripts/compare-intersection.sh \
+  --states 12 \
+  --len 10 \
+  --vocab 4 \
+  --iterations 10 \
+  --warmup 2 \
+  --report target/alto-comparison/intersection-report.md
+```
+
+The script runs four combinations:
+
+- `rusty-alto` naive: repeated compatible rule-pair scanning
+- `rusty-alto` sibling: agenda-driven child-pair joins using child-state indexes
+- Alto naive: `IntersectionAutomaton.intersectBottomUpNaive`
+- Alto sibling: an agenda benchmark using Alto `ConcreteTreeAutomaton` and
+  `SiblingFinder` indexes
+
+It verifies that the Rust naive and sibling algorithms produce identical output
+state and rule counts. Alto counts are reported in the same table; the current
+generated workload has matched the same counts in smoke runs.
+
 ## Generated Alto Suite
 
 Suite mode currently generates eight workloads:
@@ -155,11 +187,37 @@ iterations, and 50 warmup iterations accepted all 32 trees in both engines. The
 smoke run measured roughly 6.0 us/tree for `rusty-alto` in `mode=det` and
 20.9 us/tree for Alto.
 
+## Current Intersection Results
+
+The following smoke run used 12 grammar states, sentence length 10, vocabulary
+size 4, 10 iterations, and 2 warmup iterations.
+
+| Engine | Algorithm | Left rules | Right rules | Output states | Output rules | ns/intersection |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| rusty-alto | naive | 192 | 175 | 660 | 23880 | 6797487.500 |
+| rusty-alto | sibling | 192 | 175 | 660 | 23880 | 5424145.900 |
+| Alto | naive | 192 | 175 | 660 | 23880 | 57177995.900 |
+| Alto | sibling | 192 | 175 | 660 | 23880 | 10214129.200 |
+
+Interpretation:
+
+- Rust's indexed path is already faster on this moderate workload, but the
+  speedup is modest because both Rust implementations are simple and the naive
+  scan is still small enough to stay cache-friendly.
+- Alto's sibling-finder path gives a much larger improvement over Alto's naive
+  intersection on the same generated automata.
+- The workload is intentionally close to `StringAlgebra` CKY decomposition, but
+  it is still explicit on the Rust side. A future port of Alto's implicit
+  `StringAlgebra` decomposition should add an explicit-vs-implicit row.
+
 ## Next Benchmarking Work
 
 Add parser-like product workloads once indexed rule enumeration exists. The
 current product benchmarks measure transition-query performance, not full
 chart-style parsing behavior.
+
+Extend the intersection harness after porting `StringAlgebra` so it can compare
+explicit grammar vs implicit decomposition automata directly.
 
 Add a dense-state determinization benchmark before replacing the current
 `BTreeSet`-based generic determinizer.

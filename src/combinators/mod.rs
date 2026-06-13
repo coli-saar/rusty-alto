@@ -6,7 +6,9 @@
 //! versions later.
 
 mod determinized;
+mod mapped;
 mod product;
 
 pub use determinized::Determinized;
+pub use mapped::Mapped;
 pub use product::Product;

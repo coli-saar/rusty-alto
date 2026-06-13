@@ -1,5 +1,6 @@
-use crate::{Explicit, ExplicitBuilder, FxHashMap, Interner, StateId, Symbol};
-use std::fmt;
+use crate::{
+    Explicit, ExplicitBuilder, FxHashMap, Interner, Signature, SignatureError, StateId, Symbol,
+};
 use thiserror::Error;
 
 /// Parsed Alto tree automaton.
@@ -22,67 +23,8 @@ pub struct AltoAutomaton {
     pub rules: Vec<AltoRule>,
 }
 
-/// String signature used while reading Alto files.
-#[derive(Clone, Debug, Default)]
-pub struct AltoSignature {
-    names: Vec<String>,
-    ids: FxHashMap<String, Symbol>,
-    arities: FxHashMap<Symbol, usize>,
-}
-
-impl AltoSignature {
-    /// Create an empty signature.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Return the symbol ID for a name, inserting it if needed.
-    pub fn intern(&mut self, name: String, arity: usize) -> Result<Symbol, AltoParseError> {
-        if let Some(&symbol) = self.ids.get(&name) {
-            let old_arity = self.arities[&symbol];
-            if old_arity != arity {
-                return Err(AltoParseError::ArityMismatch {
-                    symbol: name,
-                    first: old_arity,
-                    second: arity,
-                });
-            }
-            return Ok(symbol);
-        }
-
-        let id = u32::try_from(self.names.len()).expect("too many symbols for Symbol");
-        let symbol = Symbol(id);
-        self.names.push(name.clone());
-        self.ids.insert(name, symbol);
-        self.arities.insert(symbol, arity);
-        Ok(symbol)
-    }
-
-    /// Look up a symbol ID by name.
-    pub fn get(&self, name: &str) -> Option<Symbol> {
-        self.ids.get(name).copied()
-    }
-
-    /// Resolve a symbol ID back to its Alto name.
-    pub fn resolve(&self, symbol: Symbol) -> &str {
-        &self.names[symbol.0 as usize]
-    }
-
-    /// Return the arity recorded for a symbol.
-    pub fn arity(&self, symbol: Symbol) -> usize {
-        self.arities[&symbol]
-    }
-
-    /// Number of terminal symbols in the signature.
-    pub fn len(&self) -> usize {
-        self.names.len()
-    }
-
-    /// Return whether the signature is empty.
-    pub fn is_empty(&self) -> bool {
-        self.names.is_empty()
-    }
-}
+/// Backwards-compatible name for the shared label signature.
+pub type AltoSignature = Signature;
 
 /// One rule parsed from an Alto file.
 #[derive(Clone, Debug, PartialEq)]
@@ -156,6 +98,22 @@ pub enum AltoParseError {
     },
 }
 
+impl From<SignatureError> for AltoParseError {
+    fn from(value: SignatureError) -> Self {
+        match value {
+            SignatureError::ArityMismatch {
+                symbol,
+                first,
+                second,
+            } => Self::ArityMismatch {
+                symbol,
+                first,
+                second,
+            },
+        }
+    }
+}
+
 /// Parse an Alto `.auto` file into a bottom-up explicit automaton.
 ///
 /// Supported syntax follows Alto's `auto` codec:
@@ -167,7 +125,21 @@ pub enum AltoParseError {
 /// - optional weights, defaulting to `1.0`
 /// - `// ...` line comments and `/* ... */` block comments
 pub fn parse_alto(input: &str) -> Result<AltoAutomaton, AltoParseError> {
-    Parser::new(input).parse()
+    let mut signature = Signature::new();
+    parse_alto_with_signature(input, &mut signature)
+}
+
+/// Parse an Alto `.auto` file using a caller-owned shared signature.
+///
+/// This is useful when automata and input trees should be compiled into the
+/// same raw [`Symbol`] space. The returned [`AltoAutomaton`] contains a clone of
+/// the signature after parsing; the caller can keep using `signature` to parse
+/// or validate trees before running the automaton.
+pub fn parse_alto_with_signature(
+    input: &str,
+    signature: &mut Signature,
+) -> Result<AltoAutomaton, AltoParseError> {
+    Parser::new(input, signature).parse()
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -194,20 +166,20 @@ struct Parser<'a> {
     builder: ExplicitBuilder,
     states: Interner<String>,
     state_ids: FxHashMap<String, StateId>,
-    signature: AltoSignature,
+    signature: &'a mut Signature,
     rules: Vec<AltoRule>,
     _input: &'a str,
 }
 
 impl<'a> Parser<'a> {
-    fn new(input: &'a str) -> Self {
+    fn new(input: &'a str, signature: &'a mut Signature) -> Self {
         Self {
             tokens: Vec::new(),
             pos: 0,
             builder: ExplicitBuilder::new(),
             states: Interner::new(),
             state_ids: FxHashMap::default(),
-            signature: AltoSignature::new(),
+            signature,
             rules: Vec::new(),
             _input: input,
         }
@@ -222,7 +194,7 @@ impl<'a> Parser<'a> {
         Ok(AltoAutomaton {
             automaton: self.builder.build(),
             states: self.states,
-            signature: self.signature,
+            signature: self.signature.clone(),
             rules: self.rules,
         })
     }
@@ -532,19 +504,6 @@ fn token_display(kind: &TokenKind) -> String {
     }
 }
 
-impl fmt::Display for AltoSignature {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (idx, name) in self.names.iter().enumerate() {
-            if idx > 0 {
-                writeln!(f)?;
-            }
-            let symbol = Symbol(idx as u32);
-            write!(f, "{} / {}", name, self.arity(symbol))?;
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,5 +555,14 @@ mod tests {
     fn detects_arity_mismatch() {
         let err = parse_alto("S -> f(A) T -> f(A,A)").unwrap_err();
         assert!(matches!(err, AltoParseError::ArityMismatch { .. }));
+    }
+
+    #[test]
+    fn can_parse_with_shared_signature() {
+        let mut signature = Signature::new();
+        let a = signature.intern("a".to_owned(), 0).unwrap();
+        let parsed = parse_alto_with_signature("S! -> a", &mut signature).unwrap();
+        assert_eq!(parsed.signature.get("a"), Some(a));
+        assert_eq!(signature.get("a"), Some(a));
     }
 }
