@@ -1,0 +1,114 @@
+use crate::alto_ast::{
+    AstAutoRule, AstFeatureDecl, AstFta, AstHomRule, AstHomTerm, AstInterpretationDecl, AstIrtg,
+    AstRule, AstState, Tok,
+};
+
+grammar;
+
+extern {
+    type Location = usize;
+    type Error = String;
+
+    enum Tok {
+        "name" => Tok::Name(<String>),
+        "number" => Tok::Number(<String>),
+        "variable" => Tok::Variable(<usize>),
+        "interpretation" => Tok::Interpretation,
+        "feature" => Tok::Feature,
+        "->" => Tok::Arrow,
+        "(" => Tok::LParen,
+        ")" => Tok::RParen,
+        "[" => Tok::LBracket,
+        "]" => Tok::RBracket,
+        "," => Tok::Comma,
+        ":" => Tok::Colon,
+        "!" => Tok::Fin,
+    }
+}
+
+pub Irtg: AstIrtg = {
+    <interpretations:InterpretationDecl*> <features:FeatureDecl*> <rules:IrtgRule*> => {
+        AstIrtg { interpretations, features, rules }
+    }
+};
+
+pub Fta: AstFta = {
+    <rules:AutoRule*> => AstFta { rules }
+};
+
+InterpretationDecl: AstInterpretationDecl = {
+    "interpretation" <name:Name> ":" <algebra:Name> => AstInterpretationDecl { name, algebra }
+};
+
+FeatureDecl: AstFeatureDecl = {
+    "feature" <first:Name> ":" <second:Name> <states:StateList> => {
+        AstFeatureDecl { parts: vec![first, second], states }
+    },
+    "feature" <first:Name> ":" <second:Name> ":" ":" <third:Name> <states:StateList> => {
+        AstFeatureDecl { parts: vec![first, second, third], states }
+    }
+};
+
+IrtgRule: AstRule = {
+    <auto:AutoRule> <homs:HomRule*> => AstRule { auto, homs }
+};
+
+#[inline]
+AutoRule: AstAutoRule = {
+    <parent:State> "->" <symbol:Name> <children:StateList> <weight:Weight?> => {
+        AstAutoRule { parent, symbol, children, weight }
+    }
+};
+
+StateList: Vec<AstState> = {
+    => Vec::new(),
+    "(" ")" => Vec::new(),
+    "(" <states:Comma<State>> ")" => states,
+};
+
+HomRule: AstHomRule = {
+    "[" <interpretation:Name> "]" <term:Term> => AstHomRule { interpretation, term }
+};
+
+Term: AstHomTerm = {
+    <name:Name> <children:TermChildren> => AstHomTerm::Symbol(name, children),
+    <variable:Variable> => AstHomTerm::Variable(variable),
+};
+
+TermChildren: Vec<AstHomTerm> = {
+    => Vec::new(),
+    "(" ")" => Vec::new(),
+    "(" <children:Comma<Term>> ")" => children,
+};
+
+State: AstState = {
+    <name:Name> <is_final:Final?> => AstState { name, is_final: is_final.is_some() }
+};
+
+Final: () = {
+    "!" => ()
+};
+
+Weight: f64 = {
+    "[" <text:Number> "]" => text.parse::<f64>().expect("lexer only emits valid numbers")
+};
+
+Name: String = {
+    "name" => <>
+};
+
+Variable: usize = {
+    "variable" => <>
+};
+
+Number: String = {
+    "number" => <>
+};
+
+Comma<T>: Vec<T> = {
+    <head:T> <tail:("," <T>)*> => {
+        let mut out = vec![head];
+        out.extend(tail);
+        out
+    }
+};

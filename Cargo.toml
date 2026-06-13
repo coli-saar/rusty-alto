@@ -10,9 +10,13 @@ rustc-hash = "2"
 rusty-tree = { path = "../rusty-tree" }
 smallvec = "1"
 thiserror = "2"
+lalrpop-util = "0.23"
 
 [dev-dependencies]
 criterion = "0.5"
+
+[build-dependencies]
+lalrpop = "0.23"
 
 [features]
 default = []

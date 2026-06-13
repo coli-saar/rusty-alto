@@ -16,14 +16,14 @@ use smallvec::SmallVec;
 /// The homomorphism is validated when it is built, so every source child occurs
 /// exactly once in each image term. This gives the condensed implementation a
 /// well-defined way to recover source child states from target-side rules.
-pub struct InvHom<'a, A> {
+pub struct InvHom<'h, A> {
     inner: A,
-    hom: Homomorphism<'a>,
+    hom: &'h Homomorphism,
 }
 
-impl<'a, A> InvHom<'a, A> {
+impl<'h, A> InvHom<'h, A> {
     /// Wrap `inner` with the given homomorphism.
-    pub fn new(inner: A, hom: Homomorphism<'a>) -> Self {
+    pub fn new(inner: A, hom: &'h Homomorphism) -> Self {
         Self { inner, hom }
     }
 
@@ -33,8 +33,8 @@ impl<'a, A> InvHom<'a, A> {
     }
 
     /// Return the homomorphism used to map source symbols to target terms.
-    pub fn homomorphism(&self) -> &Homomorphism<'a> {
-        &self.hom
+    pub fn homomorphism(&self) -> &Homomorphism {
+        self.hom
     }
 }
 
@@ -536,9 +536,9 @@ mod tests {
         let v0 = var(&mut arena, 0);
         let v1 = var(&mut arena, 1);
         let rhs = node(&mut arena, sym(10), vec![v0, v1]);
-        let mut hom = Homomorphism::new(&arena);
+        let mut hom = Homomorphism::with_arena(arena);
         hom.add(sym(0), 2, rhs).unwrap();
-        let inv = InvHom::new(inner, hom);
+        let inv = InvHom::new(inner, &hom);
 
         let mut out = Vec::new();
         inv.step(sym(0), &[q0, q1], &mut |q| out.push(q));
@@ -567,9 +567,9 @@ mod tests {
         let mut arena = TreeArena::new();
         let v0 = var(&mut arena, 0);
         let rhs = node(&mut arena, sym(10), vec![v0]);
-        let mut hom = Homomorphism::new(&arena);
+        let mut hom = Homomorphism::with_arena(arena);
         hom.add(sym(0), 1, rhs).unwrap();
-        let inv = InvHom::new(DuplicateInner, hom);
+        let inv = InvHom::new(DuplicateInner, &hom);
 
         let mut out = Vec::new();
         inv.step(sym(0), &[StateId(0)], &mut |q| out.push(q));
@@ -583,9 +583,9 @@ mod tests {
         let v0 = var(&mut arena, 0);
         let v1 = var(&mut arena, 1);
         let rhs = node(&mut arena, sym(10), vec![v0, v1]);
-        let mut hom = Homomorphism::new(&arena);
+        let mut hom = Homomorphism::with_arena(arena);
         hom.add(sym(0), 2, rhs).unwrap();
-        let inv = InvHom::new(inner, hom);
+        let inv = InvHom::new(inner, &hom);
         assert_eq!(inv.step_det(sym(0), &[q0, q1]), Some(qr));
         assert_eq!(inv.step_det(sym(0), &[q1, q0]), None);
     }
@@ -594,8 +594,8 @@ mod tests {
     fn unmapped_symbol_emits_nothing() {
         let (inner, q0, q1, _qr) = make_inner();
         let arena = TreeArena::new();
-        let hom = Homomorphism::new(&arena);
-        let inv = InvHom::new(inner, hom);
+        let hom = Homomorphism::with_arena(arena);
+        let inv = InvHom::new(inner, &hom);
         let mut out = Vec::new();
         inv.step(sym(99), &[q0, q1], &mut |q| out.push(q));
         assert!(out.is_empty());
@@ -611,9 +611,9 @@ mod tests {
 
         let mut arena = TreeArena::new();
         let rhs = node(&mut arena, sym(20), vec![]);
-        let mut hom = Homomorphism::new(&arena);
+        let mut hom = Homomorphism::with_arena(arena);
         hom.add(sym(0), 0, rhs).unwrap();
-        let inv = InvHom::new(inner, hom);
+        let inv = InvHom::new(inner, &hom);
 
         let mut out = Vec::new();
         inv.step(sym(0), &[], &mut |q| out.push(q));
@@ -638,9 +638,9 @@ mod tests {
         let wrapped = node(&mut arena, sym(5), vec![wrapped_v0]);
         let v1 = var(&mut arena, 1);
         let rhs = node(&mut arena, sym(6), vec![wrapped, v1]);
-        let mut hom = Homomorphism::new(&arena);
+        let mut hom = Homomorphism::with_arena(arena);
         hom.add(sym(0), 2, rhs).unwrap();
-        let inv = InvHom::new(inner, hom);
+        let inv = InvHom::new(inner, &hom);
 
         let mut out = Vec::new();
         inv.step(sym(0), &[q_leaf, q1], &mut |q| out.push(q));
@@ -657,10 +657,10 @@ mod tests {
         let same_v0 = var(&mut arena, 0);
         let same_v1 = var(&mut arena, 1);
         let same = node(&mut arena, sym(10), vec![same_v0, same_v1]);
-        let mut hom = Homomorphism::new(&arena);
+        let mut hom = Homomorphism::with_arena(arena);
         hom.add(sym(0), 2, rhs).unwrap();
         hom.add(sym(1), 2, same).unwrap();
-        let inv = InvHom::new(inner, hom);
+        let inv = InvHom::new(inner, &hom);
 
         let mut groups = Vec::new();
         inv.condensed_rules(&mut |children, symbols, result| {
@@ -684,10 +684,10 @@ mod tests {
         let same_v0 = var(&mut arena, 0);
         let same_v1 = var(&mut arena, 1);
         let same = node(&mut arena, sym(10), vec![same_v0, same_v1]);
-        let mut hom = Homomorphism::new(&arena);
+        let mut hom = Homomorphism::with_arena(arena);
         hom.add(sym(0), 2, rhs).unwrap();
         hom.add(sym(1), 2, same).unwrap();
-        let inv = InvHom::new(inner, hom);
+        let inv = InvHom::new(inner, &hom);
 
         let mut groups = Vec::new();
         inv.condensed_rules_by_child(0, &q0, &mut |children, symbols, result| {
@@ -717,9 +717,9 @@ mod tests {
         let wrapped = node(&mut arena, sym(5), vec![wrapped_v0]);
         let v1 = var(&mut arena, 1);
         let rhs = node(&mut arena, sym(6), vec![wrapped, v1]);
-        let mut hom = Homomorphism::new(&arena);
+        let mut hom = Homomorphism::with_arena(arena);
         hom.add(sym(0), 2, rhs).unwrap();
-        let inv = InvHom::new(inner, hom);
+        let inv = InvHom::new(inner, &hom);
 
         let mut condensed = Vec::new();
         inv.condensed_rules(&mut |children, symbols, result| {
@@ -751,9 +751,9 @@ mod tests {
         let ground = node(&mut arena, sym(3), vec![]);
         let v0 = var(&mut arena, 0);
         let rhs = node(&mut arena, sym(4), vec![ground, v0]);
-        let mut hom = Homomorphism::new(&arena);
+        let mut hom = Homomorphism::with_arena(arena);
         hom.add(sym(0), 1, rhs).unwrap();
-        let inv = InvHom::new(inner, hom);
+        let inv = InvHom::new(inner, &hom);
 
         let mut groups = Vec::new();
         inv.condensed_rules(&mut |children, symbols, result| {
@@ -777,9 +777,9 @@ mod tests {
 
         let mut arena = TreeArena::new();
         let rhs = var(&mut arena, 0);
-        let mut hom = Homomorphism::new(&arena);
+        let mut hom = Homomorphism::with_arena(arena);
         hom.add(sym(0), 1, rhs).unwrap();
-        let inv = InvHom::new(inner, hom);
+        let inv = InvHom::new(inner, &hom);
 
         let mut groups = Vec::new();
         inv.condensed_rules(&mut |children, symbols, result| {
@@ -833,9 +833,9 @@ mod tests {
         let v0 = var(&mut arena, 0);
         let v1 = var(&mut arena, 1);
         let rhs = node(&mut arena, sym(10), vec![v0, v1]);
-        let mut hom = Homomorphism::new(&arena);
+        let mut hom = Homomorphism::with_arena(arena);
         hom.add(sym(0), 2, rhs).unwrap();
-        let inv = InvHom::new(inner, hom);
+        let inv = InvHom::new(inner, &hom);
 
         let mut rules = Vec::new();
         inv.condensed_rules(&mut |children, symbols, result| {

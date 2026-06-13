@@ -43,12 +43,18 @@
 
 pub mod algebras;
 pub mod alto;
+pub mod alto_ast;
+lalrpop_util::lalrpop_mod!(
+    #[allow(clippy::all)]
+    alto_grammar
+);
 pub mod arena;
 pub mod combinators;
 pub mod explicit;
 pub mod homomorphism;
 pub mod ids;
 pub mod interner;
+pub mod irtg;
 pub mod materialize;
 pub mod memo;
 pub mod run;
@@ -67,7 +73,13 @@ pub use explicit::{Explicit, ExplicitBuilder, Rule};
 pub use homomorphism::{HomLabel, HomTerm, Homomorphism, HomomorphismError};
 pub use ids::{Arity, StateId, Symbol};
 pub use interner::Interner;
-pub use materialize::materialize;
+pub use irtg::{
+    Interpretation, Irtg, IrtgError, IrtgRule, ParseChart, ParseInput, TypedInterpretation,
+    parse_irtg,
+};
+pub use materialize::{
+    IndexedCondensedIntersectionStats, materialize, materialize_indexed_condensed_intersection,
+};
 pub use memo::{Memo, MemoStats};
 pub use run::{DetRun, NonDetRun, StateSet, run_det, run_nondet};
 pub use signature::{Signature, SignatureError};

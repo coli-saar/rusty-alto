@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-OUT_DIR="${1:-examples/deterministic}"
+OUT_DIR="${1:-benchdata/alto/deterministic}"
 DEPTH="${DEPTH:-10}"
 COUNT="${COUNT:-64}"
 

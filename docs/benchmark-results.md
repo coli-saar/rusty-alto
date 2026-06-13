@@ -66,8 +66,8 @@ Run a single comparison with:
 
 ```bash
 scripts/compare-alto.sh \
-  --auto examples/compare.auto \
-  --trees examples/compare.trees \
+  --auto benchdata/alto/compare.auto \
+  --trees benchdata/alto/compare.trees \
   --iterations 1000 \
   --warmup 20
 ```
@@ -213,8 +213,8 @@ Interpretation:
 
 ## Earlier Smoke Checks
 
-The tiny sample workload in [`examples/compare.auto`](../examples/compare.auto)
-and [`examples/compare.trees`](../examples/compare.trees) is useful as a quick
+The tiny sample workload in [`benchdata/alto/compare.auto`](../benchdata/alto/compare.auto)
+and [`benchdata/alto/compare.trees`](../benchdata/alto/compare.trees) is useful as a quick
 sanity check. In a 1000-iteration, 20-warmup smoke run, both engines agreed on
 `accepted_last=3` and `root_states_last=4`; the measured time was roughly
 386 ns/tree for `rusty-alto` and 739 ns/tree for Alto.

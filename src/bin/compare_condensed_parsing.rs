@@ -1,6 +1,7 @@
 use rusty_alto::{
     CondensedTa, Explicit, ExplicitBuilder, HomLabel, Homomorphism, InvHom, Rule, StateId,
     StateUniverse, StringDecompositionAutomaton, Symbol, SymbolSet,
+    materialize_indexed_condensed_intersection,
 };
 use rusty_tree::tree::TreeArena;
 use smallvec::SmallVec;
@@ -49,17 +50,27 @@ fn run_workload<A>(
     workload: &TypedWorkload<A>,
 ) -> Result<(), String>
 where
-    A: CondensedTa + StateUniverse,
+    A: CondensedTa + StateUniverse + Clone,
     A::State: Clone + Eq + Hash,
 {
     let mut last = Summary::default();
     for _ in 0..args.warmup {
-        last = intersect_workload(args.intersection, &workload.left, &workload.right);
+        last = intersect_workload(
+            args.intersection,
+            &workload.left,
+            &workload.decomp,
+            &workload.hom,
+        );
     }
 
     let start = Instant::now();
     for _ in 0..args.iterations {
-        last = intersect_workload(args.intersection, &workload.left, &workload.right);
+        last = intersect_workload(
+            args.intersection,
+            &workload.left,
+            &workload.decomp,
+            &workload.hom,
+        );
     }
     let elapsed = start.elapsed();
 
@@ -88,14 +99,27 @@ where
     Ok(())
 }
 
-fn intersect_workload<A>(mode: IntersectionMode, left: &Explicit, right: &InvHom<'_, A>) -> Summary
+fn intersect_workload<A>(
+    mode: IntersectionMode,
+    left: &Explicit,
+    decomp: &A,
+    hom: &Homomorphism,
+) -> Summary
 where
-    A: CondensedTa + StateUniverse,
+    A: CondensedTa + StateUniverse + Clone,
     A::State: Clone + Eq + Hash,
 {
+    let right = InvHom::new(decomp.clone(), hom);
     match mode {
-        IntersectionMode::Eager => intersect_condensed(left, right),
-        IntersectionMode::IndexedCondensed => intersect_indexed_condensed(left, right),
+        IntersectionMode::Eager => intersect_condensed(left, &right),
+        IntersectionMode::IndexedCondensed => {
+            let (mat, _interner, stats) = materialize_indexed_condensed_intersection(left, &right);
+            Summary {
+                states: stats.output_states,
+                rules: mat.rules().count(),
+                condensed_rules: stats.right_queries(),
+            }
+        }
     }
 }
 
@@ -198,7 +222,8 @@ enum Workload {
 
 struct TypedWorkload<A> {
     left: Explicit,
-    right: InvHom<'static, A>,
+    decomp: A,
+    hom: Homomorphism,
     left_rules: usize,
     decomp_rules: usize,
 }
@@ -219,10 +244,10 @@ impl Workload {
             DecompMode::Explicit => {
                 let decomp = string_decomposition_automaton(len, vocab);
                 let decomp_rules = decomp.rules().count();
-                let right = InvHom::new(decomp, hom);
                 Workload::Explicit(TypedWorkload {
                     left,
-                    right,
+                    decomp,
+                    hom,
                     left_rules,
                     decomp_rules,
                 })
@@ -231,10 +256,10 @@ impl Workload {
                 let decomp =
                     StringDecompositionAutomaton::new(CONCAT, sentence_symbols(len, vocab));
                 let decomp_rules = decomp.rule_count();
-                let right = InvHom::new(decomp, hom);
                 Workload::Implicit(TypedWorkload {
                     left,
-                    right,
+                    decomp,
+                    hom,
                     left_rules,
                     decomp_rules,
                 })
@@ -309,7 +334,7 @@ fn string_homomorphism(
     vocab: usize,
     lexical_labels: usize,
     binary_labels: usize,
-) -> Result<Homomorphism<'static>, String> {
+) -> Result<Homomorphism, String> {
     let mut arena = TreeArena::new();
     let mut lexical_terms = Vec::new();
     for word in 0..vocab {
@@ -320,8 +345,7 @@ fn string_homomorphism(
     let v1 = arena.add_node(HomLabel::Var(1), vec![]);
     let concat = arena.add_node(HomLabel::Symbol(CONCAT), vec![v0, v1]);
 
-    let arena = Box::leak(Box::new(arena));
-    let mut hom = Homomorphism::new(arena);
+    let mut hom = Homomorphism::with_arena(arena);
     for (word, &term) in lexical_terms.iter().enumerate() {
         for variant in 0..lexical_labels {
             hom.add(lex_symbol(word, variant, lexical_labels), 0, term)
@@ -469,110 +493,6 @@ where
     }
 }
 
-fn intersect_indexed_condensed<S>(left: &Explicit, right: &impl CondensedTa<State = S>) -> Summary
-where
-    S: Clone + Eq + Hash,
-{
-    let left_rules: Vec<_> = left.rules().map(OwnedRule::from).collect();
-    let left_index = LeftIndex::build(&left_rules);
-    let mut pairs = FxHashMap::<(StateId, S), StateId>::default();
-    let mut queue = VecDeque::<(StateId, S)>::new();
-    let mut rules = FxHashSet::<OutRule>::default();
-    let mut right_by_child_cache = FxHashMap::<(usize, S), Vec<OwnedCondensedRule<S>>>::default();
-    let mut right_nullary_rules = 0usize;
-    let mut right_indexed_queries = 0usize;
-
-    right.condensed_nullary_rules(&mut |symbols, right_result| {
-        right_nullary_rules += 1;
-        for symbol in symbols.iter() {
-            let Some(left_rule_indexes) = left_index.nullary_by_symbol.get(&symbol) else {
-                continue;
-            };
-            for &left_rule_idx in left_rule_indexes {
-                let left_rule = &left_rules[left_rule_idx];
-                let existed = pairs.contains_key(&(left_rule.result, right_result.clone()));
-                let parent = intern_pair(&mut pairs, left_rule.result, right_result.clone());
-                if !existed {
-                    queue.push_back((left_rule.result, right_result.clone()));
-                }
-                rules.insert(OutRule {
-                    symbol,
-                    children: SmallVec::new(),
-                    result: parent,
-                });
-            }
-        }
-    });
-
-    while let Some((left_state, right_state)) = queue.pop_front() {
-        let Some(left_occurrences) = left_index.by_state.get(&left_state) else {
-            continue;
-        };
-
-        for &(symbol, position, left_rule_idx) in left_occurrences {
-            let left_rule = &left_rules[left_rule_idx];
-            let cache_key = (position, right_state.clone());
-            let right_rules = right_by_child_cache.entry(cache_key).or_insert_with(|| {
-                right_indexed_queries += 1;
-                let mut collected = Vec::new();
-                right.condensed_rules_by_child(
-                    position,
-                    &right_state,
-                    &mut |children, symbols, result| {
-                        collected.push(OwnedCondensedRule {
-                            children: children.iter().cloned().collect(),
-                            symbols: symbols.clone(),
-                            result,
-                        });
-                    },
-                );
-                collected
-            });
-
-            for right_rule in right_rules {
-                if !right_rule.symbols.contains(symbol)
-                    || right_rule.children.len() != left_rule.children.len()
-                {
-                    continue;
-                }
-
-                let mut children = Children::new();
-                let mut ok = true;
-                for (&left_child, right_child) in
-                    left_rule.children.iter().zip(&right_rule.children)
-                {
-                    if let Some(&child) = pairs.get(&(left_child, right_child.clone())) {
-                        children.push(child);
-                    } else {
-                        ok = false;
-                        break;
-                    }
-                }
-                if !ok {
-                    continue;
-                }
-
-                let existed = pairs.contains_key(&(left_rule.result, right_rule.result.clone()));
-                let parent = intern_pair(&mut pairs, left_rule.result, right_rule.result.clone());
-                if !existed {
-                    queue.push_back((left_rule.result, right_rule.result.clone()));
-                }
-                rules.insert(OutRule {
-                    symbol,
-                    children,
-                    result: parent,
-                });
-            }
-        }
-    }
-
-    Summary {
-        states: pairs.len(),
-        rules: rules.len(),
-        condensed_rules: right_nullary_rules + right_indexed_queries,
-    }
-}
-
 #[derive(Default)]
 struct LeftIndex {
     nullary_by_symbol: FxHashMap<Symbol, Vec<usize>>,
@@ -708,11 +628,17 @@ mod tests {
             panic!("expected implicit workload");
         };
 
-        let eager = intersect_workload(IntersectionMode::Eager, &workload.left, &workload.right);
+        let eager = intersect_workload(
+            IntersectionMode::Eager,
+            &workload.left,
+            &workload.decomp,
+            &workload.hom,
+        );
         let indexed = intersect_workload(
             IntersectionMode::IndexedCondensed,
             &workload.left,
-            &workload.right,
+            &workload.decomp,
+            &workload.hom,
         );
 
         assert_eq!(indexed.states, eager.states);

@@ -16,6 +16,9 @@ pub trait Algebra {
     /// Value domain of the algebra.
     type Value: Clone + Eq + Hash;
 
+    /// Error returned when parsing a textual object representation.
+    type ParseError;
+
     /// Return the operation signature used by this algebra.
     fn signature(&self) -> &Signature;
 
@@ -23,6 +26,9 @@ pub trait Algebra {
     ///
     /// Return `None` when the operation is undefined for the given children.
     fn evaluate(&self, symbol: Symbol, children: &[Self::Value]) -> Option<Self::Value>;
+
+    /// Parse a textual representation of an algebra value.
+    fn parse_object(&mut self, input: &str) -> Result<Self::Value, Self::ParseError>;
 
     /// Return whether `value` is a valid algebra value.
     fn is_valid_value(&self, _value: &Self::Value) -> bool {
@@ -108,6 +114,7 @@ mod tests {
 
     impl Algebra for Tiny {
         type Value = u8;
+        type ParseError = std::num::ParseIntError;
 
         fn signature(&self) -> &Signature {
             &self.signature
@@ -119,6 +126,10 @@ mod tests {
                 (s, [x]) if s == self.inc => Some(x + 1),
                 _ => None,
             }
+        }
+
+        fn parse_object(&mut self, input: &str) -> Result<Self::Value, Self::ParseError> {
+            input.parse()
         }
     }
 

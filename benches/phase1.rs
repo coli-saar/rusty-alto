@@ -4,7 +4,8 @@ use criterion::{
 use rusty_alto::{
     Arena, BottomUpTa, CondensedTa, DetBottomUpTa, Determinized, Explicit, ExplicitBuilder,
     HomLabel, Homomorphism, IndexedBottomUpTa, InvHom, Memo, Product, Span, StateId, StringAlgebra,
-    Symbol, TestArena, TestNode, TopDownTa, materialize, run_det, run_nondet,
+    StringDecompositionAutomaton, Symbol, TestArena, TestNode, TopDownTa, materialize,
+    materialize_indexed_condensed_intersection, parse_irtg, run_det, run_nondet,
 };
 use rusty_tree::tree::TreeArena;
 
@@ -322,9 +323,9 @@ fn string_decomposition(c: &mut Criterion) {
     let v0 = arena.add_node(HomLabel::Var(0), vec![]);
     let v1 = arena.add_node(HomLabel::Var(1), vec![]);
     let concat_term = arena.add_node(HomLabel::Symbol(concat), vec![v0, v1]);
-    let mut hom = Homomorphism::new(&arena);
+    let mut hom = Homomorphism::with_arena(arena);
     hom.add(Symbol(1_000), 2, concat_term).unwrap();
-    let inv = InvHom::new(decomp, hom);
+    let inv = InvHom::new(decomp, &hom);
 
     group.bench_function("condensed_invhom_concat", |b| {
         b.iter(|| {
@@ -337,6 +338,88 @@ fn string_decomposition(c: &mut Criterion) {
     group.finish();
 }
 
+fn irtg_condensed_parsing(c: &mut Criterion) {
+    let states = 8;
+    let len = 12;
+    let vocab = 8;
+    let lexical_labels = 2;
+    let binary_labels = 4;
+    let irtg_text = synthetic_string_irtg(states, vocab, lexical_labels, binary_labels);
+    let irtg = parse_irtg(irtg_text.as_bytes()).unwrap();
+    let interpretation = irtg.interpretation::<StringAlgebra>("i").unwrap();
+    let sentence_text = synthetic_sentence_text(len, vocab);
+    let sentence = interpretation.parse_object(&sentence_text).unwrap();
+    let concat = interpretation.algebra_signature().get("*").unwrap();
+
+    let mut group = c.benchmark_group("irtg_condensed_parsing");
+    group.throughput(Throughput::Elements(len as u64));
+
+    group.bench_function("direct_indexed_condensed", |b| {
+        b.iter(|| {
+            let decomp = StringDecompositionAutomaton::new(concat, sentence.clone());
+            let invhom = InvHom::new(decomp, interpretation.homomorphism());
+            let (chart, _, stats) =
+                materialize_indexed_condensed_intersection(black_box(irtg.grammar()), &invhom);
+            black_box((chart.rules().count(), stats.output_states))
+        })
+    });
+
+    group.bench_function("irtg_parse", |b| {
+        b.iter(|| {
+            let chart = irtg
+                .parse([interpretation.input(sentence.clone())])
+                .unwrap();
+            black_box((
+                chart.automaton.rules().count(),
+                chart.stats[0].output_states,
+            ))
+        })
+    });
+
+    group.finish();
+}
+
+fn synthetic_string_irtg(
+    states: usize,
+    vocab: usize,
+    lexical_labels: usize,
+    binary_labels: usize,
+) -> String {
+    let mut out = String::from("interpretation i: de.up.ling.irtg.algebra.StringAlgebra\n\n");
+
+    for state in 0..states {
+        let final_mark = if state == 0 { "!" } else { "" };
+        for word in 0..vocab {
+            for variant in 0..lexical_labels {
+                out.push_str(&format!(
+                    "q{state}{final_mark} -> lex_{word}_{variant}\n  [i] w{word}\n\n"
+                ));
+            }
+        }
+    }
+
+    for op in 0..binary_labels {
+        for left in 0..states {
+            for right in 0..states {
+                let parent = (left * 31 + right * 17 + op * 13) % states;
+                let final_mark = if parent == 0 { "!" } else { "" };
+                out.push_str(&format!(
+                    "q{parent}{final_mark} -> bin_{op}(q{left},q{right})\n  [i] *(?1,?2)\n\n"
+                ));
+            }
+        }
+    }
+
+    out
+}
+
+fn synthetic_sentence_text(len: usize, vocab: usize) -> String {
+    (0..len)
+        .map(|i| format!("w{}", i % vocab))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 criterion_group!(
     benches,
     explicit_lookup,
@@ -345,6 +428,7 @@ criterion_group!(
     combinators,
     materialization,
     reachability,
-    string_decomposition
+    string_decomposition,
+    irtg_condensed_parsing
 );
 criterion_main!(benches);

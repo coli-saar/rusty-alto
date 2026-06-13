@@ -1,6 +1,9 @@
 use crate::{
     Explicit, ExplicitBuilder, FxHashMap, Interner, Signature, SignatureError, StateId, Symbol,
+    alto_ast::{AstAutoRule, AstFta, AstState, LexError, Tok, lex},
+    alto_grammar,
 };
+use lalrpop_util::ParseError;
 use thiserror::Error;
 
 /// Parsed Alto tree automaton.
@@ -78,6 +81,12 @@ pub enum AltoParseError {
         /// Byte offset where the comment started.
         offset: usize,
     },
+    /// A variable token appeared in an automaton file or was malformed.
+    #[error("invalid variable at byte {offset}")]
+    InvalidVariable {
+        /// Byte offset where the variable started.
+        offset: usize,
+    },
     /// A weight could not be parsed as `f64`.
     #[error("invalid weight {text:?} at byte {offset}")]
     InvalidWeight {
@@ -96,6 +105,9 @@ pub enum AltoParseError {
         /// Later conflicting arity.
         second: usize,
     },
+    /// LALRPOP reported a syntax error.
+    #[error("{0}")]
+    Syntax(String),
 }
 
 impl From<SignatureError> for AltoParseError {
@@ -109,6 +121,21 @@ impl From<SignatureError> for AltoParseError {
                 symbol,
                 first,
                 second,
+            },
+        }
+    }
+}
+
+impl From<LexError> for AltoParseError {
+    fn from(value: LexError) -> Self {
+        match value {
+            LexError::UnterminatedQuote { offset } => Self::UnterminatedQuote { offset },
+            LexError::UnterminatedComment { offset } => Self::UnterminatedComment { offset },
+            LexError::InvalidVariable { offset } => Self::InvalidVariable { offset },
+            LexError::Unexpected { found, offset } => Self::Unexpected {
+                expected: "Alto token",
+                found: found.to_string(),
+                offset,
             },
         }
     }
@@ -139,368 +166,144 @@ pub fn parse_alto_with_signature(
     input: &str,
     signature: &mut Signature,
 ) -> Result<AltoAutomaton, AltoParseError> {
-    Parser::new(input, signature).parse()
+    let tokens = lex(input)?;
+    let ast = alto_grammar::FtaParser::new()
+        .parse(tokens.into_iter().map(Ok))
+        .map_err(parse_error_to_alto)?;
+    build_alto(ast, signature)
 }
 
-#[derive(Clone, Debug, PartialEq)]
-enum TokenKind {
-    Name(String),
-    Arrow,
-    LParen,
-    RParen,
-    LBracket,
-    RBracket,
-    Comma,
-    Fin,
-}
+fn build_alto(ast: AstFta, signature: &mut Signature) -> Result<AltoAutomaton, AltoParseError> {
+    let mut builder = ExplicitBuilder::new();
+    let mut states = Interner::new();
+    let mut state_ids = FxHashMap::default();
+    let mut rules = Vec::new();
 
-#[derive(Clone, Debug, PartialEq)]
-struct Token {
-    kind: TokenKind,
-    offset: usize,
-}
-
-struct Parser<'a> {
-    tokens: Vec<Token>,
-    pos: usize,
-    builder: ExplicitBuilder,
-    states: Interner<String>,
-    state_ids: FxHashMap<String, StateId>,
-    signature: &'a mut Signature,
-    rules: Vec<AltoRule>,
-    _input: &'a str,
-}
-
-impl<'a> Parser<'a> {
-    fn new(input: &'a str, signature: &'a mut Signature) -> Self {
-        Self {
-            tokens: Vec::new(),
-            pos: 0,
-            builder: ExplicitBuilder::new(),
-            states: Interner::new(),
-            state_ids: FxHashMap::default(),
-            signature,
-            rules: Vec::new(),
-            _input: input,
+    for rule in ast.rules {
+        let parent_name = rule.parent.name.clone();
+        let parent = state_id(&mut builder, &mut states, &mut state_ids, &rule.parent);
+        if rule.parent.is_final {
+            builder.add_accepting(parent);
         }
-    }
-
-    fn parse(mut self) -> Result<AltoAutomaton, AltoParseError> {
-        self.tokens = lex(self._input)?;
-        while !self.is_eof() {
-            self.rule()?;
-        }
-
-        Ok(AltoAutomaton {
-            automaton: self.builder.build(),
-            states: self.states,
-            signature: self.signature.clone(),
-            rules: self.rules,
-        })
-    }
-
-    fn rule(&mut self) -> Result<(), AltoParseError> {
-        let (parent_name, parent, _) = self.state()?;
-        self.expect_arrow()?;
-        let (symbol_name, children) = self.term()?;
-        let weight = if self.eat_lbracket() {
-            let start = self.current_offset();
-            let text = self.expect_name("weight")?;
-            self.expect_rbracket()?;
-            text.parse::<f64>()
-                .map_err(|_| AltoParseError::InvalidWeight {
-                    text,
-                    offset: start,
-                })?
-        } else {
-            1.0
-        };
-
-        let symbol = self.signature.intern(symbol_name.clone(), children.len())?;
-        let child_ids: Vec<StateId> = children.iter().map(|(_, id, _)| *id).collect();
-        let child_names: Vec<String> = children.iter().map(|(name, _, _)| name.clone()).collect();
-        self.builder.add_rule(symbol, child_ids.clone(), parent);
-        self.rules.push(AltoRule {
+        let child_ids: Vec<_> = rule
+            .children
+            .iter()
+            .map(|child| {
+                let id = state_id(&mut builder, &mut states, &mut state_ids, child);
+                if child.is_final {
+                    builder.add_accepting(id);
+                }
+                id
+            })
+            .collect();
+        let child_names: Vec<_> = rule
+            .children
+            .iter()
+            .map(|child| child.name.clone())
+            .collect();
+        let symbol = signature.intern(rule.symbol.clone(), child_ids.len())?;
+        builder.add_rule(symbol, child_ids.clone(), parent);
+        rules.push(alto_rule(
+            rule,
             parent,
             symbol,
-            children: child_ids,
-            weight,
+            child_ids,
             parent_name,
-            symbol_name,
             child_names,
-        });
-        Ok(())
+        ));
     }
 
-    fn term(&mut self) -> Result<(String, Vec<(String, StateId, bool)>), AltoParseError> {
-        let name = self.expect_name("terminal symbol")?;
-        let children = if self.eat_lparen() {
-            let mut children = Vec::new();
-            if !self.eat_rparen() {
-                loop {
-                    children.push(self.state()?);
-                    if self.eat_comma() {
-                        continue;
-                    }
-                    self.expect_rparen()?;
-                    break;
-                }
-            }
-            children
-        } else {
-            Vec::new()
-        };
-        Ok((name, children))
-    }
+    Ok(AltoAutomaton {
+        automaton: builder.build(),
+        states,
+        signature: signature.clone(),
+        rules,
+    })
+}
 
-    fn state(&mut self) -> Result<(String, StateId, bool), AltoParseError> {
-        let name = self.expect_name("state")?;
-        let final_state = self.eat_fin();
-        let id = self.state_id(&name);
-        if final_state {
-            self.builder.add_accepting(id);
-        }
-        Ok((name, id, final_state))
-    }
-
-    fn state_id(&mut self, name: &str) -> StateId {
-        if let Some(&id) = self.state_ids.get(name) {
-            return id;
-        }
-        let id = self.builder.new_state();
-        let interned = self.states.intern(name.to_owned());
-        debug_assert_eq!(id, interned);
-        self.state_ids.insert(name.to_owned(), id);
-        id
-    }
-
-    fn is_eof(&self) -> bool {
-        self.pos >= self.tokens.len()
-    }
-
-    fn current_offset(&self) -> usize {
-        self.tokens
-            .get(self.pos)
-            .map(|t| t.offset)
-            .or_else(|| self.tokens.last().map(|t| t.offset + 1))
-            .unwrap_or(0)
-    }
-
-    fn expect_name(&mut self, expected: &'static str) -> Result<String, AltoParseError> {
-        match self.tokens.get(self.pos) {
-            Some(Token {
-                kind: TokenKind::Name(name),
-                ..
-            }) => {
-                self.pos += 1;
-                Ok(name.clone())
-            }
-            Some(tok) => Err(AltoParseError::Unexpected {
-                expected,
-                found: token_display(&tok.kind),
-                offset: tok.offset,
-            }),
-            None => Err(AltoParseError::Expected {
-                expected,
-                offset: self.current_offset(),
-            }),
-        }
-    }
-
-    fn expect_arrow(&mut self) -> Result<(), AltoParseError> {
-        self.expect_punct("->", |kind| matches!(kind, TokenKind::Arrow))
-    }
-
-    fn expect_rparen(&mut self) -> Result<(), AltoParseError> {
-        self.expect_punct(")", |kind| matches!(kind, TokenKind::RParen))
-    }
-
-    fn expect_rbracket(&mut self) -> Result<(), AltoParseError> {
-        self.expect_punct("]", |kind| matches!(kind, TokenKind::RBracket))
-    }
-
-    fn expect_punct(
-        &mut self,
-        expected: &'static str,
-        pred: impl FnOnce(&TokenKind) -> bool,
-    ) -> Result<(), AltoParseError> {
-        match self.tokens.get(self.pos) {
-            Some(tok) if pred(&tok.kind) => {
-                self.pos += 1;
-                Ok(())
-            }
-            Some(tok) => Err(AltoParseError::Unexpected {
-                expected,
-                found: token_display(&tok.kind),
-                offset: tok.offset,
-            }),
-            None => Err(AltoParseError::Expected {
-                expected,
-                offset: self.current_offset(),
-            }),
-        }
-    }
-
-    fn eat_lparen(&mut self) -> bool {
-        self.eat(|kind| matches!(kind, TokenKind::LParen))
-    }
-
-    fn eat_rparen(&mut self) -> bool {
-        self.eat(|kind| matches!(kind, TokenKind::RParen))
-    }
-
-    fn eat_lbracket(&mut self) -> bool {
-        self.eat(|kind| matches!(kind, TokenKind::LBracket))
-    }
-
-    fn eat_comma(&mut self) -> bool {
-        self.eat(|kind| matches!(kind, TokenKind::Comma))
-    }
-
-    fn eat_fin(&mut self) -> bool {
-        self.eat(|kind| matches!(kind, TokenKind::Fin))
-    }
-
-    fn eat(&mut self, pred: impl FnOnce(&TokenKind) -> bool) -> bool {
-        if self.tokens.get(self.pos).is_some_and(|tok| pred(&tok.kind)) {
-            self.pos += 1;
-            true
-        } else {
-            false
-        }
+fn alto_rule(
+    rule: AstAutoRule,
+    parent: StateId,
+    symbol: Symbol,
+    children: Vec<StateId>,
+    parent_name: String,
+    child_names: Vec<String>,
+) -> AltoRule {
+    AltoRule {
+        parent,
+        symbol,
+        children,
+        weight: rule.weight.unwrap_or(1.0),
+        parent_name,
+        symbol_name: rule.symbol,
+        child_names,
     }
 }
 
-fn lex(input: &str) -> Result<Vec<Token>, AltoParseError> {
-    let mut tokens = Vec::new();
-    let mut iter = input.char_indices().peekable();
-
-    while let Some((offset, ch)) = iter.next() {
-        match ch {
-            c if c.is_whitespace() => {}
-            '/' if iter.peek().is_some_and(|&(_, c)| c == '/') => {
-                iter.next();
-                for (_, c) in iter.by_ref() {
-                    if c == '\n' {
-                        break;
-                    }
-                }
-            }
-            '/' if iter.peek().is_some_and(|&(_, c)| c == '*') => {
-                iter.next();
-                let mut closed = false;
-                let mut prev = '\0';
-                for (_, c) in iter.by_ref() {
-                    if prev == '*' && c == '/' {
-                        closed = true;
-                        break;
-                    }
-                    prev = c;
-                }
-                if !closed {
-                    return Err(AltoParseError::UnterminatedComment { offset });
-                }
-            }
-            '-' if iter.peek().is_some_and(|&(_, c)| c == '>') => {
-                iter.next();
-                tokens.push(Token {
-                    kind: TokenKind::Arrow,
-                    offset,
-                });
-            }
-            '(' => tokens.push(Token {
-                kind: TokenKind::LParen,
-                offset,
-            }),
-            ')' => tokens.push(Token {
-                kind: TokenKind::RParen,
-                offset,
-            }),
-            '[' => tokens.push(Token {
-                kind: TokenKind::LBracket,
-                offset,
-            }),
-            ']' => tokens.push(Token {
-                kind: TokenKind::RBracket,
-                offset,
-            }),
-            ',' => tokens.push(Token {
-                kind: TokenKind::Comma,
-                offset,
-            }),
-            '!' | '°' => tokens.push(Token {
-                kind: TokenKind::Fin,
-                offset,
-            }),
-            '\'' | '"' => {
-                let quote = ch;
-                let mut value = String::new();
-                let mut closed = false;
-                for (_, c) in iter.by_ref() {
-                    if c == quote {
-                        closed = true;
-                        break;
-                    }
-                    value.push(c);
-                }
-                if !closed {
-                    return Err(AltoParseError::UnterminatedQuote { offset });
-                }
-                tokens.push(Token {
-                    kind: TokenKind::Name(value),
-                    offset,
-                });
-            }
-            c if is_name_start(c) || c.is_ascii_digit() || c == '-' || c == '.' => {
-                let mut value = String::new();
-                value.push(c);
-                while let Some(&(_, next)) = iter.peek() {
-                    if is_name_continue(next) {
-                        value.push(next);
-                        iter.next();
-                    } else {
-                        break;
-                    }
-                }
-                tokens.push(Token {
-                    kind: TokenKind::Name(value),
-                    offset,
-                });
-            }
-            _ => {
-                return Err(AltoParseError::Unexpected {
-                    expected: "Alto token",
-                    found: ch.to_string(),
-                    offset,
-                });
-            }
-        }
+fn state_id(
+    builder: &mut ExplicitBuilder,
+    states: &mut Interner<String>,
+    state_ids: &mut FxHashMap<String, StateId>,
+    state: &AstState,
+) -> StateId {
+    if let Some(&id) = state_ids.get(&state.name) {
+        return id;
     }
-
-    Ok(tokens)
+    let id = builder.new_state();
+    let interned = states.intern(state.name.clone());
+    debug_assert_eq!(id, interned);
+    state_ids.insert(state.name.clone(), id);
+    id
 }
 
-fn is_name_start(c: char) -> bool {
-    c.is_ascii_alphabetic() || matches!(c, '_' | '*' | '$' | '@' | '+')
+fn parse_error_to_alto(err: ParseError<usize, Tok, String>) -> AltoParseError {
+    match err {
+        ParseError::InvalidToken { location } => AltoParseError::Unexpected {
+            expected: "Alto token",
+            found: "<invalid>".to_owned(),
+            offset: location,
+        },
+        ParseError::UnrecognizedEof { location, expected } => AltoParseError::Expected {
+            expected: leak_expected(expected),
+            offset: location,
+        },
+        ParseError::UnrecognizedToken { token, expected } => AltoParseError::Unexpected {
+            expected: leak_expected(expected),
+            found: token_display(&token.1),
+            offset: token.0,
+        },
+        ParseError::ExtraToken { token } => AltoParseError::Unexpected {
+            expected: "end of input",
+            found: token_display(&token.1),
+            offset: token.0,
+        },
+        ParseError::User { error } => AltoParseError::Syntax(error),
+    }
 }
 
-fn is_name_continue(c: char) -> bool {
-    is_name_start(c)
-        || c.is_ascii_digit()
-        || matches!(c, '<' | '>' | '/' | '.' | '-')
-        || matches!(c, 'e' | 'E')
+fn leak_expected(expected: Vec<String>) -> &'static str {
+    if expected.is_empty() {
+        "valid syntax"
+    } else {
+        Box::leak(expected.join(", ").into_boxed_str())
+    }
 }
 
-fn token_display(kind: &TokenKind) -> String {
+fn token_display(kind: &Tok) -> String {
     match kind {
-        TokenKind::Name(name) => format!("name {name:?}"),
-        TokenKind::Arrow => "->".to_owned(),
-        TokenKind::LParen => "(".to_owned(),
-        TokenKind::RParen => ")".to_owned(),
-        TokenKind::LBracket => "[".to_owned(),
-        TokenKind::RBracket => "]".to_owned(),
-        TokenKind::Comma => ",".to_owned(),
-        TokenKind::Fin => "!".to_owned(),
+        Tok::Name(name) => format!("name {name:?}"),
+        Tok::Number(number) => format!("number {number:?}"),
+        Tok::Variable(variable) => format!("variable ?{variable}"),
+        Tok::Interpretation => "interpretation".to_owned(),
+        Tok::Feature => "feature".to_owned(),
+        Tok::Arrow => "->".to_owned(),
+        Tok::LParen => "(".to_owned(),
+        Tok::RParen => ")".to_owned(),
+        Tok::LBracket => "[".to_owned(),
+        Tok::RBracket => "]".to_owned(),
+        Tok::Comma => ",".to_owned(),
+        Tok::Colon => ":".to_owned(),
+        Tok::Fin => "!".to_owned(),
     }
 }
 
@@ -564,5 +367,31 @@ mod tests {
         let parsed = parse_alto_with_signature("S! -> a", &mut signature).unwrap();
         assert_eq!(parsed.signature.get("a"), Some(a));
         assert_eq!(signature.get("a"), Some(a));
+    }
+
+    #[test]
+    fn parses_nullary_empty_parens() {
+        let parsed = parse_alto("S! -> a()").unwrap();
+        assert_eq!(parsed.rules[0].child_names, Vec::<String>::new());
+        assert_eq!(parsed.signature.arity(parsed.rules[0].symbol), 0);
+    }
+
+    #[test]
+    fn final_marker_on_child_marks_accepting_state() {
+        let parsed = parse_alto("S -> f(A!)").unwrap();
+        let a = parsed.states.get(&"A".to_owned()).unwrap();
+        assert!(parsed.automaton.is_accepting(&a));
+    }
+
+    #[test]
+    fn rejects_variable_tokens_in_automata() {
+        let err = parse_alto("S -> f(?1)").unwrap_err();
+        assert!(matches!(err, AltoParseError::Unexpected { .. }));
+    }
+
+    #[test]
+    fn lalrpop_rejects_trailing_junk() {
+        let err = parse_alto("S -> a [oops]").unwrap_err();
+        assert!(matches!(err, AltoParseError::Unexpected { .. }));
     }
 }

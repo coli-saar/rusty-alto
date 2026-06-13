@@ -4,6 +4,7 @@ use crate::{
     SymbolSet, TopDownTa,
 };
 use smallvec::SmallVec;
+use std::convert::Infallible;
 
 /// Reserved concatenation operation name for [`StringAlgebra`].
 pub const CONCAT: &str = "*";
@@ -53,6 +54,12 @@ impl StringAlgebra {
         Self { signature, concat }
     }
 
+    /// Create a string algebra from an existing operation signature.
+    pub fn with_signature(mut signature: Signature) -> Self {
+        let concat = signature.intern(CONCAT.to_owned(), 2).unwrap();
+        Self { signature, concat }
+    }
+
     /// Return the concat operation symbol.
     pub fn concat_symbol(&self) -> Symbol {
         self.concat
@@ -85,6 +92,7 @@ impl Default for StringAlgebra {
 
 impl Algebra for StringAlgebra {
     type Value = Vec<Symbol>;
+    type ParseError = Infallible;
 
     fn signature(&self) -> &Signature {
         &self.signature
@@ -104,6 +112,10 @@ impl Algebra for StringAlgebra {
         } else {
             None
         }
+    }
+
+    fn parse_object(&mut self, input: &str) -> Result<Self::Value, Self::ParseError> {
+        Ok(self.parse_string(input))
     }
 }
 

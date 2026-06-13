@@ -19,9 +19,9 @@ pub enum HomLabel {
 
 /// Root handle of a homomorphism right-hand side term.
 ///
-/// The nodes live in an externally owned [`TreeArena<HomLabel>`]. This lets
-/// callers synchronize symbol IDs and share tree storage with surrounding data
-/// structures instead of copying recursive term objects into the homomorphism.
+/// The nodes live in the owning [`Homomorphism`] so that long-lived IRTGs can
+/// keep homomorphic images alive for the whole application run without leaking
+/// arenas or building self-referential structs.
 pub type HomTerm = Tree;
 
 /// Error returned when constructing or applying a homomorphism.
@@ -101,9 +101,9 @@ enum TermKey {
 /// Structurally identical image terms are stored once as a *term id*. All
 /// source symbols sharing that image are kept in the same label set, which is
 /// the basis for condensed inverse-homomorphism rules.
-#[derive(Clone, Debug)]
-pub struct Homomorphism<'a> {
-    arena: &'a TreeArena<HomLabel>,
+#[derive(Debug)]
+pub struct Homomorphism {
+    arena: TreeArena<HomLabel>,
     terms: Vec<HomTerm>,
     labels: Vec<SmallVec<[Symbol; 2]>>,
     symbol_to_term: FxHashMap<Symbol, usize>,
@@ -112,9 +112,24 @@ pub struct Homomorphism<'a> {
     root_index: FxHashMap<Symbol, Vec<usize>>,
 }
 
-impl<'a> Homomorphism<'a> {
-    /// Create an empty homomorphism whose right-hand sides live in `arena`.
-    pub fn new(arena: &'a TreeArena<HomLabel>) -> Self {
+impl Homomorphism {
+    /// Create an empty homomorphism.
+    pub fn new() -> Self {
+        Self {
+            arena: TreeArena::new(),
+            terms: Vec::new(),
+            labels: Vec::new(),
+            symbol_to_term: FxHashMap::default(),
+            arities: FxHashMap::default(),
+            term_dedup: FxHashMap::default(),
+            root_index: FxHashMap::default(),
+        }
+    }
+
+    /// Create an empty homomorphism from a pre-populated RHS arena.
+    ///
+    /// Existing term handles from the arena remain valid after the move.
+    pub fn with_arena(arena: TreeArena<HomLabel>) -> Self {
         Self {
             arena,
             terms: Vec::new(),
@@ -127,8 +142,18 @@ impl<'a> Homomorphism<'a> {
     }
 
     /// Return the arena that owns all registered image terms.
-    pub fn arena(&self) -> &'a TreeArena<HomLabel> {
-        self.arena
+    pub fn arena(&self) -> &TreeArena<HomLabel> {
+        &self.arena
+    }
+
+    /// Add a variable node to the homomorphism's right-hand-side arena.
+    pub fn add_var(&mut self, variable: usize) -> HomTerm {
+        self.arena.add_node(HomLabel::Var(variable), Vec::new())
+    }
+
+    /// Add a symbol node to the homomorphism's right-hand-side arena.
+    pub fn add_symbol(&mut self, symbol: Symbol, children: Vec<HomTerm>) -> HomTerm {
+        self.arena.add_node(HomLabel::Symbol(symbol), children)
     }
 
     /// Register `src` with source arity `src_arity` and image term `rhs`.
@@ -337,12 +362,12 @@ impl<'a> Homomorphism<'a> {
     }
 }
 
-struct ApplyAlg<'h, 'out, 'arena> {
-    hom: &'h Homomorphism<'arena>,
+struct ApplyAlg<'h, 'out> {
+    hom: &'h Homomorphism,
     output_arena: &'out mut TreeArena<Symbol>,
 }
 
-impl MutAlgebra<Symbol, Result<Tree, HomomorphismError>> for ApplyAlg<'_, '_, '_> {
+impl MutAlgebra<Symbol, Result<Tree, HomomorphismError>> for ApplyAlg<'_, '_> {
     fn apply(
         &mut self,
         src: Symbol,
@@ -384,7 +409,7 @@ mod tests {
         let same_v1 = var(&mut arena, 1);
         let same = node(&mut arena, sym(10), vec![same_v0, same_v1]);
 
-        let mut h = Homomorphism::new(&arena);
+        let mut h = Homomorphism::with_arena(arena);
         h.add(sym(0), 2, term).unwrap();
         h.add(sym(1), 2, same).unwrap();
 
@@ -407,7 +432,7 @@ mod tests {
         let out_of_range_v2 = var(&mut arena, 2);
         let out_of_range = node(&mut arena, sym(10), vec![out_of_range_v0, out_of_range_v2]);
 
-        let mut h = Homomorphism::new(&arena);
+        let mut h = Homomorphism::with_arena(arena);
         assert!(matches!(
             h.add(sym(0), 2, missing),
             Err(HomomorphismError::MissingVariable { variable: 1, .. })
@@ -430,7 +455,7 @@ mod tests {
         let second_v0 = var(&mut arena, 0);
         let second = node(&mut arena, sym(11), vec![second_v0]);
 
-        let mut h = Homomorphism::new(&arena);
+        let mut h = Homomorphism::with_arena(arena);
         h.add(sym(0), 1, first).unwrap();
         assert!(matches!(
             h.add(sym(0), 2, first),
@@ -451,7 +476,7 @@ mod tests {
         let concat_rhs = node(&mut hom_arena, sym(21), vec![concat_v0, concat_v1]);
         let wrap_rhs = node(&mut hom_arena, sym(22), vec![concat_rhs]);
 
-        let mut hom = Homomorphism::new(&hom_arena);
+        let mut hom = Homomorphism::with_arena(hom_arena);
         hom.add(sym(0), 0, leaf_rhs).unwrap();
         hom.add(sym(1), 2, wrap_rhs).unwrap();
 
@@ -473,7 +498,7 @@ mod tests {
     #[test]
     fn apply_reports_unmapped_symbols() {
         let hom_arena = TreeArena::new();
-        let hom = Homomorphism::new(&hom_arena);
+        let hom = Homomorphism::with_arena(hom_arena);
         let mut input = TreeArena::new();
         let root = input.add_node(sym(99), vec![]);
         let mut output = TreeArena::new();
