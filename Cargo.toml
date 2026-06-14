@@ -12,6 +12,7 @@ rusty-tree = { path = "../rusty-tree" }
 smallvec = "1"
 thiserror = "2"
 lalrpop-util = "0.23"
+orx-priority-queue = "1.8"
 
 [dev-dependencies]
 criterion = "0.5"
@@ -23,6 +24,17 @@ lalrpop = "0.23"
 default = []
 stats = []
 
+[[bin]]
+name = "ptb-eval"
+path = "src/bin/ptb-eval.rs"
+
 [[bench]]
 name = "phase1"
 harness = false
+
+
+[profile.release-optimized]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+panic = "abort"

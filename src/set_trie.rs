@@ -60,6 +60,26 @@ where
         self.for_each_value_for_key_sets_at(0, key_sets, &mut out);
     }
 
+    /// Visit every value whose key tuple starts with `prefix` and whose
+    /// remaining keys are accepted by `key_sets`.
+    pub fn for_each_value_for_prefix_and_key_sets<S>(
+        &self,
+        prefix: &[K],
+        key_sets: &[S],
+        mut out: impl FnMut(&V),
+    ) where
+        S: KeySet<K>,
+    {
+        let mut node = self;
+        for part in prefix {
+            let Some(next) = node.next.get(part) else {
+                return;
+            };
+            node = next;
+        }
+        node.for_each_value_for_key_sets_at(0, key_sets, &mut out);
+    }
+
     fn for_each_value_for_key_sets_at<S>(
         &self,
         depth: usize,
@@ -157,6 +177,23 @@ mod tests {
         let second = FxHashSet::from_iter([2, 3]);
         let mut values = Vec::new();
         trie.for_each_value_for_key_sets(&[&first, &second], |found| {
+            values.extend(found.iter().copied());
+        });
+        values.sort_unstable();
+
+        assert_eq!(values, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn visits_values_matching_prefix_and_key_sets() {
+        let mut trie = SetTrie::new();
+        trie.get_or_insert_with(&[1, 2], Vec::new).push("a");
+        trie.get_or_insert_with(&[1, 3], Vec::new).push("b");
+        trie.get_or_insert_with(&[4, 2], Vec::new).push("c");
+
+        let second = FxHashSet::from_iter([2, 3]);
+        let mut values = Vec::new();
+        trie.for_each_value_for_prefix_and_key_sets(&[1], &[&second], |found| {
             values.extend(found.iter().copied());
         });
         values.sort_unstable();

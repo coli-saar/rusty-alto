@@ -5,7 +5,9 @@ mod string;
 use crate::{BottomUpTa, DetBottomUpTa, Signature, Symbol};
 use std::hash::Hash;
 
-pub use string::{Span, StringAlgebra, StringDecompositionAutomaton};
+pub use string::{
+    SentenceSxHeuristic, Span, StringAlgebra, StringDecompositionAutomaton, UniversalSxHeuristic,
+};
 
 /// Algebra over a domain of values.
 ///

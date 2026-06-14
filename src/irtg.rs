@@ -2,10 +2,15 @@
 
 use crate::{
     Algebra, Explicit, ExplicitBuildError, ExplicitBuilder, FxHashMap, Homomorphism,
-    HomomorphismError, IndexedCondensedIntersectionStats, Interner, InvHom, Signature,
-    SignatureError, StateId, StringAlgebra, Symbol,
+    HomomorphismError, IndexedCondensedIntersectionStats, Interner, InvHom, OutsideHeuristic,
+    ScoredZeroHeuristic, Signature, SignatureError, StateId, StringAlgebra, Symbol,
+    UniversalSxHeuristic, ViterbiTree, WeightScorer, ZeroHeuristic,
     alto_ast::{AstHomTerm, AstIrtg, AstState, LexError, Tok, lex},
-    alto_grammar, materialize_topdown_condensed_intersection,
+    alto_grammar,
+    astar::{AstarOptions, AstarStats, astar_one_best_with_stats, materialize_astar_intersection},
+    materialize::{
+        materialize_indexed_condensed_intersection, materialize_topdown_condensed_intersection,
+    },
 };
 use lalrpop_util::ParseError;
 use rusty_tree::tree::Tree;
@@ -13,6 +18,46 @@ use std::{any::Any, cell::RefCell, fmt, io::Read, marker::PhantomData};
 use thiserror::Error;
 
 const STRING_ALGEBRA: &str = "de.up.ling.irtg.algebra.StringAlgebra";
+
+// ---------------------------------------------------------------------------
+// Materialization strategy
+// ---------------------------------------------------------------------------
+
+/// Which algorithm to use when materializing an intersection inside [`Irtg::parse_with`].
+pub enum MaterializationStrategy<'h> {
+    /// Top-down condensed intersection (default, matches [`Irtg::parse`]).
+    TopDownCondensed,
+    /// Indexed condensed intersection.
+    IndexedCondensed,
+    /// A* intersection with a configurable heuristic.
+    ///
+    /// **Precondition**: all grammar rule weights must be ≤ 1 (probability
+    /// weights).  If any weight exceeds 1 the strategy is rejected at
+    /// parse time with [`IrtgError::AstarWeightPrecondition`].
+    Astar {
+        /// Heuristic to guide the A* search.
+        heuristic: AstarHeuristic<'h>,
+        /// Options for the A* materializer.
+        options: AstarOptions,
+    },
+}
+
+/// Heuristic choice for [`MaterializationStrategy::Astar`].
+pub enum AstarHeuristic<'h> {
+    /// Uninformed heuristic (always returns 1.0).  A* degenerates to Knuth
+    /// order and is exact.
+    Zero,
+    /// Grammar-only outside-weight heuristic.  Algebra-agnostic and
+    /// sentence-independent; compute once with [`OutsideHeuristic::from_grammar`].
+    Outside(&'h OutsideHeuristic),
+    /// Universal SX heuristic table built for `n_max`; `n` is the length of the
+    /// current sentence.  The table is admissible for any sentence with `n ≤ n_max`.
+    /// Build once with [`UniversalSxHeuristic::new`] and reuse across all sentences.
+    UniversalSx {
+        table: &'h UniversalSxHeuristic,
+        n: usize,
+    },
+}
 
 /// An interpreted regular tree grammar.
 #[derive(Debug)]
@@ -74,11 +119,31 @@ impl Irtg {
         }
     }
 
-    /// Parse with one or more interpretation inputs.
+    /// Parse with one or more interpretation inputs using the default strategy
+    /// ([`MaterializationStrategy::TopDownCondensed`]).
     pub fn parse<'a>(
         &self,
         inputs: impl IntoIterator<Item = ParseInput<'a>>,
     ) -> Result<ParseChart, IrtgError> {
+        self.parse_with(inputs, &MaterializationStrategy::TopDownCondensed)
+    }
+
+    /// Parse with one or more interpretation inputs, selecting the
+    /// materialization algorithm via `strategy`.
+    ///
+    /// For [`MaterializationStrategy::Astar`] the precondition is that all
+    /// grammar rule weights are ≤ 1.  If that is violated the method returns
+    /// [`IrtgError::AstarWeightPrecondition`] immediately.
+    pub fn parse_with<'a>(
+        &self,
+        inputs: impl IntoIterator<Item = ParseInput<'a>>,
+        strategy: &MaterializationStrategy<'_>,
+    ) -> Result<ParseChart, IrtgError> {
+        // Guard: A* requires probability weights (≤ 1).
+        if matches!(strategy, MaterializationStrategy::Astar { .. }) {
+            self.check_astar_weight_precondition()?;
+        }
+
         let mut chart = self.grammar.clone();
         let mut stats = Vec::new();
 
@@ -100,10 +165,32 @@ impl Irtg {
                         })?;
                     let decomp = algebra.decompose(value);
                     let invhom = InvHom::new(decomp, &interpretation.homomorphism);
-                    let (next_chart, _right_interner, stat) =
-                        materialize_topdown_condensed_intersection(&chart, &invhom);
+                    let next_chart = match strategy {
+                        MaterializationStrategy::TopDownCondensed => {
+                            let (c, _, stat) =
+                                materialize_topdown_condensed_intersection(&chart, &invhom);
+                            stats.push(stat);
+                            c
+                        }
+                        MaterializationStrategy::IndexedCondensed => {
+                            let (c, _, stat) =
+                                materialize_indexed_condensed_intersection(&chart, &invhom);
+                            stats.push(stat);
+                            c
+                        }
+                        MaterializationStrategy::Astar {
+                            heuristic,
+                            options: _,
+                        } => {
+                            // We need owned options — clone by rebuilding (AstarOptions is not Clone).
+                            // Instead, call materialize_astar_intersection with a fresh options value.
+                            // We route via a helper to avoid duplicating logic.
+                            let c = self.run_astar_chart(&chart, &invhom, heuristic, strategy)?;
+                            // A* produces no IndexedCondensedIntersectionStats; we push nothing.
+                            c
+                        }
+                    };
                     chart = next_chart;
-                    stats.push(stat);
                 }
                 InterpretationKind::Unsupported => {
                     return Err(IrtgError::UnsupportedAlgebra {
@@ -118,6 +205,243 @@ impl Irtg {
             automaton: chart,
             stats,
         })
+    }
+
+    /// Return the single best parse tree (Viterbi tree) for the given inputs
+    /// and strategy.
+    ///
+    /// For [`MaterializationStrategy::Astar`] this calls [`astar_one_best`]
+    /// directly without building a full chart.  For chart-based strategies it
+    /// falls back to [`Irtg::parse_with`] and calls `.automaton.viterbi()`.
+    pub fn best_with<'a>(
+        &self,
+        inputs: impl IntoIterator<Item = ParseInput<'a>>,
+        strategy: &MaterializationStrategy<'_>,
+    ) -> Result<Option<ViterbiTree>, IrtgError> {
+        self.best_with_scorer(inputs, strategy, &crate::ProbabilityScorer)
+    }
+
+    /// Return the single best parse tree using `scorer` for weight products.
+    pub fn best_with_scorer<'a, S: WeightScorer>(
+        &self,
+        inputs: impl IntoIterator<Item = ParseInput<'a>>,
+        strategy: &MaterializationStrategy<'_>,
+        scorer: &S,
+    ) -> Result<Option<ViterbiTree>, IrtgError> {
+        self.best_with_scorer_and_stats(inputs, strategy, scorer)
+            .map(|(tree, _)| tree)
+    }
+
+    /// Return the single best parse tree using `scorer`, plus A* stats when available.
+    pub fn best_with_scorer_and_stats<'a, S: WeightScorer>(
+        &self,
+        inputs: impl IntoIterator<Item = ParseInput<'a>>,
+        strategy: &MaterializationStrategy<'_>,
+        scorer: &S,
+    ) -> Result<(Option<ViterbiTree>, Option<AstarStats>), IrtgError> {
+        // For A* we can short-circuit and avoid building the chart.
+        if let MaterializationStrategy::Astar { heuristic, .. } = strategy {
+            // Guard
+            self.check_astar_weight_precondition()?;
+
+            // We need to iterate inputs and run astar_one_best on the last
+            // grammar (after intersecting all inputs in order).  For simplicity
+            // we run parse_with for all-but-last inputs (if any) and then do
+            // astar_one_best for the final one.  In practice IRTGs usually have
+            // a single string interpretation per parse call, so this is fast.
+            let inputs: Vec<_> = inputs.into_iter().collect();
+            if inputs.is_empty() {
+                return Ok((self.grammar.viterbi_with(scorer), None));
+            }
+
+            // Split: all-but-last via parse_with(TopDownCondensed), then last via astar_one_best.
+            let (last, rest) = inputs.split_last().unwrap();
+            // Build intermediate chart from all-but-last inputs (if any).
+            let intermediate_chart = if rest.is_empty() {
+                self.grammar.clone()
+            } else {
+                // Collect rest as owned inputs — but ParseInput<'a> is not Clone.
+                // We cannot split a Vec<ParseInput<'_>> this way because ParseInput doesn't
+                // implement Clone.  Instead we re-collect from the iterator below.
+                // Since we already consumed the iterator into a Vec, we need to handle
+                // the rest of the inputs with their Box<dyn Any> values.
+                // The simplest approach: call parse_with on rest using TopDownCondensed.
+                // We cannot re-use ParseInput because it owns value; instead we call
+                // materialize_topdown_condensed_intersection directly.
+                //
+                // NOTE: this path is only reached when there are 2+ inputs and the
+                // caller uses Astar.  The typical single-interpretation use case avoids it.
+                return self.best_with_multi(inputs, heuristic, strategy, scorer);
+            };
+
+            // Run astar_one_best for the last (only) input.
+            let interpretation = last.interpretation;
+            match interpretation.kind {
+                InterpretationKind::String => {
+                    let value = last
+                        .value
+                        .downcast_ref::<Vec<Symbol>>()
+                        .ok_or_else(|| IrtgError::WrongInputType {
+                            interpretation: interpretation.name.clone(),
+                        })?
+                        .clone();
+                    let algebra = interpretation.algebra.borrow();
+                    let algebra = algebra
+                        .as_ref()
+                        .downcast_ref::<StringAlgebra>()
+                        .ok_or_else(|| IrtgError::WrongInputType {
+                            interpretation: interpretation.name.clone(),
+                        })?;
+                    let decomp = algebra.decompose(value);
+                    let invhom = InvHom::new(decomp, &interpretation.homomorphism);
+                    let (tree, stats) = self.run_astar_one_best_with_scorer(
+                        &intermediate_chart,
+                        &invhom,
+                        heuristic,
+                        scorer,
+                    );
+                    Ok((tree, Some(stats)))
+                }
+                InterpretationKind::Unsupported => Err(IrtgError::UnsupportedAlgebra {
+                    interpretation: interpretation.name.clone(),
+                    class_name: interpretation.class_name.clone(),
+                }),
+            }
+        } else {
+            // Chart strategies: build the chart and run Viterbi on it.
+            let chart = self.parse_with(inputs, strategy)?;
+            Ok((chart.automaton.viterbi_with(scorer), None))
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Private helpers
+    // -----------------------------------------------------------------------
+
+    /// Check the A* weight precondition: all grammar rule weights must be ≤ 1.
+    fn check_astar_weight_precondition(&self) -> Result<(), IrtgError> {
+        for rule in self.grammar.rules() {
+            if rule.weight > 1.0 {
+                // `Signature::resolve` panics if the symbol is absent; use
+                // a bounds check first since all interned rules should be present.
+                let symbol = if (rule.symbol.0 as usize) < self.grammar_signature.len() {
+                    self.grammar_signature.resolve(rule.symbol).to_owned()
+                } else {
+                    format!("{:?}", rule.symbol)
+                };
+                return Err(IrtgError::AstarWeightPrecondition {
+                    weight: rule.weight,
+                    symbol,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Run A* chart materializer for a single `InvHom<StringDecompositionAutomaton>`.
+    fn run_astar_chart(
+        &self,
+        chart: &Explicit,
+        invhom: &InvHom<'_, crate::algebras::StringDecompositionAutomaton>,
+        heuristic: &AstarHeuristic<'_>,
+        strategy: &MaterializationStrategy<'_>,
+    ) -> Result<Explicit, IrtgError> {
+        let options = match strategy {
+            MaterializationStrategy::Astar { options, .. } => AstarOptions {
+                stop_at_first_goal: options.stop_at_first_goal,
+                beam: options.beam,
+            },
+            _ => unreachable!(),
+        };
+        let (new_chart, _, _) = match heuristic {
+            AstarHeuristic::Zero => {
+                let h = ZeroHeuristic;
+                materialize_astar_intersection(chart, invhom, &h, options)
+            }
+            AstarHeuristic::Outside(h) => {
+                materialize_astar_intersection(chart, invhom, *h, options)
+            }
+            AstarHeuristic::UniversalSx { table, n } => {
+                let h = table.for_sentence(*n);
+                materialize_astar_intersection(chart, invhom, &h, options)
+            }
+        };
+        Ok(new_chart)
+    }
+
+    /// Run `astar_one_best` for a single `InvHom<StringDecompositionAutomaton>`.
+    fn run_astar_one_best_with_scorer<S: WeightScorer>(
+        &self,
+        chart: &Explicit,
+        invhom: &InvHom<'_, crate::algebras::StringDecompositionAutomaton>,
+        heuristic: &AstarHeuristic<'_>,
+        scorer: &S,
+    ) -> (Option<ViterbiTree>, AstarStats) {
+        match heuristic {
+            AstarHeuristic::Zero => {
+                let h = ScoredZeroHeuristic::new(scorer);
+                astar_one_best_with_stats(chart, invhom, &h, scorer)
+            }
+            AstarHeuristic::Outside(h) => astar_one_best_with_stats(chart, invhom, *h, scorer),
+            AstarHeuristic::UniversalSx { table, n } => {
+                let h = table.for_sentence(*n);
+                astar_one_best_with_stats(chart, invhom, &h, scorer)
+            }
+        }
+    }
+
+    /// Fallback for `best_with` when there are 2+ inputs with A* strategy.
+    /// Runs all inputs using TopDownCondensed, then A* on the last one.
+    fn best_with_multi<'a, S: WeightScorer>(
+        &self,
+        inputs: Vec<ParseInput<'a>>,
+        heuristic: &AstarHeuristic<'_>,
+        _strategy: &MaterializationStrategy<'_>,
+        scorer: &S,
+    ) -> Result<(Option<ViterbiTree>, Option<AstarStats>), IrtgError> {
+        // We can't clone ParseInput, so we process them one by one.
+        let n = inputs.len();
+        let mut chart = self.grammar.clone();
+
+        for (i, input) in inputs.into_iter().enumerate() {
+            let interpretation = input.interpretation;
+            let is_last = i == n - 1;
+            match interpretation.kind {
+                InterpretationKind::String => {
+                    let value = *input.value.downcast::<Vec<Symbol>>().map_err(|_| {
+                        IrtgError::WrongInputType {
+                            interpretation: interpretation.name.clone(),
+                        }
+                    })?;
+                    let algebra = interpretation.algebra.borrow();
+                    let algebra = algebra
+                        .as_ref()
+                        .downcast_ref::<StringAlgebra>()
+                        .ok_or_else(|| IrtgError::WrongInputType {
+                            interpretation: interpretation.name.clone(),
+                        })?;
+                    let decomp = algebra.decompose(value);
+                    let invhom = InvHom::new(decomp, &interpretation.homomorphism);
+                    if is_last {
+                        let (tree, stats) =
+                            self.run_astar_one_best_with_scorer(&chart, &invhom, heuristic, scorer);
+                        return Ok((tree, Some(stats)));
+                    } else {
+                        let (next, _, _) =
+                            materialize_topdown_condensed_intersection(&chart, &invhom);
+                        chart = next;
+                    }
+                }
+                InterpretationKind::Unsupported => {
+                    return Err(IrtgError::UnsupportedAlgebra {
+                        interpretation: interpretation.name.clone(),
+                        class_name: interpretation.class_name.clone(),
+                    });
+                }
+            }
+        }
+
+        Ok((chart.viterbi_with(scorer), None))
     }
 }
 
@@ -284,6 +608,16 @@ pub enum IrtgError {
         interpretation: String,
         /// Alto class name.
         class_name: String,
+    },
+    /// A* strategy requires all grammar rule weights ≤ 1 (probability weights).
+    #[error(
+        "A* requires all grammar rule weights ≤ 1, but found weight {weight} for rule {symbol:?}"
+    )]
+    AstarWeightPrecondition {
+        /// The offending weight.
+        weight: f64,
+        /// The grammar symbol name of the offending rule.
+        symbol: String,
     },
 }
 
@@ -604,5 +938,209 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, IrtgError::Automaton(_)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase E: MaterializationStrategy tests
+    // -----------------------------------------------------------------------
+
+    fn tiny_irtg_bytes() -> &'static [u8] {
+        br#"
+        interpretation english: de.up.ling.irtg.algebra.StringAlgebra
+
+        S! -> r(NP,VP) [1.0]
+          [english] *(?1,?2)
+
+        NP -> john_rule [1.0]
+          [english] john
+
+        VP -> watches_rule [1.0]
+          [english] watches
+        "#
+    }
+
+    #[test]
+    fn parse_with_top_down_condensed_matches_parse() {
+        let irtg = parse_irtg(tiny_irtg_bytes()).unwrap();
+        let english = irtg.interpretation::<StringAlgebra>("english").unwrap();
+
+        let value = english.parse_object("john watches").unwrap();
+        let chart_default = irtg.parse([english.input(value.clone())]).unwrap();
+
+        let chart_explicit = irtg
+            .parse_with(
+                [english.input(value)],
+                &MaterializationStrategy::TopDownCondensed,
+            )
+            .unwrap();
+
+        // Both strategies should agree on emptiness.
+        assert_eq!(
+            chart_default.automaton.is_empty(),
+            chart_explicit.automaton.is_empty()
+        );
+        assert!(!chart_explicit.automaton.is_empty());
+    }
+
+    #[test]
+    fn parse_with_indexed_condensed_works() {
+        let irtg = parse_irtg(tiny_irtg_bytes()).unwrap();
+        let english = irtg.interpretation::<StringAlgebra>("english").unwrap();
+
+        let value = english.parse_object("john watches").unwrap();
+        let chart = irtg
+            .parse_with(
+                [english.input(value)],
+                &MaterializationStrategy::IndexedCondensed,
+            )
+            .unwrap();
+
+        assert!(!chart.automaton.is_empty());
+
+        // Rejection case.
+        let bad = english.parse_object("john sleeps").unwrap();
+        let chart = irtg
+            .parse_with(
+                [english.input(bad)],
+                &MaterializationStrategy::IndexedCondensed,
+            )
+            .unwrap();
+        assert!(chart.automaton.is_empty());
+    }
+
+    #[test]
+    fn parse_with_astar_zero_returns_non_empty_chart_for_known_sentence() {
+        let irtg = parse_irtg(tiny_irtg_bytes()).unwrap();
+        let english = irtg.interpretation::<StringAlgebra>("english").unwrap();
+
+        let value = english.parse_object("john watches").unwrap();
+        let chart = irtg
+            .parse_with(
+                [english.input(value)],
+                &MaterializationStrategy::Astar {
+                    heuristic: AstarHeuristic::Zero,
+                    options: AstarOptions {
+                        stop_at_first_goal: true,
+                        beam: None,
+                    },
+                },
+            )
+            .unwrap();
+
+        assert!(!chart.automaton.is_empty());
+    }
+
+    #[test]
+    fn astar_strategy_rejects_grammar_with_weight_greater_than_one() {
+        let irtg = parse_irtg(
+            br#"
+            interpretation i: de.up.ling.irtg.algebra.StringAlgebra
+
+            S! -> r [5.0]
+              [i] hello
+
+            "# as &[u8],
+        )
+        .unwrap();
+
+        let interp = irtg.interpretation::<StringAlgebra>("i").unwrap();
+        let value = interp.parse_object("hello").unwrap();
+
+        let err = irtg
+            .parse_with(
+                [interp.input(value)],
+                &MaterializationStrategy::Astar {
+                    heuristic: AstarHeuristic::Zero,
+                    options: AstarOptions {
+                        stop_at_first_goal: true,
+                        beam: None,
+                    },
+                },
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(err, IrtgError::AstarWeightPrecondition { weight, .. } if weight > 1.0),
+            "expected AstarWeightPrecondition, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn astar_weight_precondition_error_contains_weight_and_symbol() {
+        let irtg = parse_irtg(
+            br#"
+            interpretation i: de.up.ling.irtg.algebra.StringAlgebra
+
+            S! -> my_rule [3.5]
+              [i] hello
+            "# as &[u8],
+        )
+        .unwrap();
+
+        let interp = irtg.interpretation::<StringAlgebra>("i").unwrap();
+        let value = interp.parse_object("hello").unwrap();
+
+        let err = irtg
+            .parse_with(
+                [interp.input(value)],
+                &MaterializationStrategy::Astar {
+                    heuristic: AstarHeuristic::Zero,
+                    options: AstarOptions {
+                        stop_at_first_goal: true,
+                        beam: None,
+                    },
+                },
+            )
+            .unwrap_err();
+
+        if let IrtgError::AstarWeightPrecondition { weight, symbol } = &err {
+            assert!((weight - 3.5).abs() < 1e-10);
+            assert!(symbol.contains("my_rule"), "symbol = {symbol}");
+        } else {
+            panic!("expected AstarWeightPrecondition, got {:?}", err);
+        }
+
+        // Check error message.
+        let msg = err.to_string();
+        assert!(msg.contains("3.5") || msg.contains("A*"), "message = {msg}");
+    }
+
+    #[test]
+    fn best_with_astar_returns_some_for_known_sentence() {
+        let irtg = parse_irtg(tiny_irtg_bytes()).unwrap();
+        let english = irtg.interpretation::<StringAlgebra>("english").unwrap();
+
+        let value = english.parse_object("john watches").unwrap();
+        let result = irtg
+            .best_with(
+                [english.input(value)],
+                &MaterializationStrategy::Astar {
+                    heuristic: AstarHeuristic::Zero,
+                    options: AstarOptions {
+                        stop_at_first_goal: true,
+                        beam: None,
+                    },
+                },
+            )
+            .unwrap();
+
+        assert!(result.is_some(), "expected a best tree for 'john watches'");
+    }
+
+    #[test]
+    fn best_with_chart_strategy_returns_some_for_known_sentence() {
+        let irtg = parse_irtg(tiny_irtg_bytes()).unwrap();
+        let english = irtg.interpretation::<StringAlgebra>("english").unwrap();
+
+        let value = english.parse_object("john watches").unwrap();
+        let result = irtg
+            .best_with(
+                [english.input(value)],
+                &MaterializationStrategy::TopDownCondensed,
+            )
+            .unwrap();
+
+        assert!(result.is_some(), "expected a best tree for 'john watches'");
     }
 }

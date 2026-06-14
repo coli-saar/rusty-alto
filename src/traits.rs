@@ -155,11 +155,13 @@ pub struct SymbolSet(SmallVec<[Symbol; 4]>);
 
 impl SymbolSet {
     /// Create an empty set.
+    #[inline]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Insert a symbol, maintaining sorted and deduplicated order.
+    #[inline]
     pub fn insert(&mut self, s: Symbol) {
         match self.0.binary_search(&s) {
             Ok(_) => {}
@@ -168,26 +170,31 @@ impl SymbolSet {
     }
 
     /// Return whether the set contains `s`.
+    #[inline]
     pub fn contains(&self, s: Symbol) -> bool {
         self.0.binary_search(&s).is_ok()
     }
 
     /// Iterate over symbols in sorted order.
+    #[inline]
     pub fn iter(&self) -> impl Iterator<Item = Symbol> + '_ {
         self.0.iter().copied()
     }
 
     /// Return the number of symbols.
+    #[inline]
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
     /// Return whether the set is empty.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
     /// Remove all symbols from the set.
+    #[inline]
     pub fn clear(&mut self) {
         self.0.clear();
     }

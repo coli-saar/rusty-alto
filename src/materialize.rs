@@ -168,22 +168,22 @@ impl IndexedCondensedIntersectionStats {
 }
 
 #[derive(Clone)]
-struct OwnedRule {
-    symbol: Symbol,
-    children: SmallVec<[StateId; 2]>,
-    result: StateId,
-    weight: f64,
+pub(crate) struct OwnedRule {
+    pub(crate) symbol: Symbol,
+    pub(crate) children: SmallVec<[StateId; 2]>,
+    pub(crate) result: StateId,
+    pub(crate) weight: f64,
 }
 
 #[derive(Clone)]
-struct OwnedCondensedRule<S> {
-    children: SmallVec<[S; 2]>,
-    symbols: SymbolSet,
-    result: S,
+pub(crate) struct OwnedCondensedRule<S> {
+    pub(crate) children: SmallVec<[S; 2]>,
+    pub(crate) symbols: SymbolSet,
+    pub(crate) result: S,
 }
 
 #[derive(Clone, Debug, Default)]
-struct ProductStateMap {
+pub(crate) struct ProductStateMap {
     by_right: Vec<FxHashMap<StateId, StateId>>,
 }
 
@@ -192,7 +192,7 @@ impl ProductStateMap {
         Self::default()
     }
 
-    fn get(&self, left: StateId, right: StateId) -> Option<StateId> {
+    pub(crate) fn get(&self, left: StateId, right: StateId) -> Option<StateId> {
         self.by_right
             .get(right.index())
             .and_then(|partners| partners.get(&left).copied())
@@ -208,13 +208,13 @@ impl ProductStateMap {
 }
 
 #[derive(Debug, Default)]
-struct TrustedRuleTracker {
+pub(crate) struct TrustedRuleTracker {
     #[cfg(debug_assertions)]
     seen: FxHashSet<(Symbol, SmallVec<[StateId; 2]>, StateId)>,
 }
 
 impl TrustedRuleTracker {
-    fn add_rule(
+    pub(crate) fn add_rule(
         &mut self,
         builder: &mut ExplicitBuilder,
         symbol: Symbol,
@@ -269,14 +269,15 @@ impl KeySet<StateId> for StateSetView<'_> {
 }
 
 #[derive(Default)]
-struct LeftIndex {
+pub(crate) struct LeftIndex {
     nullary_by_symbol: FxHashMap<Symbol, Vec<usize>>,
-    by_state: FxHashMap<StateId, Vec<(Symbol, usize, usize)>>,
+    pub(crate) by_state: FxHashMap<StateId, Vec<(Symbol, usize, usize)>>,
     by_children: SetTrie<StateId, FxHashMap<Symbol, Vec<usize>>>,
+    by_rotated_children: Vec<SetTrie<StateId, FxHashMap<Symbol, Vec<usize>>>>,
 }
 
 impl LeftIndex {
-    fn build(rules: &[OwnedRule]) -> Self {
+    pub(crate) fn build(rules: &[OwnedRule]) -> Self {
         let mut index = Self::default();
         for (rule_idx, rule) in rules.iter().enumerate() {
             index
@@ -298,12 +299,26 @@ impl LeftIndex {
                     .entry(child)
                     .or_default()
                     .push((rule.symbol, position, rule_idx));
+                if index.by_rotated_children.len() <= position {
+                    index
+                        .by_rotated_children
+                        .resize_with(position + 1, SetTrie::default);
+                }
+                let mut rotated_children = SmallVec::<[StateId; 4]>::new();
+                rotated_children.push(child);
+                rotated_children.extend(rule.children[..position].iter().copied());
+                rotated_children.extend(rule.children[position + 1..].iter().copied());
+                index.by_rotated_children[position]
+                    .get_or_insert_with(&rotated_children, FxHashMap::default)
+                    .entry(rule.symbol)
+                    .or_default()
+                    .push(rule_idx);
             }
         }
         index
     }
 
-    fn rule_indexes_for_sets_into<S>(
+    pub(crate) fn rule_indexes_for_sets_into<S>(
         &self,
         symbols: &SymbolSet,
         child_sets: &[S],
@@ -328,6 +343,219 @@ impl LeftIndex {
                     }
                 }
             });
+    }
+
+    fn extend_symbol_matches(
+        symbols: &SymbolSet,
+        rules_by_symbol: &FxHashMap<Symbol, Vec<usize>>,
+        out: &mut Vec<usize>,
+    ) {
+        if symbols.len() < rules_by_symbol.len() {
+            for symbol in symbols.iter() {
+                if let Some(rule_indexes) = rules_by_symbol.get(&symbol) {
+                    out.extend(rule_indexes.iter().copied());
+                }
+            }
+        } else {
+            for (&symbol, rule_indexes) in rules_by_symbol {
+                if symbols.contains(symbol) {
+                    out.extend(rule_indexes.iter().copied());
+                }
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn rule_indexes_for_rotated_sets_into<S>(
+        &self,
+        trigger_position: usize,
+        symbols: &SymbolSet,
+        rotated_child_sets: &[S],
+        out: &mut Vec<usize>,
+    ) where
+        S: KeySet<StateId>,
+    {
+        out.clear();
+        let Some(trie) = self.by_rotated_children.get(trigger_position) else {
+            return;
+        };
+        trie.for_each_value_for_key_sets(rotated_child_sets, |rules_by_symbol| {
+            Self::extend_symbol_matches(symbols, rules_by_symbol, out);
+        });
+    }
+
+    pub(crate) fn rule_indexes_for_rotated_trigger_sets_into<S>(
+        &self,
+        trigger_position: usize,
+        trigger_left: StateId,
+        symbols: &SymbolSet,
+        sibling_sets: &[S],
+        out: &mut Vec<usize>,
+    ) where
+        S: KeySet<StateId>,
+    {
+        out.clear();
+        let Some(trie) = self.by_rotated_children.get(trigger_position) else {
+            return;
+        };
+        trie.for_each_value_for_prefix_and_key_sets(
+            &[trigger_left],
+            sibling_sets,
+            |rules_by_symbol| {
+                Self::extend_symbol_matches(symbols, rules_by_symbol, out);
+            },
+        );
+    }
+}
+
+/// A matched nullary edge from `for_each_nullary_edge`.
+pub(crate) struct NullaryEdge {
+    pub(crate) parent_left: StateId,
+    pub(crate) parent_right: StateId,
+    pub(crate) symbol: Symbol,
+    pub(crate) weight: f64,
+}
+
+/// A candidate non-nullary edge from `for_each_candidate_edge`.
+pub(crate) struct CandidateEdge {
+    pub(crate) parent_left: StateId,
+    pub(crate) parent_right: StateId,
+    pub(crate) children: SmallVec<[StateId; 2]>,
+    pub(crate) weight: f64,
+    pub(crate) symbol: Symbol,
+    pub(crate) trigger_position: usize,
+}
+
+/// Intern all right-side nullary results and match them against left nullary
+/// rules. Calls `on_edge` for every matched (left_rule, right_result) pair.
+/// Increments `stats.right_nullary_rules` once per right condensed nullary
+/// shape.
+pub(crate) fn for_each_nullary_edge<R: CondensedTa>(
+    left_rules: &[OwnedRule],
+    left_index: &LeftIndex,
+    right: &R,
+    right_interner: &mut Interner<R::State>,
+    stats: &mut IndexedCondensedIntersectionStats,
+    on_edge: &mut dyn FnMut(NullaryEdge),
+) where
+    R::State: Clone + Eq + Hash,
+{
+    right.condensed_nullary_rules(&mut |symbols, right_result| {
+        stats.right_nullary_rules += 1;
+        let right_result = right_interner.intern(right_result);
+        for symbol in symbols.iter() {
+            let Some(left_rule_indexes) = left_index.nullary_by_symbol.get(&symbol) else {
+                continue;
+            };
+            for &left_rule_idx in left_rule_indexes {
+                let left_rule = &left_rules[left_rule_idx];
+                on_edge(NullaryEdge {
+                    parent_left: left_rule.result,
+                    parent_right: right_result,
+                    symbol,
+                    weight: left_rule.weight,
+                });
+            }
+        }
+    });
+}
+
+/// For a single trigger product state, assemble candidate non-nullary edges.
+/// Queries right condensed rules indexed by `(trigger_position, trigger_right)`,
+/// caches results, and calls `on_edge` for every candidate where all sibling
+/// children already have product IDs. Does not check `current_product_is_latest`
+/// or intern the parent — those are caller responsibilities.
+///
+/// Increments `stats.right_indexed_queries` on cache misses.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn for_each_candidate_edge<R: CondensedTa>(
+    trigger_left: StateId,
+    trigger_right: StateId,
+    trigger_product: StateId,
+    left_rules: &[OwnedRule],
+    left_index: &LeftIndex,
+    product_ids: &ProductStateMap,
+    right: &R,
+    right_interner: &mut Interner<R::State>,
+    right_by_child_cache: &mut FxHashMap<(usize, StateId), Vec<OwnedCondensedRule<StateId>>>,
+    stats: &mut IndexedCondensedIntersectionStats,
+    on_edge: &mut dyn FnMut(CandidateEdge),
+) where
+    R::State: Clone + Eq + Hash,
+{
+    let Some(left_occurrences) = left_index.by_state.get(&trigger_left) else {
+        return;
+    };
+
+    for &(symbol, position, left_rule_idx) in left_occurrences {
+        stat_inc!(stats, left_occurrences_considered);
+        let left_rule = &left_rules[left_rule_idx];
+        let cache_key = (position, trigger_right);
+        let right_rules = right_by_child_cache.entry(cache_key).or_insert_with(|| {
+            stats.right_indexed_queries += 1;
+            let raw_state = right_interner.resolve(trigger_right).clone();
+            let mut collected = Vec::new();
+            right.condensed_rules_by_child(
+                position,
+                &raw_state,
+                &mut |children, symbols, result| {
+                    collected.push(OwnedCondensedRule {
+                        children: children
+                            .iter()
+                            .cloned()
+                            .map(|child| right_interner.intern(child))
+                            .collect(),
+                        symbols: symbols.clone(),
+                        result: right_interner.intern(result),
+                    });
+                },
+            );
+            collected
+        });
+
+        for right_rule in right_rules {
+            stat_inc!(stats, right_rules_scanned);
+            if !right_rule.symbols.contains(symbol)
+                || right_rule.children.len() != left_rule.children.len()
+            {
+                continue;
+            }
+            stat_inc!(stats, symbol_arity_matches);
+
+            let mut children = SmallVec::<[StateId; 2]>::new();
+            let mut ok = true;
+            for (child_position, (&left_child, &right_child)) in left_rule
+                .children
+                .iter()
+                .zip(&right_rule.children)
+                .enumerate()
+            {
+                if child_position == position
+                    && left_child == trigger_left
+                    && right_child == trigger_right
+                {
+                    children.push(trigger_product);
+                } else if let Some(child) = product_ids.get(left_child, right_child) {
+                    children.push(child);
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                continue;
+            }
+            stat_inc!(stats, child_tuple_matches);
+
+            on_edge(CandidateEdge {
+                parent_left: left_rule.result,
+                parent_right: right_rule.result,
+                children,
+                weight: left_rule.weight,
+                symbol,
+                trigger_position: position,
+            });
+        }
     }
 }
 
@@ -372,123 +600,85 @@ where
         FxHashMap::<(usize, StateId), Vec<OwnedCondensedRule<StateId>>>::default();
     let mut stats = IndexedCondensedIntersectionStats::default();
 
-    right.condensed_nullary_rules(&mut |symbols, right_result| {
-        stats.right_nullary_rules += 1;
-        let right_result = right_interner.intern(right_result);
-        for symbol in symbols.iter() {
-            let Some(left_rule_indexes) = left_index.nullary_by_symbol.get(&symbol) else {
-                continue;
-            };
-            for &left_rule_idx in left_rule_indexes {
-                let left_rule = &left_rules[left_rule_idx];
-                let (parent, is_new) = intern_product(
-                    left_rule.result,
-                    right_result,
-                    left,
-                    right,
-                    &mut product_ids,
-                    &mut product_pairs,
-                    &right_interner,
-                    &mut builder,
-                );
-                if is_new {
-                    queue.push_back((left_rule.result, right_result, parent));
-                }
-                rule_tracker.add_rule(
-                    &mut builder,
-                    symbol,
-                    SmallVec::new(),
-                    parent,
-                    left_rule.weight,
-                );
-            }
+    // Collect nullary edges first, then apply them (avoids borrow conflict on
+    // right_interner which is both mutated by the helper and read in get_or_create_product_id).
+    let mut nullary_edges = Vec::<NullaryEdge>::new();
+    for_each_nullary_edge(
+        &left_rules,
+        &left_index,
+        right,
+        &mut right_interner,
+        &mut stats,
+        &mut |edge| nullary_edges.push(edge),
+    );
+    for edge in nullary_edges {
+        let (parent, is_new) = get_or_create_product_id(
+            edge.parent_left,
+            edge.parent_right,
+            left,
+            right,
+            &mut product_ids,
+            &mut product_pairs,
+            &right_interner,
+            &mut builder,
+        );
+        if is_new {
+            queue.push_back((edge.parent_left, edge.parent_right, parent));
         }
-    });
+        rule_tracker.add_rule(
+            &mut builder,
+            edge.symbol,
+            SmallVec::new(),
+            parent,
+            edge.weight,
+        );
+    }
 
     while let Some((left_state, right_state, current_product)) = queue.pop_front() {
         stat_inc!(stats, queue_pops);
-        let Some(left_occurrences) = left_index.by_state.get(&left_state) else {
-            continue;
-        };
 
-        for &(symbol, position, left_rule_idx) in left_occurrences {
-            stat_inc!(stats, left_occurrences_considered);
-            let left_rule = &left_rules[left_rule_idx];
-            let cache_key = (position, right_state);
-            let right_rules = right_by_child_cache.entry(cache_key).or_insert_with(|| {
-                stats.right_indexed_queries += 1;
-                let raw_state = right_interner.resolve(right_state).clone();
-                let mut collected = Vec::new();
-                right.condensed_rules_by_child(
-                    position,
-                    &raw_state,
-                    &mut |children, symbols, result| {
-                        collected.push(OwnedCondensedRule {
-                            children: children
-                                .iter()
-                                .cloned()
-                                .map(|child| right_interner.intern(child))
-                                .collect(),
-                            symbols: symbols.clone(),
-                            result: right_interner.intern(result),
-                        });
-                    },
-                );
-                collected
-            });
-
-            for right_rule in right_rules {
-                stat_inc!(stats, right_rules_scanned);
-                if !right_rule.symbols.contains(symbol)
-                    || right_rule.children.len() != left_rule.children.len()
-                {
-                    continue;
-                }
-                stat_inc!(stats, symbol_arity_matches);
-
-                let mut children = SmallVec::<[StateId; 2]>::new();
-                let mut ok = true;
-                for (child_position, (&left_child, &right_child)) in left_rule
-                    .children
-                    .iter()
-                    .zip(&right_rule.children)
-                    .enumerate()
-                {
-                    if child_position == position
-                        && left_child == left_state
-                        && right_child == right_state
-                    {
-                        children.push(current_product);
-                    } else if let Some(child) = product_ids.get(left_child, right_child) {
-                        children.push(child);
-                    } else {
-                        ok = false;
-                        break;
-                    }
-                }
-                if !ok {
-                    continue;
-                }
-                stat_inc!(stats, child_tuple_matches);
-                if !current_product_is_latest(&children, position, current_product) {
-                    continue;
-                }
-
-                let (parent, is_new) = intern_product(
-                    left_rule.result,
-                    right_rule.result,
-                    left,
-                    right,
-                    &mut product_ids,
-                    &mut product_pairs,
-                    &right_interner,
-                    &mut builder,
-                );
-                if is_new {
-                    queue.push_back((left_rule.result, right_rule.result, parent));
-                }
-                rule_tracker.add_rule(&mut builder, symbol, children, parent, left_rule.weight);
+        // Collect candidate edges first, then apply them (avoids borrow conflicts on
+        // product_ids and right_interner which are both read/mutated by the helper and
+        // the driver closure).
+        let mut candidate_edges = Vec::<CandidateEdge>::new();
+        for_each_candidate_edge(
+            left_state,
+            right_state,
+            current_product,
+            &left_rules,
+            &left_index,
+            &product_ids,
+            right,
+            &mut right_interner,
+            &mut right_by_child_cache,
+            &mut stats,
+            &mut |edge| candidate_edges.push(edge),
+        );
+        for edge in candidate_edges {
+            if !current_product_is_latest(&edge.children, edge.trigger_position, current_product) {
+                continue;
             }
+
+            let (parent, is_new) = get_or_create_product_id(
+                edge.parent_left,
+                edge.parent_right,
+                left,
+                right,
+                &mut product_ids,
+                &mut product_pairs,
+                &right_interner,
+                &mut builder,
+            );
+            if is_new {
+                queue.push_back((edge.parent_left, edge.parent_right, parent));
+            }
+            rule_tracker.add_rule(
+                &mut builder,
+                edge.symbol,
+                edge.children,
+                parent,
+                edge.weight,
+            );
         }
     }
 
@@ -746,7 +936,7 @@ where
             children.push(child_pair);
         }
 
-        let (parent, is_new_product) = intern_product(
+        let (parent, is_new_product) = get_or_create_product_id(
             left_rule.result,
             right_rule.result,
             self.left,
@@ -788,7 +978,7 @@ fn current_product_is_latest(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn intern_product<R>(
+pub(crate) fn get_or_create_product_id<R>(
     left_state: StateId,
     right_state: StateId,
     left: &Explicit,

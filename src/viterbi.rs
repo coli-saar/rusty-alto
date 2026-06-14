@@ -1,6 +1,6 @@
 //! One-best Viterbi extraction for explicit weighted tree automata.
 
-use crate::{Explicit, StateId, Symbol, TopDownTa};
+use crate::{Explicit, ProbabilityScorer, StateId, Symbol, TopDownTa, WeightScorer};
 use rusty_tree::tree::{Tree, TreeArena};
 use smallvec::SmallVec;
 
@@ -10,9 +10,25 @@ pub struct ViterbiTree {
     arena: TreeArena<Symbol>,
     root: Tree,
     weight: f64,
+    score: f64,
 }
 
 impl ViterbiTree {
+    /// Construct a `ViterbiTree` with an algorithm score and display weight.
+    pub(crate) fn new_with_score(
+        arena: TreeArena<Symbol>,
+        root: Tree,
+        score: f64,
+        weight: f64,
+    ) -> Self {
+        Self {
+            arena,
+            root,
+            weight,
+            score,
+        }
+    }
+
     /// Return the arena containing the tree.
     pub fn arena(&self) -> &TreeArena<Symbol> {
         &self.arena
@@ -27,13 +43,22 @@ impl ViterbiTree {
     pub fn weight(&self) -> f64 {
         self.weight
     }
+
+    /// Return the score used to rank this tree.
+    ///
+    /// For [`Explicit::viterbi`] this equals [`Self::weight`]. For
+    /// [`Explicit::viterbi_with`] it is in the scorer's representation, e.g. a
+    /// log probability when using [`crate::LogProbabilityScorer`].
+    pub fn score(&self) -> f64 {
+        self.score
+    }
 }
 
 #[derive(Clone, Debug)]
-struct Backpointer {
-    symbol: Symbol,
-    children: SmallVec<[StateId; 2]>,
-    weight: f64,
+pub(crate) struct Backpointer {
+    pub(crate) symbol: Symbol,
+    pub(crate) children: SmallVec<[StateId; 2]>,
+    pub(crate) weight: f64,
 }
 
 impl Explicit {
@@ -44,6 +69,11 @@ impl Explicit {
     /// only need the best derivation. Self-loop rules are skipped, matching
     /// Alto's Viterbi convention for productive weighted charts.
     pub fn viterbi(&self) -> Option<ViterbiTree> {
+        self.viterbi_with(&ProbabilityScorer)
+    }
+
+    /// Compute the highest-scoring accepted tree under `scorer`.
+    pub fn viterbi_with<S: WeightScorer>(&self, scorer: &S) -> Option<ViterbiTree> {
         let mut order = Vec::new();
         let mut marks = vec![0u8; self.num_states() as usize];
 
@@ -60,20 +90,23 @@ impl Explicit {
                     continue;
                 }
 
-                let mut weight = rule.weight;
+                let mut weight = scorer.rule_score(rule.weight);
                 let mut all_children_available = true;
                 for &child in rule.children {
                     let Some(child_best) = best.get(child.index()).and_then(Option::as_ref) else {
                         all_children_available = false;
                         break;
                     };
-                    weight *= child_best.weight;
+                    weight = scorer.times(weight, child_best.weight);
                 }
                 if !all_children_available {
                     continue;
                 }
 
-                if best_here.as_ref().is_none_or(|old| weight > old.weight) {
+                if best_here
+                    .as_ref()
+                    .is_none_or(|old| scorer.better(weight, old.weight))
+                {
                     best_here = Some(Backpointer {
                         symbol: rule.symbol,
                         children: rule.children.iter().copied().collect(),
@@ -88,20 +121,23 @@ impl Explicit {
         let mut best_final = None::<(StateId, f64)>;
         self.initial_states(&mut |state| {
             if let Some(backpointer) = best.get(state.index()).and_then(Option::as_ref) {
-                if best_final.is_none_or(|(_, old_weight)| backpointer.weight > old_weight) {
+                if best_final
+                    .is_none_or(|(_, old_weight)| scorer.better(backpointer.weight, old_weight))
+                {
                     best_final = Some((state, backpointer.weight));
                 }
             }
         });
 
-        let (state, weight) = best_final?;
+        let (state, score) = best_final?;
         let mut arena = TreeArena::new();
         let root = build_tree(state, &best, &mut arena)?;
-        Some(ViterbiTree {
+        Some(ViterbiTree::new_with_score(
             arena,
             root,
-            weight,
-        })
+            score,
+            scorer.score_to_weight(score),
+        ))
     }
 }
 
@@ -150,7 +186,7 @@ enum DfsFrame {
     Exit(StateId),
 }
 
-fn build_tree(
+pub(crate) fn build_tree(
     state: StateId,
     best: &[Option<Backpointer>],
     arena: &mut TreeArena<Symbol>,
@@ -246,5 +282,32 @@ mod tests {
         assert_eq!(*best.arena().get_label(best.root()), f);
         let child = best.arena().get_children(best.root())[0];
         assert_eq!(*best.arena().get_label(child), a);
+    }
+
+    #[test]
+    fn log_scorer_keeps_underflowed_derivation_orderable() {
+        let a = Symbol(0);
+        let f = Symbol(1);
+
+        let mut builder = ExplicitBuilder::new();
+        let mut states = Vec::new();
+        for _ in 0..220 {
+            states.push(builder.new_state());
+        }
+
+        builder.add_weighted_rule(a, vec![], states[0], 0.01);
+        for i in 1..states.len() {
+            builder.add_weighted_rule(f, vec![states[i - 1]], states[i], 0.01);
+        }
+        builder.add_accepting(*states.last().unwrap());
+        let automaton = builder.build();
+
+        let best_prob = automaton.viterbi().unwrap();
+        assert_eq!(best_prob.weight(), 0.0);
+
+        let scorer = crate::LogProbabilityScorer;
+        let best_log = automaton.viterbi_with(&scorer).unwrap();
+        assert!(best_log.score().is_finite());
+        assert_eq!(best_log.weight(), 0.0);
     }
 }
