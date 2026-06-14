@@ -1,7 +1,7 @@
 use rusty_alto::{
-    Arena, BottomUpTa, DetBottomUpTa, ParsedTreeAutomaton, Signature, StateId, Symbol, TestArena,
-    TestNode, parse_alto,
+    BottomUpTa, DetBottomUpTa, ParsedTreeAutomaton, Signature, StateId, Symbol, parse_alto,
 };
+use rusty_tree::tree::{Tree, TreeArena};
 use std::collections::HashSet;
 use std::env;
 use std::fs;
@@ -104,7 +104,7 @@ fn run_all_det(parsed: &ParsedTreeAutomaton, trees: &[ParsedTree]) -> RunSummary
                 .unwrap_or(StateId::STUCK);
         }
 
-        let root = states[tree.root.0];
+        let root = states[tree.root.index()];
         if !root.is_stuck() {
             root_states += 1;
             if parsed.automaton.is_accepting(&root) {
@@ -139,7 +139,7 @@ fn run_all_nondet(parsed: &ParsedTreeAutomaton, trees: &[ParsedTree]) -> RunSumm
             });
             states[node] = local;
         }
-        let root = &states[tree.root.0];
+        let root = &states[tree.root.index()];
         root_states += root.len();
         if root.iter().any(|q| parsed.automaton.is_accepting(q)) {
             accepted += 1;
@@ -184,8 +184,8 @@ struct RunSummary {
 }
 
 struct ParsedTree {
-    arena: TestArena,
-    root: TestNode,
+    arena: TreeArena<Symbol>,
+    root: Tree,
     symbols: Vec<Symbol>,
     children: Vec<Vec<usize>>,
     postorder: Vec<usize>,
@@ -212,7 +212,7 @@ struct TreeParser<'a, 'b> {
     input: &'a str,
     pos: usize,
     signature: &'b mut Signature,
-    arena: TestArena,
+    arena: TreeArena<Symbol>,
     symbols: Vec<Symbol>,
     children: Vec<Vec<usize>>,
 }
@@ -223,7 +223,7 @@ impl<'a, 'b> TreeParser<'a, 'b> {
             input,
             pos: 0,
             signature,
-            arena: TestArena::new(),
+            arena: TreeArena::new(),
             symbols: Vec::new(),
             children: Vec::new(),
         }
@@ -237,7 +237,7 @@ impl<'a, 'b> TreeParser<'a, 'b> {
         }
 
         let mut postorder = Vec::new();
-        collect_postorder(root.0, &self.children, &mut postorder);
+        collect_postorder(root.index(), &self.children, &mut postorder);
         Ok(ParsedTree {
             arena: self.arena,
             root,
@@ -247,7 +247,7 @@ impl<'a, 'b> TreeParser<'a, 'b> {
         })
     }
 
-    fn node(&mut self) -> Result<TestNode, String> {
+    fn node(&mut self) -> Result<Tree, String> {
         self.skip_ws();
         let label = self.name()?;
         self.skip_ws();
@@ -268,7 +268,7 @@ impl<'a, 'b> TreeParser<'a, 'b> {
         }
 
         let symbol = self.symbol_for(&label, children.len())?;
-        let child_indices: Vec<usize> = children.iter().map(|node| node.0).collect();
+        let child_indices: Vec<usize> = children.iter().map(|node| node.index()).collect();
         let node = self.arena.add_node(symbol, children);
         self.symbols.push(symbol);
         self.children.push(child_indices);

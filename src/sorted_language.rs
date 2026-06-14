@@ -93,21 +93,8 @@ impl<'a> SortedLanguageIterator<'a> {
     /// Use this before advancing the iterator if the tree must be retained
     /// independently of the iterator.
     pub fn clone_tree(&self, root: Tree) -> (TreeArena<Symbol>, Tree) {
-        fn copy_rec(
-            source: &TreeArena<Symbol>,
-            target: &mut TreeArena<Symbol>,
-            root: Tree,
-        ) -> Tree {
-            let children = source
-                .get_children(root)
-                .iter()
-                .map(|&child| copy_rec(source, target, child))
-                .collect();
-            target.add_node(*source.get_label(root), children)
-        }
-
         let mut target = TreeArena::new();
-        let root = copy_rec(&self.arena, &mut target, root);
+        let root = self.arena.copy_into(root, &mut target);
         (target, root)
     }
 

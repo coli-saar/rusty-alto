@@ -1,5 +1,6 @@
-use crate::{Arena, BottomUpTa, DetBottomUpTa, NodeId, StateId};
+use crate::{BottomUpTa, DetBottomUpTa, StateId, Symbol};
 use fixedbitset::FixedBitSet;
+use rusty_tree::tree::{Tree, TreeArena};
 use smallvec::SmallVec;
 
 /// Side table produced by [`run_det`].
@@ -8,7 +9,7 @@ use smallvec::SmallVec;
 /// [`StateId::STUCK`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DetRun {
-    /// State assigned to each node, indexed by [`crate::NodeId::index`].
+    /// State assigned to each node, indexed by [`Tree::index`].
     pub states: Vec<StateId>,
     /// State assigned to the root, or [`StateId::STUCK`] if the tree rejected.
     pub root_state: StateId,
@@ -69,7 +70,7 @@ impl<S: Clone + Ord> StateSet<S> {
 /// subtree rooted at that node is rejected.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NonDetRun<S> {
-    /// State set assigned to each node, indexed by [`crate::NodeId::index`].
+    /// State set assigned to each node, indexed by [`Tree::index`].
     pub states: Vec<StateSet<S>>,
     /// State set assigned to the root.
     pub root_states: StateSet<S>,
@@ -82,10 +83,9 @@ pub struct NonDetRun<S> {
 /// richer state values, wrap the automaton in [`crate::Memo`] first.
 ///
 /// If a child is stuck, the parent is stuck without querying the automaton.
-pub fn run_det<A, T>(a: &A, arena: &T, root: T::NodeId) -> DetRun
+pub fn run_det<A>(a: &A, arena: &TreeArena<Symbol>, root: Tree) -> DetRun
 where
     A: DetBottomUpTa<State = StateId>,
-    T: Arena,
 {
     let mut states = vec![StateId::STUCK; arena.len()];
     let mut visited = FixedBitSet::with_capacity(arena.len());
@@ -99,7 +99,7 @@ where
 
         buf.clear();
         let mut any_stuck = false;
-        for child in arena.children(node) {
+        for &child in arena.get_children(node) {
             let cs = states[child.index()];
             if cs.is_stuck() {
                 any_stuck = true;
@@ -111,7 +111,7 @@ where
             continue;
         }
         states[node.index()] = a
-            .step_det(arena.symbol(node), &buf)
+            .step_det(*arena.get_label(node), &buf)
             .unwrap_or(StateId::STUCK);
     }
 
@@ -126,11 +126,10 @@ where
 /// This runner stores a set of possible states at every node. It is more
 /// general than [`run_det`] but does more allocation and tuple enumeration, so
 /// deterministic automata should prefer [`run_det`] when possible.
-pub fn run_nondet<A, T>(a: &A, arena: &T, root: T::NodeId) -> NonDetRun<A::State>
+pub fn run_nondet<A>(a: &A, arena: &TreeArena<Symbol>, root: Tree) -> NonDetRun<A::State>
 where
     A: BottomUpTa,
     A::State: Ord,
-    T: Arena,
 {
     let mut states = vec![StateSet::new(); arena.len()];
     let mut visited = FixedBitSet::with_capacity(arena.len());
@@ -142,7 +141,7 @@ where
         visited.set(node.index(), true);
 
         let local = {
-            let child_ids: SmallVec<[T::NodeId; 4]> = arena.children(node).collect();
+            let child_ids: SmallVec<[Tree; 4]> = arena.get_children(node).iter().copied().collect();
             let mut pools: SmallVec<[&[A::State]; 4]> = SmallVec::new();
             let mut any_empty = false;
             for child in child_ids {
@@ -158,7 +157,7 @@ where
             } else {
                 let mut local = StateSet::new();
                 cartesian_product(&pools, |tuple| {
-                    a.step(arena.symbol(node), tuple, &mut |q| local.insert(q));
+                    a.step(*arena.get_label(node), tuple, &mut |q| local.insert(q));
                 });
                 Some(local)
             }
@@ -242,7 +241,7 @@ mod tests {
         builder.add_accepting(root_state);
         let automaton = builder.build();
 
-        let mut arena = crate::TestArena::new();
+        let mut arena = TreeArena::new();
         let left = arena.add_node(a, vec![]);
         let right = arena.add_node(a, vec![]);
         let root = arena.add_node(f, vec![left, right]);
@@ -261,7 +260,7 @@ mod tests {
         builder.add_rule(a, vec![], q0);
         builder.add_rule(a, vec![], q1);
         let automaton = builder.build();
-        let mut arena = crate::TestArena::new();
+        let mut arena = TreeArena::new();
         let root = arena.add_node(a, vec![]);
         let run = run_nondet(&automaton, &arena, root);
         assert_eq!(run.root_states.len(), 2);
@@ -274,7 +273,7 @@ mod tests {
         let builder = ExplicitBuilder::new();
         let automaton = builder.build();
 
-        let mut arena = crate::TestArena::new();
+        let mut arena = TreeArena::new();
         let shared = arena.add_node(leaf_symbol, vec![]);
         let root = arena.add_node(parent_symbol, vec![shared, shared]);
 

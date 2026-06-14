@@ -2,12 +2,12 @@ use criterion::{
     BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
 };
 use rusty_alto::{
-    Arena, BottomUpTa, CondensedTa, DetBottomUpTa, Determinized, Explicit, ExplicitBuilder,
-    HomLabel, Homomorphism, IndexedBottomUpTa, InvHom, Memo, Product, Span, StateId, StringAlgebra,
-    StringDecompositionAutomaton, Symbol, TestArena, TestNode, TopDownTa, materialize,
+    BottomUpTa, CondensedTa, DetBottomUpTa, Determinized, Explicit, ExplicitBuilder, HomLabel,
+    Homomorphism, IndexedBottomUpTa, InvHom, Memo, Product, Span, StateId, StringAlgebra,
+    StringDecompositionAutomaton, Symbol, TopDownTa, materialize,
     materialize_indexed_condensed_intersection, parse_irtg, run_det, run_nondet,
 };
-use rusty_tree::tree::TreeArena;
+use rusty_tree::tree::{Tree, TreeArena};
 
 const A: Symbol = Symbol(0);
 const U: Symbol = Symbol(1);
@@ -28,8 +28,8 @@ fn explicit_chain() -> (Explicit, StateId, StateId) {
     (builder.build(), leaf, node)
 }
 
-fn balanced_tree(depth: usize) -> (TestArena, TestNode) {
-    fn build(arena: &mut TestArena, depth: usize) -> TestNode {
+fn balanced_tree(depth: usize) -> (TreeArena<Symbol>, Tree) {
+    fn build(arena: &mut TreeArena<Symbol>, depth: usize) -> Tree {
         if depth == 0 {
             arena.add_node(A, vec![])
         } else {
@@ -39,13 +39,13 @@ fn balanced_tree(depth: usize) -> (TestArena, TestNode) {
         }
     }
 
-    let mut arena = TestArena::new();
+    let mut arena = TreeArena::new();
     let root = build(&mut arena, depth);
     (arena, root)
 }
 
-fn unary_chain(len: usize) -> (TestArena, TestNode) {
-    let mut arena = TestArena::new();
+fn unary_chain(len: usize) -> (TreeArena<Symbol>, Tree) {
+    let mut arena = TreeArena::new();
     let mut node = arena.add_node(A, vec![]);
     for _ in 0..len {
         node = arena.add_node(U, vec![node]);

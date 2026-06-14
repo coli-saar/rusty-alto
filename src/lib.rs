@@ -22,6 +22,7 @@
 //!
 //! ```
 //! use rusty_alto::*;
+//! use rusty_tree::tree::TreeArena;
 //!
 //! let a = Symbol(0);
 //! let f = Symbol(1);
@@ -33,7 +34,7 @@
 //! builder.add_accepting(root);
 //! let automaton = builder.build();
 //!
-//! let mut tree = TestArena::new();
+//! let mut tree = TreeArena::new();
 //! let left = tree.add_node(a, vec![]);
 //! let right = tree.add_node(a, vec![]);
 //! let root_node = tree.add_node(f, vec![left, right]);
@@ -48,7 +49,6 @@ lalrpop_util::lalrpop_mod!(
     #[allow(clippy::all)]
     alto_grammar
 );
-pub mod arena;
 pub mod combinators;
 pub mod explicit;
 pub mod homomorphism;
@@ -67,7 +67,6 @@ pub use algebras::{
     Algebra, EvaluatingDecompositionAutomaton, Span, StringAlgebra, StringDecompositionAutomaton,
 };
 pub use alto::{AltoParseError, ParsedTreeAutomaton, parse_alto, parse_alto_with_signature};
-pub use arena::{Arena, NodeId, TestArena, TestNode};
 pub use combinators::{Determinized, InvHom, Mapped, Product};
 pub use explicit::{Explicit, ExplicitBuildError, ExplicitBuilder, Rule};
 pub use homomorphism::{HomLabel, HomTerm, Homomorphism, HomomorphismError};
