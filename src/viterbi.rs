@@ -2,6 +2,7 @@
 
 use crate::{Explicit, StateId, Symbol, TopDownTa};
 use rusty_tree::tree::{Tree, TreeArena};
+use smallvec::SmallVec;
 
 /// The highest-weighted tree found in an automaton language.
 #[derive(Debug)]
@@ -31,7 +32,7 @@ impl ViterbiTree {
 #[derive(Clone, Debug)]
 struct Backpointer {
     symbol: Symbol,
-    children: Vec<StateId>,
+    children: SmallVec<[StateId; 2]>,
     weight: f64,
 }
 
@@ -75,7 +76,7 @@ impl Explicit {
                 if best_here.as_ref().is_none_or(|old| weight > old.weight) {
                     best_here = Some(Backpointer {
                         symbol: rule.symbol,
-                        children: rule.children.to_vec(),
+                        children: rule.children.iter().copied().collect(),
                         weight,
                     });
                 }
@@ -104,30 +105,49 @@ impl Explicit {
     }
 }
 
-fn visit_state(auto: &Explicit, state: StateId, marks: &mut [u8], order: &mut Vec<StateId>) {
-    if state.is_stuck() || state.index() >= marks.len() {
+fn visit_state(auto: &Explicit, start: StateId, marks: &mut [u8], order: &mut Vec<StateId>) {
+    if start.is_stuck() || start.index() >= marks.len() || marks[start.index()] != 0 {
         return;
     }
 
-    match marks[state.index()] {
-        2 => return,
-        1 => return,
-        _ => {}
-    }
+    let mut stack = Vec::new();
+    stack.push(DfsFrame::Enter(start));
+    marks[start.index()] = 1;
 
-    marks[state.index()] = 1;
-    let child_tuples: Vec<Vec<StateId>> = auto
-        .rules_topdown(state)
-        .filter(|rule| !rule.children.contains(&state))
-        .map(|rule| rule.children.to_vec())
-        .collect();
-    for children in child_tuples {
-        for child in children {
-            visit_state(auto, child, marks, order);
+    while let Some(frame) = stack.pop() {
+        match frame {
+            DfsFrame::Enter(state) => {
+                stack.push(DfsFrame::Exit(state));
+
+                for &rule_idx in auto.rule_indexes_topdown(state).iter().rev() {
+                    let rule = auto.rule(rule_idx);
+                    if rule.children.contains(&state) {
+                        continue;
+                    }
+
+                    for &child in rule.children.iter().rev() {
+                        if child.is_stuck() || child.index() >= marks.len() {
+                            continue;
+                        }
+                        if marks[child.index()] == 0 {
+                            marks[child.index()] = 1;
+                            stack.push(DfsFrame::Enter(child));
+                        }
+                    }
+                }
+            }
+            DfsFrame::Exit(state) => {
+                marks[state.index()] = 2;
+                order.push(state);
+            }
         }
     }
-    marks[state.index()] = 2;
-    order.push(state);
+}
+
+#[derive(Clone, Copy)]
+enum DfsFrame {
+    Enter(StateId),
+    Exit(StateId),
 }
 
 fn build_tree(
@@ -181,5 +201,50 @@ mod tests {
         let automaton = builder.build();
 
         assert!(automaton.viterbi().is_none());
+    }
+
+    #[test]
+    fn preserves_binary_child_order() {
+        let a = Symbol(0);
+        let b = Symbol(1);
+        let f = Symbol(2);
+
+        let mut builder = ExplicitBuilder::new();
+        let qa = builder.new_state();
+        let qb = builder.new_state();
+        let root = builder.new_state();
+        builder.add_weighted_rule(a, vec![], qa, 0.5);
+        builder.add_weighted_rule(b, vec![], qb, 0.5);
+        builder.add_weighted_rule(f, vec![qa, qb], root, 0.5);
+        builder.add_accepting(root);
+        let automaton = builder.build();
+
+        let best = automaton.viterbi().unwrap();
+        assert!((best.weight() - 0.125).abs() < 1e-12);
+        let children = best.arena().get_children(best.root());
+        assert_eq!(children.len(), 2);
+        assert_eq!(*best.arena().get_label(children[0]), a);
+        assert_eq!(*best.arena().get_label(children[1]), b);
+    }
+
+    #[test]
+    fn skips_self_loop_rules_during_iterative_traversal() {
+        let a = Symbol(0);
+        let f = Symbol(1);
+
+        let mut builder = ExplicitBuilder::new();
+        let leaf = builder.new_state();
+        let root = builder.new_state();
+        builder.add_weighted_rule(a, vec![], leaf, 0.7);
+        builder.add_weighted_rule(f, vec![leaf], root, 0.5);
+        builder.add_weighted_rule(f, vec![root], root, 100.0);
+        builder.add_accepting(root);
+        let automaton = builder.build();
+
+        let best = automaton.viterbi().unwrap();
+        assert!((best.weight() - 0.35).abs() < 1e-12);
+        assert_eq!(*best.arena().get_label(best.root()), f);
+        let child = best.arena().get_children(best.root())[0];
+        assert_eq!(*best.arena().get_label(child), a);
     }
 }

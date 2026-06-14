@@ -174,12 +174,26 @@ impl ExplicitBuilder {
         q: StateId,
         weight: f64,
     ) {
+        self.add_weighted_rule_inline(f, SmallVec::from_vec(children), q, weight);
+    }
+
+    /// Add a weighted rule from an inline child tuple.
+    ///
+    /// This avoids round-tripping through `Vec` in internal materializers that
+    /// already build child tuples in the same inline representation used by
+    /// [`Explicit`].
+    pub(crate) fn add_weighted_rule_inline(
+        &mut self,
+        f: Symbol,
+        children: SmallVec<[StateId; 2]>,
+        q: StateId,
+        weight: f64,
+    ) {
         self.check_state(q);
         for &child in &children {
             self.check_state(child);
         }
-        self.rules
-            .push((f, SmallVec::from_vec(children), q, weight));
+        self.rules.push((f, children, q, weight));
     }
 
     /// Build the explicit automaton.
@@ -355,20 +369,36 @@ impl Explicit {
 
     /// Iterate over rules with the given parent/result state.
     pub fn rules_topdown(&self, parent: StateId) -> impl Iterator<Item = Rule<'_>> {
-        self.result_index()[parent.index()].iter().map(|&rule_idx| {
-            let rule = &self.rules[rule_idx];
-            Rule {
-                symbol: rule.symbol,
-                children: rule.children.as_slice(),
-                result: rule.result,
-                weight: rule.weight,
-            }
-        })
+        self.result_index()[parent.index()]
+            .iter()
+            .map(|&rule_idx| self.rule(rule_idx))
+    }
+
+    pub(crate) fn rule(&self, rule_idx: usize) -> Rule<'_> {
+        let rule = &self.rules[rule_idx];
+        Rule {
+            symbol: rule.symbol,
+            children: rule.children.as_slice(),
+            result: rule.result,
+            weight: rule.weight,
+        }
+    }
+
+    pub(crate) fn rule_indexes_topdown(&self, parent: StateId) -> &[usize] {
+        &self.result_index()[parent.index()]
     }
 
     fn result_index(&self) -> &[Vec<usize>] {
         self.result_index.get_or_init(|| {
-            let mut by_result = vec![Vec::new(); self.num_states as usize];
+            let mut counts = vec![0usize; self.num_states as usize];
+            for rule in &self.rules {
+                counts[rule.result.index()] += 1;
+            }
+
+            let mut by_result = counts
+                .into_iter()
+                .map(Vec::with_capacity)
+                .collect::<Vec<_>>();
             for (rule_idx, rule) in self.rules.iter().enumerate() {
                 by_result[rule.result.index()].push(rule_idx);
             }
@@ -652,6 +682,26 @@ mod tests {
         let e = b.build();
         let rule = e.rules().next().unwrap();
         assert_eq!(rule.weight, 0.25);
+    }
+
+    #[test]
+    fn add_weighted_rule_inline_preserves_child_tuple() {
+        let mut b = ExplicitBuilder::new();
+        let left = b.new_state();
+        let right = b.new_state();
+        let parent = b.new_state();
+        b.add_weighted_rule_inline(
+            Symbol(1),
+            SmallVec::from_slice(&[left, right]),
+            parent,
+            0.75,
+        );
+
+        let e = b.build();
+        let rule = e.rules().next().unwrap();
+        assert_eq!(rule.children, &[left, right]);
+        assert_eq!(rule.result, parent);
+        assert_eq!(rule.weight, 0.75);
     }
 
     #[test]

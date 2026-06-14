@@ -53,9 +53,9 @@ where
     ///
     /// `key_sets[d]` is the set of allowed keys at depth `d`. Values stored at
     /// shorter or longer key lengths are not visited.
-    pub fn for_each_value_for_key_sets<S>(&self, key_sets: &[&S], mut out: impl FnMut(&V))
+    pub fn for_each_value_for_key_sets<S>(&self, key_sets: &[S], mut out: impl FnMut(&V))
     where
-        S: KeySet<K> + ?Sized,
+        S: KeySet<K>,
     {
         self.for_each_value_for_key_sets_at(0, key_sets, &mut out);
     }
@@ -63,10 +63,10 @@ where
     fn for_each_value_for_key_sets_at<S>(
         &self,
         depth: usize,
-        key_sets: &[&S],
+        key_sets: &[S],
         out: &mut dyn FnMut(&V),
     ) where
-        S: KeySet<K> + ?Sized,
+        S: KeySet<K>,
     {
         if depth == key_sets.len() {
             if let Some(value) = &self.value {
@@ -75,7 +75,7 @@ where
             return;
         }
 
-        let keys = key_sets[depth];
+        let keys = &key_sets[depth];
         if keys.len() < self.next.len() {
             keys.for_each(&mut |key| {
                 if let Some(next) = self.next.get(key) {
@@ -121,6 +121,23 @@ where
         for key in self {
             out(key);
         }
+    }
+}
+
+impl<K, T> KeySet<K> for &T
+where
+    T: KeySet<K> + ?Sized,
+{
+    fn len(&self) -> usize {
+        (**self).len()
+    }
+
+    fn contains(&self, key: &K) -> bool {
+        (**self).contains(key)
+    }
+
+    fn for_each(&self, out: &mut dyn FnMut(&K)) {
+        (**self).for_each(out);
     }
 }
 

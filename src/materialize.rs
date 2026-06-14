@@ -1,6 +1,6 @@
 use crate::{
     Arity, BottomUpTa, CondensedTa, CondensedTopDownTa, Explicit, ExplicitBuilder, FxHashSet,
-    Interner, Memo, SetTrie, StateId, Symbol, SymbolSet, run::cartesian_product,
+    Interner, KeySet, Memo, SetTrie, StateId, Symbol, SymbolSet, run::cartesian_product,
 };
 use fixedbitset::FixedBitSet;
 use smallvec::SmallVec;
@@ -182,6 +182,92 @@ struct OwnedCondensedRule<S> {
     result: S,
 }
 
+#[derive(Clone, Debug, Default)]
+struct ProductStateMap {
+    by_right: Vec<FxHashMap<StateId, StateId>>,
+}
+
+impl ProductStateMap {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn get(&self, left: StateId, right: StateId) -> Option<StateId> {
+        self.by_right
+            .get(right.index())
+            .and_then(|partners| partners.get(&left).copied())
+    }
+
+    fn insert(&mut self, left: StateId, right: StateId, product: StateId) {
+        if self.by_right.len() <= right.index() {
+            self.by_right
+                .resize_with(right.index() + 1, FxHashMap::default);
+        }
+        self.by_right[right.index()].insert(left, product);
+    }
+}
+
+#[derive(Debug, Default)]
+struct TrustedRuleTracker {
+    #[cfg(debug_assertions)]
+    seen: FxHashSet<(Symbol, SmallVec<[StateId; 2]>, StateId)>,
+}
+
+impl TrustedRuleTracker {
+    fn add_rule(
+        &mut self,
+        builder: &mut ExplicitBuilder,
+        symbol: Symbol,
+        children: SmallVec<[StateId; 2]>,
+        parent: StateId,
+        weight: f64,
+    ) {
+        #[cfg(debug_assertions)]
+        {
+            let key = (symbol, children.clone(), parent);
+            debug_assert!(
+                self.seen.insert(key),
+                "trusted materializer generated a duplicate transition"
+            );
+        }
+
+        builder.add_weighted_rule_inline(symbol, children, parent, weight);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum StateSetView<'a> {
+    One(StateId),
+    Many(&'a FxHashSet<StateId>),
+}
+
+impl KeySet<StateId> for StateSetView<'_> {
+    fn len(&self) -> usize {
+        match self {
+            StateSetView::One(_) => 1,
+            StateSetView::Many(states) => states.len(),
+        }
+    }
+
+    fn contains(&self, key: &StateId) -> bool {
+        match self {
+            StateSetView::One(state) => state == key,
+            StateSetView::Many(states) => states.contains(key),
+        }
+    }
+
+    fn for_each(&self, out: &mut dyn FnMut(&StateId)) {
+        match self {
+            StateSetView::One(state) => out(state),
+            StateSetView::Many(states) => {
+                for state in *states {
+                    out(state);
+                }
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct LeftIndex {
     nullary_by_symbol: FxHashMap<Symbol, Vec<usize>>,
@@ -217,12 +303,15 @@ impl LeftIndex {
         index
     }
 
-    fn rule_indexes_for_sets(
+    fn rule_indexes_for_sets_into<S>(
         &self,
         symbols: &SymbolSet,
-        child_sets: &[&FxHashSet<StateId>],
-    ) -> SmallVec<[usize; 16]> {
-        let mut out = SmallVec::<[usize; 16]>::new();
+        child_sets: &[S],
+        out: &mut Vec<usize>,
+    ) where
+        S: KeySet<StateId>,
+    {
+        out.clear();
         self.by_children
             .for_each_value_for_key_sets(child_sets, |rules_by_symbol| {
                 if symbols.len() < rules_by_symbol.len() {
@@ -239,7 +328,6 @@ impl LeftIndex {
                     }
                 }
             });
-        out
     }
 }
 
@@ -275,12 +363,11 @@ where
     let left_index = LeftIndex::build(&left_rules);
 
     let mut right_interner = Interner::new();
-    let mut product_ids_by_left = (0..left.num_states())
-        .map(|_| FxHashMap::<StateId, StateId>::default())
-        .collect::<Vec<_>>();
+    let mut product_ids = ProductStateMap::new();
     let mut product_pairs = Vec::<(StateId, StateId)>::new();
     let mut queue = VecDeque::<(StateId, StateId, StateId)>::new();
     let mut builder = ExplicitBuilder::new();
+    let mut rule_tracker = TrustedRuleTracker::default();
     let mut right_by_child_cache =
         FxHashMap::<(usize, StateId), Vec<OwnedCondensedRule<StateId>>>::default();
     let mut stats = IndexedCondensedIntersectionStats::default();
@@ -299,7 +386,7 @@ where
                     right_result,
                     left,
                     right,
-                    &mut product_ids_by_left,
+                    &mut product_ids,
                     &mut product_pairs,
                     &right_interner,
                     &mut builder,
@@ -307,7 +394,13 @@ where
                 if is_new {
                     queue.push_back((left_rule.result, right_result, parent));
                 }
-                builder.add_weighted_rule(symbol, Vec::new(), parent, left_rule.weight);
+                rule_tracker.add_rule(
+                    &mut builder,
+                    symbol,
+                    SmallVec::new(),
+                    parent,
+                    left_rule.weight,
+                );
             }
         }
     });
@@ -366,9 +459,7 @@ where
                         && right_child == right_state
                     {
                         children.push(current_product);
-                    } else if let Some(&child) =
-                        product_ids_by_left[left_child.index()].get(&right_child)
-                    {
+                    } else if let Some(child) = product_ids.get(left_child, right_child) {
                         children.push(child);
                     } else {
                         ok = false;
@@ -388,7 +479,7 @@ where
                     right_rule.result,
                     left,
                     right,
-                    &mut product_ids_by_left,
+                    &mut product_ids,
                     &mut product_pairs,
                     &right_interner,
                     &mut builder,
@@ -396,7 +487,7 @@ where
                 if is_new {
                     queue.push_back((left_rule.result, right_rule.result, parent));
                 }
-                builder.add_weighted_rule(symbol, children.into_vec(), parent, left_rule.weight);
+                rule_tracker.add_rule(&mut builder, symbol, children, parent, left_rule.weight);
             }
         }
     }
@@ -442,14 +533,13 @@ where
         left_rules: &left_rules,
         left_index: &left_index,
         right_interner: Interner::new(),
-        product_ids_by_left: (0..left.num_states())
-            .map(|_| FxHashMap::<StateId, StateId>::default())
-            .collect(),
+        product_ids: ProductStateMap::new(),
         product_pairs: Vec::new(),
         builder: ExplicitBuilder::new(),
+        rule_tracker: TrustedRuleTracker::default(),
         partners: Vec::new(),
         visited: FixedBitSet::new(),
-        output_seen: FxHashSet::default(),
+        matches_scratch: Vec::new(),
         stats: IndexedCondensedIntersectionStats::default(),
     };
 
@@ -474,12 +564,13 @@ where
     left_rules: &'a [OwnedRule],
     left_index: &'a LeftIndex,
     right_interner: Interner<R::State>,
-    product_ids_by_left: Vec<FxHashMap<StateId, StateId>>,
+    product_ids: ProductStateMap,
     product_pairs: Vec<(StateId, StateId)>,
     builder: ExplicitBuilder,
+    rule_tracker: TrustedRuleTracker,
     partners: Vec<FxHashSet<StateId>>,
     visited: FixedBitSet,
-    output_seen: FxHashSet<(Symbol, SmallVec<[StateId; 2]>, StateId)>,
+    matches_scratch: Vec<usize>,
     stats: IndexedCondensedIntersectionStats,
 }
 
@@ -508,8 +599,8 @@ where
         self.stats.right_indexed_queries += 1;
 
         let raw_parent = self.right_interner.resolve(q).clone();
-        let mut normal_rules = Vec::<OwnedCondensedRule<StateId>>::new();
-        let mut loop_rules = Vec::<OwnedCondensedRule<StateId>>::new();
+        let mut normal_rules = SmallVec::<[OwnedCondensedRule<StateId>; 4]>::new();
+        let mut loop_rules = SmallVec::<[OwnedCondensedRule<StateId>; 4]>::new();
 
         self.right
             .condensed_rules_by_parent(&raw_parent, &mut |symbols, children| {
@@ -561,12 +652,18 @@ where
             .iter()
             .map(|&child| &self.partners[child.index()])
             .collect::<SmallVec<[&FxHashSet<StateId>; 4]>>();
-        let matches = self.left_rule_indexes_for_sets(&right_rule.symbols, &child_sets);
+        self.left_index.rule_indexes_for_sets_into(
+            &right_rule.symbols,
+            &child_sets,
+            &mut self.matches_scratch,
+        );
         drop(child_sets);
-        for rule_idx in matches {
+        let matches = std::mem::take(&mut self.matches_scratch);
+        for &rule_idx in &matches {
             let left_rule = &self.left_rules[rule_idx];
             self.collect_pair(left_rule, right_rule);
         }
+        self.matches_scratch = matches;
     }
 
     fn process_loop_rules(&mut self, q: StateId, loop_rules: &[OwnedCondensedRule<StateId>]) {
@@ -588,14 +685,14 @@ where
                 let mut seen = self.partners[q.index()].clone();
 
                 while let Some(left_at_loop) = agenda.pop_front() {
-                    let singleton = FxHashSet::from_iter([left_at_loop]);
-                    let mut child_sets = SmallVec::<[&FxHashSet<StateId>; 4]>::new();
+                    let mut child_sets = SmallVec::<[StateSetView<'_>; 4]>::new();
                     let mut missing = false;
                     for (position, &right_child) in right_rule.children.iter().enumerate() {
                         if position == loop_position {
-                            child_sets.push(&singleton);
+                            child_sets.push(StateSetView::One(left_at_loop));
                         } else if self.has_partners(right_child) {
-                            child_sets.push(&self.partners[right_child.index()]);
+                            child_sets
+                                .push(StateSetView::Many(&self.partners[right_child.index()]));
                         } else {
                             missing = true;
                             break;
@@ -605,11 +702,16 @@ where
                         continue;
                     }
 
-                    let matches = self.left_rule_indexes_for_sets(&right_rule.symbols, &child_sets);
+                    self.left_index.rule_indexes_for_sets_into(
+                        &right_rule.symbols,
+                        &child_sets,
+                        &mut self.matches_scratch,
+                    );
                     drop(child_sets);
+                    let matches = std::mem::take(&mut self.matches_scratch);
 
                     let mut newly_added = SmallVec::<[StateId; 4]>::new();
-                    for rule_idx in matches {
+                    for &rule_idx in &matches {
                         let left_rule = &self.left_rules[rule_idx];
                         if self.collect_pair(left_rule, right_rule) && seen.insert(left_rule.result)
                         {
@@ -619,6 +721,7 @@ where
                     for state in newly_added {
                         agenda.push_back(state);
                     }
+                    self.matches_scratch = matches;
                 }
             }
         }
@@ -630,14 +733,6 @@ where
             .is_some_and(|partners| !partners.is_empty())
     }
 
-    fn left_rule_indexes_for_sets(
-        &self,
-        symbols: &SymbolSet,
-        child_sets: &[&FxHashSet<StateId>],
-    ) -> SmallVec<[usize; 16]> {
-        self.left_index.rule_indexes_for_sets(symbols, child_sets)
-    }
-
     fn collect_pair(
         &mut self,
         left_rule: &OwnedRule,
@@ -645,8 +740,7 @@ where
     ) -> bool {
         let mut children = SmallVec::<[StateId; 2]>::new();
         for (&left_child, &right_child) in left_rule.children.iter().zip(&right_rule.children) {
-            let Some(&child_pair) = self.product_ids_by_left[left_child.index()].get(&right_child)
-            else {
+            let Some(child_pair) = self.product_ids.get(left_child, right_child) else {
                 return false;
             };
             children.push(child_pair);
@@ -657,7 +751,7 @@ where
             right_rule.result,
             self.left,
             self.right,
-            &mut self.product_ids_by_left,
+            &mut self.product_ids,
             &mut self.product_pairs,
             &self.right_interner,
             &mut self.builder,
@@ -666,15 +760,13 @@ where
             self.partners[right_rule.result.index()].insert(left_rule.result);
         }
 
-        let key = (left_rule.symbol, children.clone(), parent);
-        if self.output_seen.insert(key) {
-            self.builder.add_weighted_rule(
-                left_rule.symbol,
-                children.into_vec(),
-                parent,
-                left_rule.weight,
-            );
-        }
+        self.rule_tracker.add_rule(
+            &mut self.builder,
+            left_rule.symbol,
+            children,
+            parent,
+            left_rule.weight,
+        );
         is_new_product
     }
 }
@@ -701,7 +793,7 @@ fn intern_product<R>(
     right_state: StateId,
     left: &Explicit,
     right: &R,
-    ids_by_left: &mut [FxHashMap<StateId, StateId>],
+    ids: &mut ProductStateMap,
     pairs: &mut Vec<(StateId, StateId)>,
     right_interner: &Interner<R::State>,
     builder: &mut ExplicitBuilder,
@@ -709,11 +801,11 @@ fn intern_product<R>(
 where
     R: BottomUpTa,
 {
-    if let Some(&id) = ids_by_left[left_state.index()].get(&right_state) {
+    if let Some(id) = ids.get(left_state, right_state) {
         return (id, false);
     }
     let id = builder.new_state();
-    ids_by_left[left_state.index()].insert(right_state, id);
+    ids.insert(left_state, right_state, id);
     pairs.push((left_state, right_state));
     if left.is_accepting(&left_state) && right.is_accepting(right_interner.resolve(right_state)) {
         builder.add_accepting(id);
@@ -725,6 +817,75 @@ where
 mod tests {
     use super::*;
     use crate::{BottomUpTa, ExplicitBuilder};
+
+    #[test]
+    fn product_state_map_is_right_major_and_sparse() {
+        let mut map = ProductStateMap::new();
+        let left = StateId(7);
+        let right = StateId(3);
+        let product = StateId(11);
+
+        assert_eq!(map.get(left, right), None);
+        map.insert(left, right, product);
+        assert_eq!(map.get(left, right), Some(product));
+        assert_eq!(map.get(StateId(8), right), None);
+        assert_eq!(map.get(left, StateId(4)), None);
+    }
+
+    #[test]
+    fn state_set_view_matches_set_trie_traversal() {
+        let mut trie = SetTrie::new();
+        trie.get_or_insert_with(&[StateId(1), StateId(2)], Vec::new)
+            .push("hit");
+        trie.get_or_insert_with(&[StateId(3), StateId(2)], Vec::new)
+            .push("miss");
+
+        let second = FxHashSet::from_iter([StateId(2)]);
+        let key_sets = [StateSetView::One(StateId(1)), StateSetView::Many(&second)];
+        let mut values = Vec::new();
+        trie.for_each_value_for_key_sets(&key_sets, |found| {
+            values.extend(found.iter().copied());
+        });
+
+        assert_eq!(values, vec!["hit"]);
+    }
+
+    #[test]
+    fn left_index_reuses_output_buffer_for_set_queries() {
+        let symbol = Symbol(1);
+        let other_symbol = Symbol(2);
+        let q0 = StateId(0);
+        let q1 = StateId(1);
+        let rules = vec![
+            OwnedRule {
+                symbol,
+                children: SmallVec::from_slice(&[q0, q1]),
+                result: StateId(2),
+                weight: 1.0,
+            },
+            OwnedRule {
+                symbol: other_symbol,
+                children: SmallVec::from_slice(&[q0, q1]),
+                result: StateId(3),
+                weight: 1.0,
+            },
+        ];
+        let index = LeftIndex::build(&rules);
+        let mut symbols = SymbolSet::default();
+        symbols.insert(symbol);
+        let first = FxHashSet::from_iter([q0]);
+        let second = FxHashSet::from_iter([q1]);
+        let key_sets = [&first, &second];
+        let mut out = vec![usize::MAX];
+
+        index.rule_indexes_for_sets_into(&symbols, &key_sets, &mut out);
+        assert_eq!(out, vec![0]);
+
+        symbols.insert(other_symbol);
+        index.rule_indexes_for_sets_into(&symbols, &key_sets, &mut out);
+        out.sort_unstable();
+        assert_eq!(out, vec![0, 1]);
+    }
 
     #[test]
     fn materializes_explicit_identity_fragment() {
