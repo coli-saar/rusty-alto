@@ -83,8 +83,12 @@ fn run() -> Result<(), Box<dyn Error>> {
         let parse_time = parse_start.elapsed();
 
         let top_start = Instant::now();
-        let mut language = chart.automaton.sorted_language();
-        let _top = language.next();
+        let top = chart.automaton.viterbi();
+        if let Some(top) = &top {
+            let _ = irtg
+                .grammar_signature()
+                .resolve_tree(top.arena(), top.root());
+        }
         let top_time = top_start.elapsed();
         let total_time = object_time + parse_time + top_time;
 

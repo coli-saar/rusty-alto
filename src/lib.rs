@@ -62,6 +62,7 @@ pub mod set_trie;
 pub mod signature;
 pub mod sorted_language;
 pub mod traits;
+pub mod viterbi;
 
 pub use algebras::{
     Algebra, EvaluatingDecompositionAutomaton, Span, StringAlgebra, StringDecompositionAutomaton,
@@ -88,6 +89,7 @@ pub use traits::{
     BottomUpTa, CondensedTa, CondensedTopDownTa, DetBottomUpTa, IndexedBottomUpTa, StateUniverse,
     SymbolSet, TopDownTa,
 };
+pub use viterbi::ViterbiTree;
 
 pub(crate) type FxHashMap<K, V> = hashbrown::HashMap<K, V, rustc_hash::FxBuildHasher>;
 pub(crate) type FxHashSet<T> = hashbrown::HashSet<T, rustc_hash::FxBuildHasher>;

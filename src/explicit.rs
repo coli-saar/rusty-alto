@@ -23,11 +23,8 @@ type Results = SmallVec<[StateId; 2]>;
 pub struct Explicit {
     num_states: u32,
     accepting: FixedBitSet,
-    nullary: FxHashMap<Symbol, Results>,
-    unary: FxHashMap<(Symbol, StateId), Results>,
-    binary: FxHashMap<(Symbol, StateId, StateId), Results>,
-    higher: FxHashMap<HigherKey, Results>,
     rules: Vec<StoredRule>,
+    bottom_up_indexes: OnceCell<BottomUpIndexes>,
     reachable_cache: OnceCell<FixedBitSet>,
     result_index: OnceCell<Vec<Vec<usize>>>,
     indexes: OnceCell<Indexes>,
@@ -70,6 +67,14 @@ struct CondensedRule {
     children: Box<[StateId]>,
     symbols: SymbolSet,
     result: StateId,
+}
+
+#[derive(Clone, Debug, Default)]
+struct BottomUpIndexes {
+    nullary: FxHashMap<Symbol, Results>,
+    unary: FxHashMap<(Symbol, StateId), Results>,
+    binary: FxHashMap<(Symbol, StateId, StateId), Results>,
+    higher: FxHashMap<HigherKey, Results>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -213,11 +218,7 @@ impl ExplicitBuilder {
         }
 
         let mut seen = FxHashSet::default();
-        let mut nullary = FxHashMap::default();
-        let mut unary = FxHashMap::default();
-        let mut binary = FxHashMap::default();
-        let mut higher = FxHashMap::default();
-        let mut stored = Vec::new();
+        let mut stored = Vec::with_capacity(self.rules.len());
 
         for (symbol, children, result, weight) in self.rules {
             if check_duplicates {
@@ -240,36 +241,14 @@ impl ExplicitBuilder {
                 result,
                 weight,
             };
-            match rule.children.len() {
-                0 => push_result(nullary.entry(symbol).or_default(), result),
-                1 => push_result(unary.entry((symbol, rule.children[0])).or_default(), result),
-                2 => push_result(
-                    binary
-                        .entry((symbol, rule.children[0], rule.children[1]))
-                        .or_default(),
-                    result,
-                ),
-                _ => push_result(
-                    higher
-                        .entry(HigherKey(
-                            symbol,
-                            rule.children.clone().into_vec().into_boxed_slice(),
-                        ))
-                        .or_default(),
-                    result,
-                ),
-            }
             stored.push(rule);
         }
 
         Ok(Explicit {
             num_states: self.next_state,
             accepting,
-            nullary,
-            unary,
-            binary,
-            higher,
             rules: stored,
+            bottom_up_indexes: OnceCell::new(),
             reachable_cache: OnceCell::new(),
             result_index: OnceCell::new(),
             indexes: OnceCell::new(),
@@ -397,12 +376,53 @@ impl Explicit {
         })
     }
 
-    fn lookup_higher(&self, f: Symbol, children: &[StateId]) -> Option<&Results> {
-        let mut hasher = self.higher.hasher().build_hasher();
+    fn bottom_up_indexes(&self) -> &BottomUpIndexes {
+        self.bottom_up_indexes.get_or_init(|| {
+            let mut indexes = BottomUpIndexes::default();
+            for rule in &self.rules {
+                match rule.children.len() {
+                    0 => push_result(indexes.nullary.entry(rule.symbol).or_default(), rule.result),
+                    1 => push_result(
+                        indexes
+                            .unary
+                            .entry((rule.symbol, rule.children[0]))
+                            .or_default(),
+                        rule.result,
+                    ),
+                    2 => push_result(
+                        indexes
+                            .binary
+                            .entry((rule.symbol, rule.children[0], rule.children[1]))
+                            .or_default(),
+                        rule.result,
+                    ),
+                    _ => push_result(
+                        indexes
+                            .higher
+                            .entry(HigherKey(
+                                rule.symbol,
+                                rule.children.clone().into_vec().into_boxed_slice(),
+                            ))
+                            .or_default(),
+                        rule.result,
+                    ),
+                }
+            }
+            indexes
+        })
+    }
+
+    fn lookup_higher<'a>(
+        indexes: &'a BottomUpIndexes,
+        f: Symbol,
+        children: &[StateId],
+    ) -> Option<&'a Results> {
+        let mut hasher = indexes.higher.hasher().build_hasher();
         f.hash(&mut hasher);
         children.hash(&mut hasher);
         let hash = hasher.finish();
-        self.higher
+        indexes
+            .higher
             .raw_entry()
             .from_hash(hash, |k| k.0 == f && &*k.1 == children)
             .map(|(_, v)| v)
@@ -458,11 +478,12 @@ impl BottomUpTa for Explicit {
     type State = StateId;
 
     fn step(&self, f: Symbol, children: &[StateId], out: &mut dyn FnMut(StateId)) {
+        let indexes = self.bottom_up_indexes();
         let results = match children.len() {
-            0 => self.nullary.get(&f),
-            1 => self.unary.get(&(f, children[0])),
-            2 => self.binary.get(&(f, children[0], children[1])),
-            _ => self.lookup_higher(f, children),
+            0 => indexes.nullary.get(&f),
+            1 => indexes.unary.get(&(f, children[0])),
+            2 => indexes.binary.get(&(f, children[0], children[1])),
+            _ => Self::lookup_higher(indexes, f, children),
         };
         if let Some(results) = results {
             for &q in results {
@@ -478,11 +499,12 @@ impl BottomUpTa for Explicit {
 
 impl DetBottomUpTa for Explicit {
     fn step_det(&self, f: Symbol, children: &[StateId]) -> Option<StateId> {
+        let indexes = self.bottom_up_indexes();
         let results = match children.len() {
-            0 => self.nullary.get(&f),
-            1 => self.unary.get(&(f, children[0])),
-            2 => self.binary.get(&(f, children[0], children[1])),
-            _ => self.lookup_higher(f, children),
+            0 => indexes.nullary.get(&f),
+            1 => indexes.unary.get(&(f, children[0])),
+            2 => indexes.binary.get(&(f, children[0], children[1])),
+            _ => Self::lookup_higher(indexes, f, children),
         }?;
         (results.len() == 1).then_some(results[0])
     }
@@ -792,6 +814,35 @@ mod tests {
 
         assert_eq!(rules, vec![(Symbol(1), vec![leaf, leaf])]);
         assert_eq!(initials, vec![root]);
+    }
+
+    #[test]
+    fn bottom_up_indexes_are_built_lazily() {
+        let mut b = ExplicitBuilder::new();
+        let leaf = b.new_state();
+        let root = b.new_state();
+        b.add_rule(Symbol(0), vec![], leaf);
+        b.add_rule(Symbol(1), vec![leaf], root);
+        b.add_accepting(root);
+        let e = b.build();
+
+        assert!(e.bottom_up_indexes.get().is_none());
+
+        let mut topdown_rules = Vec::new();
+        e.step_topdown(&root, &mut |symbol, children| {
+            topdown_rules.push((symbol, children.to_vec()));
+        });
+        assert_eq!(topdown_rules, vec![(Symbol(1), vec![leaf])]);
+        assert!(e.bottom_up_indexes.get().is_none());
+
+        let best = e.viterbi().unwrap();
+        assert_eq!(*best.arena().get_label(best.root()), Symbol(1));
+        assert!(e.bottom_up_indexes.get().is_none());
+
+        let mut leaves = Vec::new();
+        e.step(Symbol(0), &[], &mut |q| leaves.push(q));
+        assert_eq!(leaves, vec![leaf]);
+        assert!(e.bottom_up_indexes.get().is_some());
     }
 
     #[test]

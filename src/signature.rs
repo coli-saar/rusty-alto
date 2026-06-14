@@ -1,4 +1,5 @@
 use crate::{FxHashMap, Symbol};
+use rusty_tree::tree::{Tree, TreeArena};
 use std::fmt;
 
 /// Bidirectional map between external label names and dense [`Symbol`] IDs.
@@ -55,6 +56,20 @@ impl Signature {
     /// Panics if `symbol` is not present in this signature.
     pub fn resolve(&self, symbol: Symbol) -> &str {
         &self.names[symbol.0 as usize]
+    }
+
+    /// Resolve every symbol in a tree into its external label.
+    ///
+    /// The returned root is a handle into the returned arena. Sharing in the
+    /// input tree is unfolded by the underlying tree map operation.
+    pub fn resolve_tree(&self, arena: &TreeArena<Symbol>, root: Tree) -> (TreeArena<String>, Tree) {
+        let mut resolved = TreeArena::new();
+        let root = arena.map(
+            root,
+            |symbol| self.resolve(*symbol).to_owned(),
+            &mut resolved,
+        );
+        (resolved, root)
     }
 
     /// Return the arity recorded for a symbol.
@@ -143,5 +158,20 @@ mod tests {
             sig.intern("f".to_owned(), 2),
             Err(SignatureError::ArityMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn resolves_symbol_tree() {
+        let mut sig = Signature::new();
+        let a = sig.intern("a".to_owned(), 0).unwrap();
+        let f = sig.intern("f".to_owned(), 1).unwrap();
+        let mut arena = TreeArena::new();
+        let leaf = arena.add_node(a, vec![]);
+        let root = arena.add_node(f, vec![leaf]);
+
+        let (resolved, resolved_root) = sig.resolve_tree(&arena, root);
+        assert_eq!(resolved.get_label(resolved_root), "f");
+        let resolved_leaf = resolved.get_children(resolved_root)[0];
+        assert_eq!(resolved.get_label(resolved_leaf), "a");
     }
 }

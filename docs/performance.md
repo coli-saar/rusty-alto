@@ -50,7 +50,8 @@ so shared rejected nodes in a DAG-like arena are not recomputed.
 ## Explicit Automata
 
 [`Explicit`](../src/explicit.rs) is the materialized automaton representation.
-It stores rules in arity-specialized indexes:
+It stores transition rules canonically in one rule vector and builds lookup
+indexes on demand. Bottom-up queries use arity-specialized indexes:
 
 - arity 0: `(symbol) -> states`
 - arity 1: `(symbol, child) -> states`
@@ -60,6 +61,13 @@ It stores rules in arity-specialized indexes:
 The arity 0, 1, and 2 indexes are the optimized path because these arities cover
 the target Phase 1 workloads. They avoid boxed tuple keys, avoid per-query
 allocation, and keep hash keys small and copyable.
+
+These bottom-up indexes are lazy. Building large parse charts can produce tens
+of millions of explicit rules, while the next consumer may only need top-down
+access for Viterbi. Deferring bottom-up index construction keeps chart
+materialization from paying for an access pattern the caller never uses. The
+first ordinary `step` or `step_det` query builds the bottom-up indexes once and
+reuses them thereafter.
 
 Higher arities remain supported, but they use a generic boxed-key table with a
 borrowed lookup key. That keeps correctness and API coverage without making
@@ -73,11 +81,12 @@ sharing storage with nondeterministic automata.
 are immutable after construction, so repeated reachability and emptiness checks
 can clone a cached bitset instead of rerunning saturation.
 
-`Explicit` also builds Phase 2 indexes lazily. The first indexed or top-down
+`Explicit` also builds indexed and top-down indexes lazily. The first indexed
 query constructs a child-position index from `(symbol, position, child state)`
-to matching rules, and a parent-state index from `result state` to matching
-rules. Users who only run ordinary bottom-up recognition do not pay this
-construction cost.
+to matching rules. The first top-down query constructs a parent-state index from
+`result state` to matching rules. These indexes are independent: Viterbi and
+top-down chart traversal do not force bottom-up indexes, and bottom-up
+recognition does not force top-down indexes.
 
 Condensed rule enumeration is cached lazily as well. `Explicit::condensed_rules`
 groups rules by `(children, result)` and stores the corresponding `SymbolSet`
@@ -258,8 +267,11 @@ right-side query reductions into larger wall-clock wins.
 High-performance parsing still needs reusable library algorithms, not only
 benchmark-local materializers, that consume `IndexedBottomUpTa` and
 `CondensedTa`. The automata engine exposes the sibling-finder-style and
-condensed primitives, but chart construction, Viterbi, and EM still need
-library-level APIs.
+condensed primitives. Chart construction now returns explicit charts whose
+indexes are demand-driven, and [`Explicit::viterbi`](../src/viterbi.rs) provides
+a direct one-best extraction path that avoids the heavier k-best sorted-language
+iterator when only the best derivation is needed. EM still needs library-level
+APIs.
 
 Generic determinization still uses `BTreeSet`. This is simple and correct, but
 not the intended final representation for dense-state workloads.

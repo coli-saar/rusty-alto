@@ -45,15 +45,13 @@ if chart.automaton.is_empty() {
 }
 println!("accepted — {} rules in chart", chart.automaton.rules().count());
 
-// Extract the top-1 derivation tree in descending weight order.
-let mut lang = chart.automaton.sorted_language();
-if let Some(best) = lang.next() {
+// Extract the top-1 derivation tree.
+if let Some(best) = chart.automaton.viterbi() {
     println!("top-1 weight: {:.6}", best.weight());
 
     // Map Symbol labels to strings, then display using the arena's built-in formatter.
     let sig = irtg.grammar_signature();
-    let mut named: rusty_tree::tree::TreeArena<String> = rusty_tree::tree::TreeArena::new();
-    let named_root = lang.arena().map(best.tree(), |sym| sig.resolve(*sym).to_owned(), &mut named);
+    let (named, named_root) = sig.resolve_tree(best.arena(), best.root());
     println!("{}", named_root.display(&named));
     // e.g. "r(john_rule, watches_rule)"
 }
@@ -73,7 +71,7 @@ Explicit automata answer this query with a hash-map lookup. Implicit automata co
 
 ### `Explicit` — the materialized form
 
-`Explicit` stores rules in arity-specialized hash maps for arity 0, 1, and 2, covering the common cases without per-query allocation. Higher arities are supported via a borrowed-key lookup that also avoids allocation.
+`Explicit` stores rules canonically and builds lookup indexes lazily. Bottom-up queries use arity-specialized hash maps for arity 0, 1, and 2, covering the common cases without per-query allocation. Higher arities are supported via a borrowed-key lookup that also avoids allocation. Top-down, indexed, condensed, and bottom-up indexes are independent caches, so large parse charts only pay for the access patterns they actually use.
 
 Build one with `ExplicitBuilder`:
 
