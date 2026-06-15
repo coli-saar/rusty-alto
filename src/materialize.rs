@@ -198,7 +198,7 @@ impl ProductStateMap {
             .and_then(|partners| partners.get(&left).copied())
     }
 
-    fn insert(&mut self, left: StateId, right: StateId, product: StateId) {
+    pub(crate) fn insert(&mut self, left: StateId, right: StateId, product: StateId) {
         if self.by_right.len() <= right.index() {
             self.by_right
                 .resize_with(right.index() + 1, FxHashMap::default);
@@ -430,15 +430,30 @@ pub(crate) struct CandidateEdge {
 /// rules. Calls `on_edge` for every matched (left_rule, right_result) pair.
 /// Increments `stats.right_nullary_rules` once per right condensed nullary
 /// shape.
-pub(crate) fn for_each_nullary_edge<R: CondensedTa>(
+pub(crate) trait StateInterner<T> {
+    fn intern(&mut self, state: T) -> StateId;
+}
+
+impl<T> StateInterner<T> for Interner<T>
+where
+    T: Clone + Eq + Hash,
+{
+    fn intern(&mut self, state: T) -> StateId {
+        Interner::intern(self, state)
+    }
+}
+
+pub(crate) fn for_each_nullary_edge<R, I>(
     left_rules: &[OwnedRule],
     left_index: &LeftIndex,
     right: &R,
-    right_interner: &mut Interner<R::State>,
+    right_interner: &mut I,
     stats: &mut IndexedCondensedIntersectionStats,
     on_edge: &mut dyn FnMut(NullaryEdge),
 ) where
+    R: CondensedTa,
     R::State: Clone + Eq + Hash,
+    I: StateInterner<R::State>,
 {
     right.condensed_nullary_rules(&mut |symbols, right_result| {
         stats.right_nullary_rules += 1;

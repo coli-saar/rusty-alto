@@ -4,8 +4,10 @@
 //! input sentence, recording timing and quality metrics in CSV format.
 
 use rusty_alto::{
-    AstarHeuristic, AstarOptions, Irtg, LogProbabilityScorer, MaterializationStrategy,
-    OutsideHeuristic, StringAlgebra, UniversalSxHeuristic, parse_irtg,
+    AstarHeuristic, AstarOptions, InvHom, Irtg, LogProbabilityScorer, MaterializationStrategy,
+    OutsideHeuristic, PreparedAstarGrammar, ScoredZeroHeuristic, StringAlgebra,
+    StringDecompositionAutomaton, UniversalSxHeuristic, astar_string_one_best_with_stats_prepared,
+    parse_irtg,
 };
 use std::{
     collections::HashMap,
@@ -92,7 +94,7 @@ struct ParsedSentence {
 impl Record {
     fn print_csv(&self) {
         println!(
-            "{},{},{},{:.4},{:.4},{:.4},{},{}",
+            "{},{},{},{:.4},{:.4},{:.4},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             self.sentence_no,
             self.strategy.name(),
             if self.weight.is_nan() {
@@ -105,6 +107,23 @@ impl Record {
             self.total_ms,
             self.finalized_states,
             self.output_rules,
+            self.heap_pushes,
+            self.heap_updates,
+            self.pops,
+            self.stale_pops,
+            self.reopen_attempts,
+            self.right_indexed_queries,
+            self.right_rules_scanned,
+            self.rotated_left_join_queries,
+            self.left_rule_matches,
+            self.candidate_edges,
+            self.dominated_candidates,
+            self.finalized_candidate_discards,
+            self.sibling_tuple_queries,
+            self.sibling_tuples_returned,
+            self.right_step_calls,
+            self.right_step_results,
+            self.sibling_fallback_expansions,
         );
     }
 }
@@ -411,7 +430,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 
     // --- CSV header ---
-    println!("sentence_no,strategy,score,parse_ms,top_ms,total_ms,finalized_states,output_rules");
+    println!(
+        "sentence_no,strategy,score,parse_ms,top_ms,total_ms,finalized_states,output_rules,heap_pushes,heap_updates,pops,stale_pops,reopen_attempts,right_indexed_queries,right_rules_scanned,rotated_left_join_queries,left_rule_matches,candidate_edges,dominated_candidates,finalized_candidate_discards,sibling_tuple_queries,sibling_tuples_returned,right_step_calls,right_step_results,sibling_fallback_expansions"
+    );
 
     let mut accums: HashMap<Strategy, StrategyAccum> = HashMap::new();
     for &s in &args.strategies {
@@ -529,6 +550,11 @@ fn run_strategy(
     let total = sentences.len();
     let mut records = Vec::with_capacity(total);
     render_progress(strategy, 0, total);
+    let prepared_astar = matches!(
+        strategy,
+        Strategy::AstarZero | Strategy::AstarOutside | Strategy::AstarSx
+    )
+    .then(|| PreparedAstarGrammar::new(irtg.grammar()));
 
     match strategy {
         Strategy::TopDown => {
@@ -553,6 +579,7 @@ fn run_strategy(
                     sentence.value.clone(),
                     sentence.sentence_no,
                     strategy,
+                    prepared_astar.as_ref().expect("A* grammar was prepared"),
                     &MaterializationStrategy::Astar {
                         heuristic: AstarHeuristic::Zero,
                         options: AstarOptions {
@@ -580,6 +607,7 @@ fn run_strategy(
                     sentence.value.clone(),
                     sentence.sentence_no,
                     strategy,
+                    prepared_astar.as_ref().expect("A* grammar was prepared"),
                     &MaterializationStrategy::Astar {
                         heuristic: AstarHeuristic::Outside(&outside),
                         options: AstarOptions {
@@ -631,6 +659,7 @@ fn run_strategy(
                     sentence.value.clone(),
                     sentence.sentence_no,
                     strategy,
+                    prepared_astar.as_ref().expect("A* grammar was prepared"),
                     &MaterializationStrategy::Astar {
                         heuristic: AstarHeuristic::UniversalSx { table: &table, n },
                         options: AstarOptions {
@@ -779,53 +808,55 @@ fn run_astar_strategy(
     value: Vec<rusty_alto::Symbol>,
     sentence_no: usize,
     strategy: Strategy,
+    prepared: &PreparedAstarGrammar,
     mat_strategy: &MaterializationStrategy<'_>,
     scorer: &LogProbabilityScorer,
 ) -> Record {
-    let input = interpretation.input(value);
+    let concat = interpretation
+        .algebra_signature()
+        .get("*")
+        .unwrap_or(rusty_alto::Symbol(0));
+    let n = value.len();
+    let decomp = StringDecompositionAutomaton::new(concat, value);
+    let invhom = InvHom::new(decomp, interpretation.homomorphism());
+    let options = match mat_strategy {
+        MaterializationStrategy::Astar { options, .. } => AstarOptions {
+            stop_at_first_goal: options.stop_at_first_goal,
+            beam: options.beam,
+        },
+        _ => unreachable!(),
+    };
 
     let parse_start = Instant::now();
-    let (result, stats) = match irtg.best_with_scorer_and_stats([input], mat_strategy, scorer) {
-        Ok(r) => r,
-        Err(err) => {
-            eprintln!(
-                "sentence {sentence_no} {}: parse-error={err}",
-                strategy.name()
-            );
-            return Record {
-                sentence_no,
-                strategy,
-                weight: f64::NAN,
-                parse_ms: 0.0,
-                top_ms: 0.0,
-                total_ms: 0.0,
-                finalized_states: 0,
-                output_rules: 0,
-                heap_pushes: 0,
-                heap_updates: 0,
-                pops: 0,
-                stale_pops: 0,
-                reopen_attempts: 0,
-                right_indexed_queries: 0,
-                right_rules_scanned: 0,
-                rotated_left_join_queries: 0,
-                left_rule_matches: 0,
-                candidate_edges: 0,
-                dominated_candidates: 0,
-                finalized_candidate_discards: 0,
-                sibling_tuple_queries: 0,
-                sibling_tuples_returned: 0,
-                right_step_calls: 0,
-                right_step_results: 0,
-                sibling_fallback_expansions: 0,
-            };
+    let (result, stats) = match mat_strategy {
+        MaterializationStrategy::Astar {
+            heuristic: AstarHeuristic::Zero,
+            ..
+        } => {
+            let h = ScoredZeroHeuristic::new(scorer);
+            astar_string_one_best_with_stats_prepared(irtg.grammar(), prepared, &invhom, &h, scorer)
         }
+        MaterializationStrategy::Astar {
+            heuristic: AstarHeuristic::Outside(h),
+            ..
+        } => {
+            astar_string_one_best_with_stats_prepared(irtg.grammar(), prepared, &invhom, *h, scorer)
+        }
+        MaterializationStrategy::Astar {
+            heuristic: AstarHeuristic::UniversalSx { table, n: sx_n },
+            ..
+        } => {
+            debug_assert_eq!(*sx_n, n);
+            let h = table.for_sentence(*sx_n);
+            astar_string_one_best_with_stats_prepared(irtg.grammar(), prepared, &invhom, &h, scorer)
+        }
+        _ => unreachable!(),
     };
     let parse_time = parse_start.elapsed();
 
     let weight = result.as_ref().map_or(f64::NAN, |t| t.score());
     let parse_ms = millis(parse_time);
-    let stats = stats.unwrap_or_default();
+    let _ = options;
 
     Record {
         sentence_no,

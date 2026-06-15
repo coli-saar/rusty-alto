@@ -1,5 +1,6 @@
 use crate::{
-    FxHashMap, Span, StateId, Symbol, algebras::SpanProductSiblingFinder, materialize::OwnedRule,
+    FxHashMap, Interner, Span, StateId, Symbol, algebras::SpanProductSiblingFinder,
+    materialize::OwnedRule,
 };
 use fixedbitset::FixedBitSet;
 
@@ -129,6 +130,10 @@ impl SpanAstarLeftIndex {
         left.index() < self.higher_arity_left.len() && self.higher_arity_left.contains(left.index())
     }
 
+    pub(super) fn has_any_higher_arity(&self) -> bool {
+        self.higher_arity_left.ones().next().is_some()
+    }
+
     pub(super) fn activate_product(
         &self,
         finder: &mut SpanProductSiblingFinder,
@@ -149,5 +154,52 @@ impl SpanAstarLeftIndex {
         if mask & 0b10 != 0 {
             finder.activate(product, left_state, right_state, span, 1);
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct SpanInterner {
+    n: usize,
+    spans: Vec<Span>,
+}
+
+impl SpanInterner {
+    pub(super) fn new(n: usize) -> Self {
+        let mut spans = Vec::with_capacity(n.saturating_mul(n + 1) / 2);
+        for start in 0..n {
+            for end in (start + 1)..=n {
+                spans.push(Span::new(start, end));
+            }
+        }
+        Self { n, spans }
+    }
+
+    #[inline]
+    pub(super) fn intern(&mut self, span: Span) -> StateId {
+        assert!(
+            span.start < span.end && span.end <= self.n,
+            "invalid string span {:?} for sentence length {}",
+            span,
+            self.n
+        );
+        let before_start = span.start * self.n - span.start.saturating_sub(1) * span.start / 2;
+        let index = before_start + (span.end - span.start - 1);
+        StateId(u32::try_from(index).expect("too many spans for StateId"))
+    }
+
+    #[inline]
+    pub(super) fn resolve(&self, id: StateId) -> &Span {
+        self.spans
+            .get(id.index())
+            .expect("span state id not present in interner")
+    }
+
+    pub(super) fn into_interner(self) -> Interner<Span> {
+        let mut interner = Interner::new();
+        for span in self.spans {
+            let id = interner.intern(span);
+            debug_assert_eq!(id.index(), interner.len() - 1);
+        }
+        interner
     }
 }

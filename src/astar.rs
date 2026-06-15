@@ -17,7 +17,7 @@ use crate::{
     heuristic::IntersectionHeuristic,
     materialize::{
         IndexedCondensedIntersectionStats, LeftIndex, NullaryEdge, OwnedCondensedRule, OwnedRule,
-        ProductStateMap, TrustedRuleTracker, for_each_nullary_edge, get_or_create_product_id,
+        ProductStateMap, StateInterner, TrustedRuleTracker, for_each_nullary_edge,
         get_or_create_product_id_direct,
     },
     viterbi::{Backpointer, ViterbiTree, build_tree},
@@ -30,7 +30,79 @@ use rusty_tree::tree::TreeArena;
 use smallvec::SmallVec;
 use std::hash::Hash;
 
-use span::SpanAstarLeftIndex;
+use span::{SpanAstarLeftIndex, SpanInterner};
+
+trait RightStateInterner<T> {
+    fn intern(&mut self, state: T) -> StateId;
+    fn resolve(&self, id: StateId) -> &T;
+    fn into_generic_interner(self) -> Interner<T>
+    where
+        T: Clone + Eq + Hash;
+}
+
+impl<T> RightStateInterner<T> for Interner<T>
+where
+    T: Clone + Eq + Hash,
+{
+    fn intern(&mut self, state: T) -> StateId {
+        Interner::intern(self, state)
+    }
+
+    fn resolve(&self, id: StateId) -> &T {
+        Interner::resolve(self, id)
+    }
+
+    fn into_generic_interner(self) -> Interner<T> {
+        self
+    }
+}
+
+impl RightStateInterner<Span> for SpanInterner {
+    fn intern(&mut self, state: Span) -> StateId {
+        SpanInterner::intern(self, state)
+    }
+
+    fn resolve(&self, id: StateId) -> &Span {
+        SpanInterner::resolve(self, id)
+    }
+
+    fn into_generic_interner(self) -> Interner<Span> {
+        SpanInterner::into_interner(self)
+    }
+}
+
+impl StateInterner<Span> for SpanInterner {
+    fn intern(&mut self, state: Span) -> StateId {
+        SpanInterner::intern(self, state)
+    }
+}
+
+pub struct PreparedAstarGrammar {
+    left_rules: Vec<OwnedRule>,
+    left_index: LeftIndex,
+    span_left_index: SpanAstarLeftIndex,
+}
+
+impl PreparedAstarGrammar {
+    pub fn new(left: &Explicit) -> Self {
+        let left_rules: Vec<_> = left
+            .rules()
+            .map(|rule| OwnedRule {
+                symbol: rule.symbol,
+                children: rule.children.iter().copied().collect(),
+                result: rule.result,
+                weight: rule.weight,
+            })
+            .collect();
+        let left_index = LeftIndex::build(&left_rules);
+        let span_left_index = SpanAstarLeftIndex::build(&left_rules);
+        Self {
+            left_rules,
+            left_index,
+            span_left_index,
+        }
+    }
+}
 #[derive(Default)]
 struct ChildStateRightRuleIndex {
     cache: FxHashMap<(usize, StateId), Vec<usize>>,
@@ -40,10 +112,10 @@ impl ChildStateRightRuleIndex {
     /// Cache right automaton rules that mention a finalized right child at a
     /// given child position. This is the generic fallback used for automata
     /// where we do not have a more precise sibling index.
-    fn rules_by_child<R>(
+    fn rules_by_child<R, I>(
         &mut self,
         right: &R,
-        right_interner: &mut Interner<R::State>,
+        right_interner: &mut I,
         right_rules: &mut Vec<OwnedCondensedRule<StateId>>,
         stats: &mut IndexedCondensedIntersectionStats,
         position: usize,
@@ -52,6 +124,7 @@ impl ChildStateRightRuleIndex {
     where
         R: CondensedTa,
         R::State: Clone + Eq + Hash,
+        I: RightStateInterner<R::State>,
     {
         let cache_key = (position, right_state);
         if !self.cache.contains_key(&cache_key) {
@@ -83,10 +156,10 @@ impl ChildStateRightRuleIndex {
             .as_slice()
     }
 
-    fn rule_ids_for_trigger_into<R>(
+    fn rule_ids_for_trigger_into<R, I>(
         &mut self,
         right: &R,
-        right_interner: &mut Interner<R::State>,
+        right_interner: &mut I,
         right_rules: &mut Vec<OwnedCondensedRule<StateId>>,
         stats: &mut IndexedCondensedIntersectionStats,
         position: usize,
@@ -95,6 +168,7 @@ impl ChildStateRightRuleIndex {
     ) where
         R: CondensedTa,
         R::State: Clone + Eq + Hash,
+        I: RightStateInterner<R::State>,
     {
         out.clear();
         let rules = self.rules_by_child(
@@ -350,17 +424,18 @@ fn string_product_heap_bound(left: &Explicit, n: usize) -> usize {
 
 /// Context for the core A* loop. Kept in a struct so the hot path can reuse
 /// buffers and indexes instead of allocating them at each finalized state.
-struct AstarContext<'a, R>
+struct AstarContext<'a, R, I = Interner<<R as BottomUpTa>::State>>
 where
     R: CondensedTa,
     R::State: Clone + Eq + Hash,
+    I: RightStateInterner<R::State> + StateInterner<R::State>,
 {
     left: &'a Explicit,
     right: &'a R,
     left_rules: &'a [OwnedRule],
     left_index: &'a LeftIndex,
     right_rule_index: ChildStateRightRuleIndex,
-    right_interner: Interner<R::State>,
+    right_interner: I,
     product_ids: ProductStateMap,
     product_pairs: Vec<(StateId, StateId)>,
     builder: Option<ExplicitBuilder>,
@@ -383,16 +458,18 @@ where
     stats: AstarStats,
 }
 
-impl<'a, R> AstarContext<'a, R>
+impl<'a, R, I> AstarContext<'a, R, I>
 where
     R: CondensedTa,
     R::State: Clone + Eq + Hash,
+    I: RightStateInterner<R::State> + StateInterner<R::State>,
 {
     fn new(
         left: &'a Explicit,
         right: &'a R,
         left_rules: &'a [OwnedRule],
         left_index: &'a LeftIndex,
+        right_interner: I,
         with_builder: bool,
         heap_index_bound: usize,
     ) -> Self {
@@ -403,7 +480,7 @@ where
             left_rules,
             left_index,
             right_rule_index: ChildStateRightRuleIndex::default(),
-            right_interner: Interner::new(),
+            right_interner,
             product_ids: ProductStateMap::default(),
             product_pairs: Vec::new(),
             builder: if with_builder {
@@ -471,6 +548,33 @@ where
         )
     }
 
+    fn get_or_create_product_id(
+        &mut self,
+        left_state: StateId,
+        right_state: StateId,
+    ) -> (StateId, bool) {
+        if let Some(id) = self.product_ids.get(left_state, right_state) {
+            return (id, false);
+        }
+
+        let id = if let Some(builder) = &mut self.builder {
+            let id = builder.new_state();
+            if self.left.is_accepting(&left_state)
+                && self
+                    .right
+                    .is_accepting(self.right_interner.resolve(right_state))
+            {
+                builder.add_accepting(id);
+            }
+            id
+        } else {
+            StateId(self.product_pairs.len() as u32)
+        };
+        self.product_ids.insert(left_state, right_state, id);
+        self.product_pairs.push((left_state, right_state));
+        (id, true)
+    }
+
     /// Return `true` if `product` is an accepting product state.
     fn is_accepting_product(&self, product: StateId) -> bool {
         if product.index() >= self.product_pairs.len() {
@@ -534,17 +638,8 @@ where
         h: &H,
     ) {
         let inside = scorer.times(scorer.rule_score(weight), child_score);
-        let (parent, _) = if let Some(builder) = &mut self.builder {
-            get_or_create_product_id(
-                parent_left,
-                parent_right,
-                self.left,
-                self.right,
-                &mut self.product_ids,
-                &mut self.product_pairs,
-                &self.right_interner,
-                builder,
-            )
+        let (parent, _) = if self.builder.is_some() {
+            self.get_or_create_product_id(parent_left, parent_right)
         } else {
             self.get_or_create_direct(parent_left, parent_right)
         };
@@ -716,7 +811,7 @@ where
         self.stats.right_step_calls += 1;
         let parent = self.right.step_det(symbol, &raw_right_children)?;
         self.stats.right_step_results += 1;
-        Some(self.right_interner.intern(parent))
+        Some(RightStateInterner::intern(&mut self.right_interner, parent))
     }
 
     fn expand_from_finalized_with_span_product_siblings<
@@ -762,7 +857,7 @@ where
                     continue;
                 };
                 self.stats.right_step_results += 1;
-                let parent_right = self.right_interner.intern(parent);
+                let parent_right = RightStateInterner::intern(&mut self.right_interner, parent);
                 self.stats.candidate_edges += 1;
                 self.push_candidate_with_child_score(
                     parent_left,
@@ -859,17 +954,8 @@ where
         h: &H,
         scorer: &S,
     ) {
-        let (product, _) = if let Some(builder) = &mut self.builder {
-            get_or_create_product_id(
-                edge.parent_left,
-                edge.parent_right,
-                self.left,
-                self.right,
-                &mut self.product_ids,
-                &mut self.product_pairs,
-                &self.right_interner,
-                builder,
-            )
+        let (product, _) = if self.builder.is_some() {
+            self.get_or_create_product_id(edge.parent_left, edge.parent_right)
         } else {
             self.get_or_create_direct(edge.parent_left, edge.parent_right)
         };
@@ -921,7 +1007,11 @@ where
         }
     }
 
-    fn pop_next_finalized<S: WeightScorer>(&mut self, scorer: &S) -> Option<FinalizedItem> {
+    fn pop_next_finalized<S: WeightScorer>(
+        &mut self,
+        scorer: &S,
+        store_finalized_partners: bool,
+    ) -> Option<FinalizedItem> {
         while let Some(product_index) = self.heap.pop() {
             self.stats.pops += 1;
             let product = StateId(product_index as u32);
@@ -951,8 +1041,10 @@ where
 
             let is_goal = self.is_accepting_product(product);
             let (left_state, right_state) = self.product_pairs[product.index()];
-            self.ensure_right_state(right_state);
-            self.finalized_partners[right_state.index()].insert(left_state, product);
+            if store_finalized_partners {
+                self.ensure_right_state(right_state);
+                self.finalized_partners[right_state.index()].insert(left_state, product);
+            }
 
             return Some(FinalizedItem {
                 product,
@@ -979,7 +1071,7 @@ where
         S: WeightScorer,
         OnFin: FnMut(&mut Self, StateId, &EmitEdge, f64),
     {
-        while let Some(item) = self.pop_next_finalized(scorer) {
+        while let Some(item) = self.pop_next_finalized(scorer, true) {
             on_finalize(self, item.product, &item.edge, item.inside);
 
             if item.is_goal && stop_at_first_goal {
@@ -994,6 +1086,7 @@ where
         &mut self,
         h: &H,
         scorer: &S,
+        span_left_index: &SpanAstarLeftIndex,
         stop_at_first_goal: bool,
         mut on_finalize: OnFin,
     ) where
@@ -1002,10 +1095,10 @@ where
         S: WeightScorer,
         OnFin: FnMut(&mut Self, StateId, &EmitEdge, f64),
     {
-        let span_left_index = SpanAstarLeftIndex::build(self.left_rules);
         let mut sibling_finder = SpanProductSiblingFinder::default();
+        let store_finalized_partners = span_left_index.has_any_higher_arity();
 
-        while let Some(item) = self.pop_next_finalized(scorer) {
+        while let Some(item) = self.pop_next_finalized(scorer, store_finalized_partners) {
             let raw_right = *self.right_interner.resolve(item.right_state);
             span_left_index.activate_product(
                 &mut sibling_finder,
@@ -1025,7 +1118,7 @@ where
                 item.left_state,
                 item.right_state,
                 item.product,
-                &span_left_index,
+                span_left_index,
                 &sibling_finder,
                 h,
                 scorer,
@@ -1090,22 +1183,42 @@ where
     H: IntersectionHeuristic<InvHom<'h, StringDecompositionAutomaton>>,
     S: WeightScorer,
 {
+    let prepared = PreparedAstarGrammar::new(left);
+    materialize_astar_string_intersection_with_prepared(left, &prepared, right, h, options, scorer)
+}
+
+pub fn materialize_astar_string_intersection_with_prepared<'h, H, S>(
+    left: &Explicit,
+    prepared: &PreparedAstarGrammar,
+    right: &InvHom<'h, StringDecompositionAutomaton>,
+    h: &H,
+    options: AstarOptions,
+    scorer: &S,
+) -> (Explicit, Interner<Span>, AstarStats)
+where
+    H: IntersectionHeuristic<InvHom<'h, StringDecompositionAutomaton>>,
+    S: WeightScorer,
+{
     materialize_astar_intersection_with_span_sibling(
         left,
+        prepared,
         right,
         h,
         options,
         scorer,
+        right.inner().len(),
         string_product_heap_bound(left, right.inner().len()),
     )
 }
 
 fn materialize_astar_intersection_with_span_sibling<R, H, S>(
     left: &Explicit,
+    prepared: &PreparedAstarGrammar,
     right: &R,
     h: &H,
     options: AstarOptions,
     scorer: &S,
+    sentence_len: usize,
     heap_index_bound: usize,
 ) -> (Explicit, Interner<Span>, AstarStats)
 where
@@ -1113,22 +1226,12 @@ where
     H: IntersectionHeuristic<R>,
     S: WeightScorer,
 {
-    let left_rules: Vec<_> = left
-        .rules()
-        .map(|rule| OwnedRule {
-            symbol: rule.symbol,
-            children: rule.children.iter().copied().collect(),
-            result: rule.result,
-            weight: rule.weight,
-        })
-        .collect();
-    let left_index = LeftIndex::build(&left_rules);
-
     let mut ctx = AstarContext::new(
         left,
         right,
-        &left_rules,
-        &left_index,
+        &prepared.left_rules,
+        &prepared.left_index,
+        SpanInterner::new(sentence_len),
         true,
         heap_index_bound,
     );
@@ -1140,6 +1243,7 @@ where
     ctx.run_with_span_product_sibling_finder(
         h,
         scorer,
+        &prepared.span_left_index,
         stop_at_first_goal,
         |ctx, _product, edge, inside| {
             let emit = stop_at_first_goal || beam.is_none_or(|threshold| inside >= threshold);
@@ -1165,7 +1269,11 @@ where
 
     let builder = ctx.builder.take().unwrap_or_default();
     let explicit = builder.build_trusted();
-    (explicit, ctx.right_interner, ctx.stats)
+    (
+        explicit,
+        ctx.right_interner.into_generic_interner(),
+        ctx.stats,
+    )
 }
 
 fn materialize_astar_intersection_with_index<R, H, S>(
@@ -1192,7 +1300,15 @@ where
         .collect();
     let left_index = LeftIndex::build(&left_rules);
 
-    let mut ctx = AstarContext::new(left, right, &left_rules, &left_index, true, 16 * 1024);
+    let mut ctx = AstarContext::new(
+        left,
+        right,
+        &left_rules,
+        &left_index,
+        Interner::new(),
+        true,
+        16 * 1024,
+    );
     ctx.seed_nullary_edges(h, scorer);
 
     let stop_at_first_goal = options.stop_at_first_goal;
@@ -1293,20 +1409,39 @@ where
     H: IntersectionHeuristic<InvHom<'h, StringDecompositionAutomaton>>,
     S: WeightScorer,
 {
+    let prepared = PreparedAstarGrammar::new(left);
+    astar_string_one_best_with_stats_prepared(left, &prepared, right, h, scorer)
+}
+
+pub fn astar_string_one_best_with_stats_prepared<'h, H, S>(
+    left: &Explicit,
+    prepared: &PreparedAstarGrammar,
+    right: &InvHom<'h, StringDecompositionAutomaton>,
+    h: &H,
+    scorer: &S,
+) -> (Option<ViterbiTree>, AstarStats)
+where
+    H: IntersectionHeuristic<InvHom<'h, StringDecompositionAutomaton>>,
+    S: WeightScorer,
+{
     astar_one_best_with_stats_and_span_sibling(
         left,
+        prepared,
         right,
         h,
         scorer,
+        right.inner().len(),
         string_product_heap_bound(left, right.inner().len()),
     )
 }
 
 fn astar_one_best_with_stats_and_span_sibling<R, H, S>(
     left: &Explicit,
+    prepared: &PreparedAstarGrammar,
     right: &R,
     h: &H,
     scorer: &S,
+    sentence_len: usize,
     heap_index_bound: usize,
 ) -> (Option<ViterbiTree>, AstarStats)
 where
@@ -1314,22 +1449,12 @@ where
     H: IntersectionHeuristic<R>,
     S: WeightScorer,
 {
-    let left_rules: Vec<_> = left
-        .rules()
-        .map(|rule| OwnedRule {
-            symbol: rule.symbol,
-            children: rule.children.iter().copied().collect(),
-            result: rule.result,
-            weight: rule.weight,
-        })
-        .collect();
-    let left_index = LeftIndex::build(&left_rules);
-
     let mut ctx = AstarContext::new(
         left,
         right,
-        &left_rules,
-        &left_index,
+        &prepared.left_rules,
+        &prepared.left_index,
+        SpanInterner::new(sentence_len),
         false,
         heap_index_bound,
     );
@@ -1337,11 +1462,17 @@ where
 
     let mut goal_state: Option<(StateId, f64)> = None;
 
-    ctx.run_with_span_product_sibling_finder(h, scorer, true, |ctx, product, _edge, inside| {
-        if goal_state.is_none() && ctx.is_accepting_product(product) {
-            goal_state = Some((product, inside));
-        }
-    });
+    ctx.run_with_span_product_sibling_finder(
+        h,
+        scorer,
+        &prepared.span_left_index,
+        true,
+        |ctx, product, _edge, inside| {
+            if goal_state.is_none() && ctx.is_accepting_product(product) {
+                goal_state = Some((product, inside));
+            }
+        },
+    );
 
     let Some((goal, best_score)) = goal_state else {
         ctx.stats.right_indexed_queries = ctx.mat_stats.right_indexed_queries;
@@ -1381,7 +1512,15 @@ where
         .collect();
     let left_index = LeftIndex::build(&left_rules);
 
-    let mut ctx = AstarContext::new(left, right, &left_rules, &left_index, false, 16 * 1024);
+    let mut ctx = AstarContext::new(
+        left,
+        right,
+        &left_rules,
+        &left_index,
+        Interner::new(),
+        false,
+        16 * 1024,
+    );
     ctx.seed_nullary_edges(h, scorer);
 
     let mut goal_state: Option<(StateId, f64)> = None;
@@ -1545,6 +1684,28 @@ mod tests {
         assert!(new_stats.right_step_calls > 0);
         assert!(new_stats.right_step_results > 0);
         assert_eq!(new_stats.sibling_fallback_expansions, 0);
+    }
+
+    #[test]
+    fn span_interner_round_trips_dense_span_ids() {
+        let mut interner = span::SpanInterner::new(4);
+        let expected = [
+            Span::new(0, 1),
+            Span::new(0, 2),
+            Span::new(0, 3),
+            Span::new(0, 4),
+            Span::new(1, 2),
+            Span::new(1, 3),
+            Span::new(1, 4),
+            Span::new(2, 3),
+            Span::new(2, 4),
+            Span::new(3, 4),
+        ];
+        for (index, span) in expected.into_iter().enumerate() {
+            let id = interner.intern(span);
+            assert_eq!(id.index(), index);
+            assert_eq!(*interner.resolve(id), span);
+        }
     }
 
     #[test]
