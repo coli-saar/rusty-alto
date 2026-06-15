@@ -5,6 +5,7 @@ use crate::{
     heuristic::IntersectionHeuristic,
     homomorphism::{HomLabel, Homomorphism},
 };
+use fixedbitset::FixedBitSet;
 use smallvec::SmallVec;
 use std::convert::Infallible;
 
@@ -34,6 +35,119 @@ impl Span {
     /// Return whether this span is empty.
     pub fn is_empty(self) -> bool {
         self.start == self.end
+    }
+}
+
+/// A finalized product item that can serve as a binary string sibling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SpanProductSibling {
+    pub(crate) product: StateId,
+    pub(crate) right_state: StateId,
+}
+
+/// Product-aware sibling finder for binary string span rules.
+///
+/// The index includes the required left state as well as the span boundary.
+/// Queries therefore return only finalized product states that can actually fill
+/// the sibling slot of the current left rule.
+#[derive(Debug, Default)]
+pub(crate) struct SpanProductSiblingFinder {
+    left_seen_by_end: Vec<Vec<Vec<SpanProductSibling>>>,
+    right_seen_by_start: Vec<Vec<Vec<SpanProductSibling>>>,
+    seen_left: FixedBitSet,
+    seen_right: FixedBitSet,
+}
+
+impl SpanProductSiblingFinder {
+    /// Activate `product` as available at child `position`.
+    ///
+    /// Returns `true` only the first time the `(position, product)` pair is seen.
+    pub(crate) fn activate(
+        &mut self,
+        product: StateId,
+        left_state: StateId,
+        right_state: StateId,
+        span: Span,
+        position: usize,
+    ) -> bool {
+        match position {
+            0 => {
+                if self.seen_left.len() <= product.index() {
+                    self.seen_left.grow(product.index() + 1);
+                }
+                if self.seen_left.contains(product.index()) {
+                    return false;
+                }
+                self.seen_left.set(product.index(), true);
+                if self.left_seen_by_end.len() <= span.end {
+                    self.left_seen_by_end.resize_with(span.end + 1, Vec::new);
+                }
+                let by_left = &mut self.left_seen_by_end[span.end];
+                if by_left.len() <= left_state.index() {
+                    by_left.resize_with(left_state.index() + 1, Vec::new);
+                }
+                by_left[left_state.index()].push(SpanProductSibling {
+                    product,
+                    right_state,
+                });
+                true
+            }
+            1 => {
+                if self.seen_right.len() <= product.index() {
+                    self.seen_right.grow(product.index() + 1);
+                }
+                if self.seen_right.contains(product.index()) {
+                    return false;
+                }
+                self.seen_right.set(product.index(), true);
+                if self.right_seen_by_start.len() <= span.start {
+                    self.right_seen_by_start
+                        .resize_with(span.start + 1, Vec::new);
+                }
+                let by_left = &mut self.right_seen_by_start[span.start];
+                if by_left.len() <= left_state.index() {
+                    by_left.resize_with(left_state.index() + 1, Vec::new);
+                }
+                by_left[left_state.index()].push(SpanProductSibling {
+                    product,
+                    right_state,
+                });
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Write active sibling products for `span` at `position`.
+    pub(crate) fn sibling_products_into(
+        &self,
+        span: Span,
+        position: usize,
+        required_left: StateId,
+        out: &mut Vec<SpanProductSibling>,
+    ) {
+        out.clear();
+        match position {
+            0 => {
+                if let Some(siblings) = self
+                    .right_seen_by_start
+                    .get(span.end)
+                    .and_then(|by_left| by_left.get(required_left.index()))
+                {
+                    out.extend_from_slice(siblings);
+                }
+            }
+            1 => {
+                if let Some(siblings) = self
+                    .left_seen_by_end
+                    .get(span.start)
+                    .and_then(|by_left| by_left.get(required_left.index()))
+                {
+                    out.extend_from_slice(siblings);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1363,6 +1477,114 @@ fn enumerate_sibling_splits_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn span_product_sibling_finder_returns_adjacent_products_in_both_directions() {
+        let left_product = StateId(10);
+        let right_product = StateId(11);
+        let left_state = StateId(0);
+        let right_state = StateId(1);
+        let left_span = Span::new(0, 1);
+        let right_span = Span::new(1, 3);
+
+        let mut finder = SpanProductSiblingFinder::default();
+        assert!(finder.activate(right_product, right_state, StateId(21), right_span, 1));
+
+        let mut products = Vec::new();
+        finder.sibling_products_into(left_span, 0, right_state, &mut products);
+        assert_eq!(
+            products,
+            vec![SpanProductSibling {
+                product: right_product,
+                right_state: StateId(21)
+            }]
+        );
+
+        let mut finder = SpanProductSiblingFinder::default();
+        assert!(finder.activate(left_product, left_state, StateId(20), left_span, 0));
+
+        products.clear();
+        finder.sibling_products_into(right_span, 1, left_state, &mut products);
+        assert_eq!(
+            products,
+            vec![SpanProductSibling {
+                product: left_product,
+                right_state: StateId(20)
+            }]
+        );
+    }
+
+    #[test]
+    fn span_product_sibling_finder_filters_by_left_state_and_activation() {
+        let product = StateId(10);
+        let wanted_left = StateId(0);
+        let other_left = StateId(1);
+        let right_state = StateId(20);
+
+        let mut finder = SpanProductSiblingFinder::default();
+        let mut products = Vec::new();
+        finder.sibling_products_into(Span::new(0, 1), 0, wanted_left, &mut products);
+        assert!(products.is_empty());
+
+        assert!(finder.activate(product, other_left, right_state, Span::new(1, 3), 1));
+        finder.sibling_products_into(Span::new(0, 1), 0, wanted_left, &mut products);
+        assert!(products.is_empty());
+
+        finder.sibling_products_into(Span::new(0, 1), 0, other_left, &mut products);
+        assert_eq!(
+            products,
+            vec![SpanProductSibling {
+                product,
+                right_state
+            }]
+        );
+    }
+
+    #[test]
+    fn span_product_sibling_finder_activation_is_idempotent_per_position() {
+        let product = StateId(10);
+        let left = StateId(0);
+        let right = StateId(20);
+        let span = Span::new(0, 1);
+
+        let mut finder = SpanProductSiblingFinder::default();
+        assert!(finder.activate(product, left, right, span, 0));
+        assert!(!finder.activate(product, left, right, span, 0));
+        assert!(finder.activate(product, left, right, span, 1));
+        assert!(!finder.activate(product, left, right, span, 1));
+    }
+
+    #[test]
+    fn span_product_sibling_finder_separates_products_with_same_right_span() {
+        let left_a = StateId(0);
+        let left_b = StateId(1);
+        let product_a = StateId(10);
+        let product_b = StateId(11);
+        let span = Span::new(1, 2);
+
+        let mut finder = SpanProductSiblingFinder::default();
+        assert!(finder.activate(product_a, left_a, StateId(20), span, 1));
+        assert!(finder.activate(product_b, left_b, StateId(21), span, 1));
+
+        let mut products = Vec::new();
+        finder.sibling_products_into(Span::new(0, 1), 0, left_a, &mut products);
+        assert_eq!(
+            products,
+            vec![SpanProductSibling {
+                product: product_a,
+                right_state: StateId(20)
+            }]
+        );
+
+        finder.sibling_products_into(Span::new(0, 1), 0, left_b, &mut products);
+        assert_eq!(
+            products,
+            vec![SpanProductSibling {
+                product: product_b,
+                right_state: StateId(21)
+            }]
+        );
+    }
 
     #[test]
     fn lexical_lookup_handles_repeated_words() {

@@ -8,13 +8,17 @@
 //! * [`astar_one_best`] — runs A* in one-best mode and returns the highest-weighted
 //!   accepted tree without building a chart.
 
+mod span;
+
 use crate::{
-    BottomUpTa, CondensedTa, Explicit, ExplicitBuilder, FxHashMap, Interner, KeySet,
-    ProbabilityScorer, StateId, Symbol, WeightScorer,
+    BottomUpTa, CondensedTa, Explicit, ExplicitBuilder, FxHashMap, Interner, InvHom, KeySet,
+    ProbabilityScorer, Span, StateId, StringDecompositionAutomaton, Symbol, WeightScorer,
+    algebras::{SpanProductSibling, SpanProductSiblingFinder},
     heuristic::IntersectionHeuristic,
     materialize::{
         IndexedCondensedIntersectionStats, LeftIndex, NullaryEdge, OwnedCondensedRule, OwnedRule,
         ProductStateMap, TrustedRuleTracker, for_each_nullary_edge, get_or_create_product_id,
+        get_or_create_product_id_direct,
     },
     viterbi::{Backpointer, ViterbiTree, build_tree},
 };
@@ -25,29 +29,108 @@ use orx_priority_queue::{
 use rusty_tree::tree::TreeArena;
 use smallvec::SmallVec;
 use std::hash::Hash;
-use std::rc::Rc;
+
+use span::SpanAstarLeftIndex;
+#[derive(Default)]
+struct ChildStateRightRuleIndex {
+    cache: FxHashMap<(usize, StateId), Vec<usize>>,
+}
+
+impl ChildStateRightRuleIndex {
+    /// Cache right automaton rules that mention a finalized right child at a
+    /// given child position. This is the generic fallback used for automata
+    /// where we do not have a more precise sibling index.
+    fn rules_by_child<R>(
+        &mut self,
+        right: &R,
+        right_interner: &mut Interner<R::State>,
+        right_rules: &mut Vec<OwnedCondensedRule<StateId>>,
+        stats: &mut IndexedCondensedIntersectionStats,
+        position: usize,
+        right_state: StateId,
+    ) -> &[usize]
+    where
+        R: CondensedTa,
+        R::State: Clone + Eq + Hash,
+    {
+        let cache_key = (position, right_state);
+        if !self.cache.contains_key(&cache_key) {
+            stats.right_indexed_queries += 1;
+            let raw_state = right_interner.resolve(right_state).clone();
+            let mut collected = Vec::new();
+            right.condensed_rules_by_child(
+                position,
+                &raw_state,
+                &mut |children, symbols, result| {
+                    let rule_id = right_rules.len();
+                    right_rules.push(OwnedCondensedRule {
+                        children: children
+                            .iter()
+                            .cloned()
+                            .map(|child| right_interner.intern(child))
+                            .collect(),
+                        symbols: symbols.clone(),
+                        result: right_interner.intern(result),
+                    });
+                    collected.push(rule_id);
+                },
+            );
+            self.cache.insert(cache_key, collected);
+        }
+        self.cache
+            .get(&cache_key)
+            .expect("cache entry was just inserted")
+            .as_slice()
+    }
+
+    fn rule_ids_for_trigger_into<R>(
+        &mut self,
+        right: &R,
+        right_interner: &mut Interner<R::State>,
+        right_rules: &mut Vec<OwnedCondensedRule<StateId>>,
+        stats: &mut IndexedCondensedIntersectionStats,
+        position: usize,
+        right_state: StateId,
+        out: &mut Vec<usize>,
+    ) where
+        R: CondensedTa,
+        R::State: Clone + Eq + Hash,
+    {
+        out.clear();
+        let rules = self.rules_by_child(
+            right,
+            right_interner,
+            right_rules,
+            stats,
+            position,
+            right_state,
+        );
+        out.extend_from_slice(rules);
+    }
+}
 
 #[derive(Default)]
 struct PartnerSet {
     states: Vec<StateId>,
     bits: FixedBitSet,
+    products_by_left: Vec<Option<StateId>>,
 }
 
 impl PartnerSet {
-    fn insert(&mut self, state: StateId) -> bool {
+    fn insert(&mut self, state: StateId, product: StateId) -> bool {
         if self.bits.len() <= state.index() {
             self.bits.grow(state.index() + 1);
+        }
+        if self.products_by_left.len() <= state.index() {
+            self.products_by_left.resize(state.index() + 1, None);
         }
         if self.bits.contains(state.index()) {
             return false;
         }
         self.bits.set(state.index(), true);
+        self.products_by_left[state.index()] = Some(product);
         self.states.push(state);
         true
-    }
-
-    fn is_empty(&self) -> bool {
-        self.states.is_empty()
     }
 
     fn len(&self) -> usize {
@@ -60,6 +143,10 @@ impl PartnerSet {
 
     fn iter(&self) -> impl Iterator<Item = &StateId> {
         self.states.iter()
+    }
+
+    fn product_for(&self, state: StateId) -> Option<StateId> {
+        self.products_by_left.get(state.index()).and_then(|&p| p)
     }
 }
 
@@ -95,6 +182,15 @@ struct EmitEdge {
 struct AgendaItem {
     inside: f64,
     edge: EmitEdge,
+}
+
+struct FinalizedItem {
+    product: StateId,
+    edge: EmitEdge,
+    inside: f64,
+    left_state: StateId,
+    right_state: StateId,
+    is_goal: bool,
 }
 
 struct AstarAgenda {
@@ -198,6 +294,18 @@ pub struct AstarStats {
     /// Number of candidate edges discarded because their parent product state
     /// had already been finalized.
     pub finalized_candidate_discards: usize,
+    /// Number of product-aware span sibling queries issued.
+    pub sibling_tuple_queries: usize,
+    /// Number of exact sibling products returned by the span sibling finder.
+    pub sibling_tuples_returned: usize,
+    /// Number of exact `right.step(symbol, children)` calls issued by the
+    /// sibling-finder expansion path.
+    pub right_step_calls: usize,
+    /// Number of right parent states returned by exact `right.step` calls.
+    pub right_step_results: usize,
+    /// Number of finalized products expanded by the old set-trie path because
+    /// at least one relevant left occurrence had arity greater than 2.
+    pub sibling_fallback_expansions: usize,
     /// Number of agenda-item pops that were discarded because the state was
     /// already finalized.  For a consistent heuristic this should always be 0.
     pub reopen_attempts: usize,
@@ -234,8 +342,8 @@ fn first_trigger(
 // Core A* loop (shared between the two entry points)
 // ---------------------------------------------------------------------------
 
-/// Context for the core A* loop.  Kept in a struct so we can pass it around
-/// without a giant argument list.
+/// Context for the core A* loop. Kept in a struct so the hot path can reuse
+/// buffers and indexes instead of allocating them at each finalized state.
 struct AstarContext<'a, R>
 where
     R: CondensedTa,
@@ -245,12 +353,13 @@ where
     right: &'a R,
     left_rules: &'a [OwnedRule],
     left_index: &'a LeftIndex,
+    right_rule_index: ChildStateRightRuleIndex,
     right_interner: Interner<R::State>,
     product_ids: ProductStateMap,
     product_pairs: Vec<(StateId, StateId)>,
     builder: Option<ExplicitBuilder>,
     rule_tracker: TrustedRuleTracker,
-    right_by_child_cache: FxHashMap<(usize, StateId), Rc<[OwnedCondensedRule<StateId>]>>,
+    right_rules: Vec<OwnedCondensedRule<StateId>>,
     mat_stats: IndexedCondensedIntersectionStats,
     // A* specific state
     finalized: FixedBitSet,
@@ -262,6 +371,8 @@ where
     heap: AstarAgenda,
     pending: Vec<Option<AgendaItem>>,
     matches_scratch: Vec<usize>,
+    right_rule_ids_scratch: Vec<usize>,
+    span_product_siblings_scratch: Vec<SpanProductSibling>,
     stats: AstarStats,
 }
 
@@ -282,6 +393,7 @@ where
             right,
             left_rules,
             left_index,
+            right_rule_index: ChildStateRightRuleIndex::default(),
             right_interner: Interner::new(),
             product_ids: ProductStateMap::default(),
             product_pairs: Vec::new(),
@@ -291,7 +403,7 @@ where
                 None
             },
             rule_tracker: TrustedRuleTracker::default(),
-            right_by_child_cache: FxHashMap::default(),
+            right_rules: Vec::new(),
             mat_stats: IndexedCondensedIntersectionStats::default(),
             finalized: FixedBitSet::new(),
             finalized_partners: Vec::new(),
@@ -301,6 +413,8 @@ where
             heap: AstarAgenda::default(),
             pending: Vec::new(),
             matches_scratch: Vec::new(),
+            right_rule_ids_scratch: Vec::new(),
+            span_product_siblings_scratch: Vec::new(),
             stats: AstarStats::default(),
         }
     }
@@ -332,20 +446,16 @@ where
         }
     }
 
-    fn get_or_create_no_builder(
+    fn get_or_create_direct(
         &mut self,
         left_state: StateId,
         right_state: StateId,
     ) -> (StateId, bool) {
-        get_or_create_product_id(
+        get_or_create_product_id_direct(
             left_state,
             right_state,
-            self.left,
-            self.right,
             &mut self.product_ids,
             &mut self.product_pairs,
-            &self.right_interner,
-            self.builder.get_or_insert_with(ExplicitBuilder::new),
         )
     }
 
@@ -359,36 +469,18 @@ where
         self.left.is_accepting(&left_state) && self.right.is_accepting(right_raw)
     }
 
-    fn right_rules_by_child(
-        &mut self,
-        position: usize,
-        right_state: StateId,
-    ) -> Rc<[OwnedCondensedRule<StateId>]> {
-        let cache_key = (position, right_state);
-        self.right_by_child_cache
-            .entry(cache_key)
-            .or_insert_with(|| {
-                self.mat_stats.right_indexed_queries += 1;
-                let raw_state = self.right_interner.resolve(right_state).clone();
-                let mut collected = Vec::new();
-                self.right.condensed_rules_by_child(
-                    position,
-                    &raw_state,
-                    &mut |children, symbols, result| {
-                        collected.push(OwnedCondensedRule {
-                            children: children
-                                .iter()
-                                .cloned()
-                                .map(|child| self.right_interner.intern(child))
-                                .collect(),
-                            symbols: symbols.clone(),
-                            result: self.right_interner.intern(result),
-                        });
-                    },
-                );
-                Rc::from(collected)
-            })
-            .clone()
+    fn rule_ids_for_trigger(&mut self, position: usize, trigger_right: StateId) -> Vec<usize> {
+        let mut out = std::mem::take(&mut self.right_rule_ids_scratch);
+        self.right_rule_index.rule_ids_for_trigger_into(
+            self.right,
+            &mut self.right_interner,
+            &mut self.right_rules,
+            &mut self.mat_stats,
+            position,
+            trigger_right,
+            &mut out,
+        );
+        out
     }
 
     fn push_candidate<H: IntersectionHeuristic<R>, S: WeightScorer>(
@@ -418,7 +510,7 @@ where
                 builder,
             )
         } else {
-            self.get_or_create_no_builder(parent_left, parent_right)
+            self.get_or_create_direct(parent_left, parent_right)
         };
         self.grow_to(parent, scorer.zero());
 
@@ -464,6 +556,12 @@ where
         let Some(left_occurrences) = self.left_index.by_state.get(&trigger_left) else {
             return;
         };
+        // Generic expansion for arbitrary right automata and higher-arity
+        // rules. For each child position where the finalized left state can
+        // occur, retrieve right rules containing the finalized right state at
+        // that position. The left index is then queried with the finalized
+        // sibling partner sets, and concrete product children are resolved
+        // before a candidate is pushed.
         let mut positions = SmallVec::<[usize; 4]>::new();
         for &(_, position, _) in left_occurrences {
             if !positions.contains(&position) {
@@ -472,9 +570,10 @@ where
         }
 
         for position in positions {
-            let right_rules = self.right_rules_by_child(position, trigger_right);
-            for right_rule in right_rules.iter() {
+            let right_rule_ids = self.rule_ids_for_trigger(position, trigger_right);
+            for &right_rule_id in &right_rule_ids {
                 self.stats.right_rules_scanned += 1;
+                let right_rule = &self.right_rules[right_rule_id];
                 if right_rule.children.is_empty() {
                     continue;
                 }
@@ -486,7 +585,7 @@ where
                     } else if self
                         .finalized_partners
                         .get(right_child.index())
-                        .is_some_and(|partners| !partners.is_empty())
+                        .is_some_and(|partners| partners.len() > 0)
                     {
                         sibling_sets.push(&self.finalized_partners[right_child.index()]);
                     } else {
@@ -497,13 +596,14 @@ where
                 if missing {
                     continue;
                 }
+                let parent_right = right_rule.result;
 
                 self.stats.rotated_left_join_queries += 1;
                 self.left_index.rule_indexes_for_rotated_trigger_sets_into(
                     position,
                     trigger_left,
                     &right_rule.symbols,
-                    &sibling_sets,
+                    sibling_sets.as_slice(),
                     &mut self.matches_scratch,
                 );
                 drop(sibling_sets);
@@ -511,41 +611,48 @@ where
                 self.stats.left_rule_matches += matches.len();
 
                 for &rule_idx in &matches {
-                    let left_rule = &self.left_rules[rule_idx];
-                    let mut children = SmallVec::<[StateId; 2]>::new();
-                    let mut ok = true;
-                    for (child_position, (&left_child, &right_child)) in left_rule
-                        .children
-                        .iter()
-                        .zip(&right_rule.children)
-                        .enumerate()
-                    {
-                        if child_position == position
-                            && left_child == trigger_left
-                            && right_child == trigger_right
+                    let Some((parent_left, symbol, weight, children)) = ({
+                        let left_rule = &self.left_rules[rule_idx];
+                        let right_rule = &self.right_rules[right_rule_id];
+                        let mut children = SmallVec::<[StateId; 2]>::new();
+                        let mut ok = true;
+                        for (child_position, (&left_child, &right_child)) in left_rule
+                            .children
+                            .iter()
+                            .zip(&right_rule.children)
+                            .enumerate()
                         {
-                            children.push(trigger_product);
-                        } else if let Some(child) = self.product_ids.get(left_child, right_child) {
-                            if self.finalized.contains(child.index()) {
+                            if child_position == position
+                                && left_child == trigger_left
+                                && right_child == trigger_right
+                            {
+                                children.push(trigger_product);
+                            } else if let Some(child) = self
+                                .finalized_partners
+                                .get(right_child.index())
+                                .and_then(|partners| partners.product_for(left_child))
+                            {
                                 children.push(child);
                             } else {
                                 ok = false;
                                 break;
                             }
-                        } else {
-                            ok = false;
-                            break;
                         }
-                    }
-                    if !ok || !first_trigger(&children, position, trigger_product) {
+                        (ok && first_trigger(&children, position, trigger_product)).then_some((
+                            left_rule.result,
+                            left_rule.symbol,
+                            left_rule.weight,
+                            children,
+                        ))
+                    }) else {
                         continue;
-                    }
+                    };
                     self.stats.candidate_edges += 1;
                     self.push_candidate(
-                        left_rule.result,
-                        right_rule.result,
-                        left_rule.symbol,
-                        left_rule.weight,
+                        parent_left,
+                        parent_right,
+                        symbol,
+                        weight,
                         children,
                         scorer,
                         h,
@@ -553,6 +660,170 @@ where
                 }
 
                 self.matches_scratch = matches;
+            }
+            self.right_rule_ids_scratch = right_rule_ids;
+        }
+    }
+
+    fn binary_right_parents(
+        &mut self,
+        symbol: Symbol,
+        right_children: [StateId; 2],
+    ) -> SmallVec<[StateId; 4]>
+    where
+        R: CondensedTa<State = Span>,
+    {
+        let raw_right_children = [
+            *self.right_interner.resolve(right_children[0]),
+            *self.right_interner.resolve(right_children[1]),
+        ];
+        let mut raw_parents = SmallVec::<[Span; 4]>::new();
+        self.stats.right_step_calls += 1;
+        self.right.step(symbol, &raw_right_children, &mut |parent| {
+            raw_parents.push(parent)
+        });
+        self.stats.right_step_results += raw_parents.len();
+
+        let mut parents = SmallVec::<[StateId; 4]>::new();
+        for parent in raw_parents {
+            parents.push(self.right_interner.intern(parent));
+        }
+        parents
+    }
+
+    fn expand_from_finalized_with_span_product_siblings<
+        H: IntersectionHeuristic<R>,
+        S: WeightScorer,
+    >(
+        &mut self,
+        trigger_left: StateId,
+        trigger_right: StateId,
+        trigger_product: StateId,
+        span_left_index: &SpanAstarLeftIndex,
+        sibling_finder: &SpanProductSiblingFinder,
+        h: &H,
+        scorer: &S,
+    ) where
+        R: CondensedTa<State = Span>,
+    {
+        if span_left_index.has_higher_arity(trigger_left) {
+            // The product-aware span sibling finder is a binary-rule
+            // optimization. If this left state also appears in a larger rule,
+            // run the generic expansion so those candidates are still found.
+            self.stats.sibling_fallback_expansions += 1;
+            self.expand_from_finalized(trigger_left, trigger_right, trigger_product, h, scorer);
+            return;
+        }
+
+        let raw_trigger = *self.right_interner.resolve(trigger_right);
+
+        // Unary rules do not need sibling lookup: the possible right parents
+        // are exactly the result of stepping the right automaton with this
+        // finalized right child.
+        if let Some(unary_rules) = span_left_index.unary_rules(trigger_left) {
+            for &rule_idx in unary_rules {
+                let (parent_left, symbol, weight) = {
+                    let left_rule = &self.left_rules[rule_idx];
+                    (left_rule.result, left_rule.symbol, left_rule.weight)
+                };
+                let mut children = SmallVec::<[StateId; 2]>::new();
+                children.push(trigger_product);
+
+                let raw_children = [raw_trigger];
+                let mut right_parents = SmallVec::<[Span; 4]>::new();
+                self.stats.right_step_calls += 1;
+                self.right.step(symbol, &raw_children, &mut |parent| {
+                    right_parents.push(parent)
+                });
+                self.stats.right_step_results += right_parents.len();
+
+                for parent in right_parents {
+                    let parent_right = self.right_interner.intern(parent);
+                    self.stats.candidate_edges += 1;
+                    self.push_candidate(
+                        parent_left,
+                        parent_right,
+                        symbol,
+                        weight,
+                        children.clone(),
+                        scorer,
+                        h,
+                    );
+                }
+            }
+        }
+
+        for position in 0..2 {
+            let Some(groups) = span_left_index.binary_groups(trigger_left, position) else {
+                continue;
+            };
+
+            for group in groups {
+                // Query by span boundary and required sibling left state. Every
+                // returned item is already a finalized product that can fill
+                // the sibling slot for this group of left rules.
+                let mut sibling_products = std::mem::take(&mut self.span_product_siblings_scratch);
+                self.stats.sibling_tuple_queries += 1;
+                sibling_finder.sibling_products_into(
+                    raw_trigger,
+                    position,
+                    group.sibling_left,
+                    &mut sibling_products,
+                );
+                self.stats.sibling_tuples_returned += sibling_products.len();
+
+                for &sibling in &sibling_products {
+                    let (children, right_children) = match position {
+                        0 => {
+                            let mut children = SmallVec::<[StateId; 2]>::new();
+                            children.push(trigger_product);
+                            children.push(sibling.product);
+                            (children, [trigger_right, sibling.right_state])
+                        }
+                        1 => {
+                            let mut children = SmallVec::<[StateId; 2]>::new();
+                            children.push(sibling.product);
+                            children.push(trigger_product);
+                            (children, [sibling.right_state, trigger_right])
+                        }
+                        _ => unreachable!(),
+                    };
+
+                    if !first_trigger(&children, position, trigger_product) {
+                        continue;
+                    }
+
+                    for symbol_group in &group.symbol_groups {
+                        // All left rules in this group share the same symbol
+                        // and left-child requirements, so one right.step call
+                        // gives the right parent states for all of them.
+                        let parent_rights =
+                            self.binary_right_parents(symbol_group.symbol, right_children);
+                        for parent_right in parent_rights {
+                            for &rule_idx in &symbol_group.rule_indexes {
+                                let left_rule = &self.left_rules[rule_idx];
+                                debug_assert_eq!(left_rule.symbol, symbol_group.symbol);
+                                debug_assert_eq!(left_rule.children[position], trigger_left);
+                                debug_assert_eq!(
+                                    left_rule.children[1 - position],
+                                    group.sibling_left
+                                );
+                                self.stats.candidate_edges += 1;
+                                self.push_candidate(
+                                    left_rule.result,
+                                    parent_right,
+                                    symbol_group.symbol,
+                                    left_rule.weight,
+                                    children.clone(),
+                                    scorer,
+                                    h,
+                                );
+                            }
+                        }
+                    }
+                }
+
+                self.span_product_siblings_scratch = sibling_products;
             }
         }
     }
@@ -576,7 +847,7 @@ where
                 builder,
             )
         } else {
-            self.get_or_create_no_builder(edge.parent_left, edge.parent_right)
+            self.get_or_create_direct(edge.parent_left, edge.parent_right)
         };
         self.grow_to(product, scorer.zero());
 
@@ -607,18 +878,26 @@ where
         }
     }
 
-    /// Run the core A* loop until the heap is exhausted or `stop` returns true.
-    fn run<H, S, OnFin>(
+    fn seed_nullary_edges<H: IntersectionHeuristic<R>, S: WeightScorer>(
         &mut self,
         h: &H,
         scorer: &S,
-        stop_at_first_goal: bool,
-        mut on_finalize: OnFin,
-    ) where
-        H: IntersectionHeuristic<R>,
-        S: WeightScorer,
-        OnFin: FnMut(&mut Self, StateId, &EmitEdge, f64),
-    {
+    ) {
+        let mut nullary_edges = Vec::<NullaryEdge>::new();
+        for_each_nullary_edge(
+            self.left_rules,
+            self.left_index,
+            self.right,
+            &mut self.right_interner,
+            &mut self.mat_stats,
+            &mut |edge| nullary_edges.push(edge),
+        );
+        for edge in nullary_edges {
+            self.push_seed(edge, h, scorer);
+        }
+    }
+
+    fn pop_next_finalized<S: WeightScorer>(&mut self, scorer: &S) -> Option<FinalizedItem> {
         while let Some(product_index) = self.heap.pop() {
             self.stats.pops += 1;
             let product = StateId(product_index as u32);
@@ -634,7 +913,6 @@ where
                 continue;
             }
 
-            // Finalize this state.
             self.finalized.set(product.index(), true);
             self.best_inside[product.index()] = item.inside;
             self.best_seen_inside[product.index()] = item.inside;
@@ -648,16 +926,84 @@ where
             let is_goal = self.is_accepting_product(product);
             let (left_state, right_state) = self.product_pairs[product.index()];
             self.ensure_right_state(right_state);
-            self.finalized_partners[right_state.index()].insert(left_state);
+            self.finalized_partners[right_state.index()].insert(left_state, product);
 
-            // Let the caller emit rules / record results.
-            on_finalize(self, product, &item.edge, item.inside);
+            return Some(FinalizedItem {
+                product,
+                edge: item.edge,
+                inside: item.inside,
+                left_state,
+                right_state,
+                is_goal,
+            });
+        }
 
-            if is_goal && stop_at_first_goal {
+        None
+    }
+
+    /// Run the core A* loop until the heap is exhausted or `stop` returns true.
+    fn run<H, S, OnFin>(
+        &mut self,
+        h: &H,
+        scorer: &S,
+        stop_at_first_goal: bool,
+        mut on_finalize: OnFin,
+    ) where
+        H: IntersectionHeuristic<R>,
+        S: WeightScorer,
+        OnFin: FnMut(&mut Self, StateId, &EmitEdge, f64),
+    {
+        while let Some(item) = self.pop_next_finalized(scorer) {
+            on_finalize(self, item.product, &item.edge, item.inside);
+
+            if item.is_goal && stop_at_first_goal {
                 break;
             }
 
-            self.expand_from_finalized(left_state, right_state, product, h, scorer);
+            self.expand_from_finalized(item.left_state, item.right_state, item.product, h, scorer);
+        }
+    }
+
+    fn run_with_span_product_sibling_finder<H, S, OnFin>(
+        &mut self,
+        h: &H,
+        scorer: &S,
+        stop_at_first_goal: bool,
+        mut on_finalize: OnFin,
+    ) where
+        R: CondensedTa<State = Span>,
+        H: IntersectionHeuristic<R>,
+        S: WeightScorer,
+        OnFin: FnMut(&mut Self, StateId, &EmitEdge, f64),
+    {
+        let span_left_index = SpanAstarLeftIndex::build(self.left_rules);
+        let mut sibling_finder = SpanProductSiblingFinder::default();
+
+        while let Some(item) = self.pop_next_finalized(scorer) {
+            let raw_right = *self.right_interner.resolve(item.right_state);
+            span_left_index.activate_product(
+                &mut sibling_finder,
+                item.product,
+                item.left_state,
+                item.right_state,
+                raw_right,
+            );
+
+            on_finalize(self, item.product, &item.edge, item.inside);
+
+            if item.is_goal && stop_at_first_goal {
+                break;
+            }
+
+            self.expand_from_finalized_with_span_product_siblings(
+                item.left_state,
+                item.right_state,
+                item.product,
+                &span_left_index,
+                &sibling_finder,
+                h,
+                scorer,
+            );
         }
     }
 }
@@ -704,6 +1050,35 @@ where
     H: IntersectionHeuristic<R>,
     S: WeightScorer,
 {
+    materialize_astar_intersection_with_index(left, right, h, options, scorer)
+}
+
+pub(crate) fn materialize_astar_string_intersection_with<'h, H, S>(
+    left: &Explicit,
+    right: &InvHom<'h, StringDecompositionAutomaton>,
+    h: &H,
+    options: AstarOptions,
+    scorer: &S,
+) -> (Explicit, Interner<Span>, AstarStats)
+where
+    H: IntersectionHeuristic<InvHom<'h, StringDecompositionAutomaton>>,
+    S: WeightScorer,
+{
+    materialize_astar_intersection_with_span_sibling(left, right, h, options, scorer)
+}
+
+fn materialize_astar_intersection_with_span_sibling<R, H, S>(
+    left: &Explicit,
+    right: &R,
+    h: &H,
+    options: AstarOptions,
+    scorer: &S,
+) -> (Explicit, Interner<Span>, AstarStats)
+where
+    R: CondensedTa<State = Span>,
+    H: IntersectionHeuristic<R>,
+    S: WeightScorer,
+{
     let left_rules: Vec<_> = left
         .rules()
         .map(|rule| OwnedRule {
@@ -716,20 +1091,68 @@ where
     let left_index = LeftIndex::build(&left_rules);
 
     let mut ctx = AstarContext::new(left, right, &left_rules, &left_index, true);
+    ctx.seed_nullary_edges(h, scorer);
 
-    // Seed: collect nullary edges.
-    let mut nullary_edges = Vec::<NullaryEdge>::new();
-    for_each_nullary_edge(
-        &left_rules,
-        &left_index,
-        right,
-        &mut ctx.right_interner,
-        &mut ctx.mat_stats,
-        &mut |edge| nullary_edges.push(edge),
+    let stop_at_first_goal = options.stop_at_first_goal;
+    let beam = options.beam;
+
+    ctx.run_with_span_product_sibling_finder(
+        h,
+        scorer,
+        stop_at_first_goal,
+        |ctx, _product, edge, inside| {
+            let emit = stop_at_first_goal || beam.is_none_or(|threshold| inside >= threshold);
+            if emit {
+                let builder = ctx
+                    .builder
+                    .as_mut()
+                    .expect("chart mode always has a builder");
+                ctx.rule_tracker.add_rule(
+                    builder,
+                    edge.symbol,
+                    edge.children.clone(),
+                    _product,
+                    edge.weight,
+                );
+                ctx.stats.emitted_rules += 1;
+            }
+        },
     );
-    for edge in nullary_edges {
-        ctx.push_seed(edge, h, scorer);
-    }
+
+    ctx.stats.output_states = ctx.product_pairs.len();
+    ctx.stats.right_indexed_queries = ctx.mat_stats.right_indexed_queries;
+
+    let builder = ctx.builder.take().unwrap_or_default();
+    let explicit = builder.build_trusted();
+    (explicit, ctx.right_interner, ctx.stats)
+}
+
+fn materialize_astar_intersection_with_index<R, H, S>(
+    left: &Explicit,
+    right: &R,
+    h: &H,
+    options: AstarOptions,
+    scorer: &S,
+) -> (Explicit, Interner<R::State>, AstarStats)
+where
+    R: CondensedTa,
+    R::State: Clone + Eq + Hash,
+    H: IntersectionHeuristic<R>,
+    S: WeightScorer,
+{
+    let left_rules: Vec<_> = left
+        .rules()
+        .map(|rule| OwnedRule {
+            symbol: rule.symbol,
+            children: rule.children.iter().copied().collect(),
+            result: rule.result,
+            weight: rule.weight,
+        })
+        .collect();
+    let left_index = LeftIndex::build(&left_rules);
+
+    let mut ctx = AstarContext::new(left, right, &left_rules, &left_index, true);
+    ctx.seed_nullary_edges(h, scorer);
 
     let stop_at_first_goal = options.stop_at_first_goal;
     let beam = options.beam;
@@ -816,6 +1239,33 @@ where
     H: IntersectionHeuristic<R>,
     S: WeightScorer,
 {
+    astar_one_best_with_stats_and_index(left, right, h, scorer)
+}
+
+pub(crate) fn astar_string_one_best_with_stats<'h, H, S>(
+    left: &Explicit,
+    right: &InvHom<'h, StringDecompositionAutomaton>,
+    h: &H,
+    scorer: &S,
+) -> (Option<ViterbiTree>, AstarStats)
+where
+    H: IntersectionHeuristic<InvHom<'h, StringDecompositionAutomaton>>,
+    S: WeightScorer,
+{
+    astar_one_best_with_stats_and_span_sibling(left, right, h, scorer)
+}
+
+fn astar_one_best_with_stats_and_span_sibling<R, H, S>(
+    left: &Explicit,
+    right: &R,
+    h: &H,
+    scorer: &S,
+) -> (Option<ViterbiTree>, AstarStats)
+where
+    R: CondensedTa<State = Span>,
+    H: IntersectionHeuristic<R>,
+    S: WeightScorer,
+{
     let left_rules: Vec<_> = left
         .rules()
         .map(|rule| OwnedRule {
@@ -828,20 +1278,56 @@ where
     let left_index = LeftIndex::build(&left_rules);
 
     let mut ctx = AstarContext::new(left, right, &left_rules, &left_index, false);
+    ctx.seed_nullary_edges(h, scorer);
 
-    // Seed.
-    let mut nullary_edges = Vec::<NullaryEdge>::new();
-    for_each_nullary_edge(
-        &left_rules,
-        &left_index,
-        right,
-        &mut ctx.right_interner,
-        &mut ctx.mat_stats,
-        &mut |edge| nullary_edges.push(edge),
-    );
-    for edge in nullary_edges {
-        ctx.push_seed(edge, h, scorer);
-    }
+    let mut goal_state: Option<(StateId, f64)> = None;
+
+    ctx.run_with_span_product_sibling_finder(h, scorer, true, |ctx, product, _edge, inside| {
+        if goal_state.is_none() && ctx.is_accepting_product(product) {
+            goal_state = Some((product, inside));
+        }
+    });
+
+    let Some((goal, best_score)) = goal_state else {
+        ctx.stats.right_indexed_queries = ctx.mat_stats.right_indexed_queries;
+        return (None, ctx.stats);
+    };
+    ctx.stats.right_indexed_queries = ctx.mat_stats.right_indexed_queries;
+
+    let mut arena = TreeArena::new();
+    let Some(root) = build_tree(goal, &ctx.back, &mut arena) else {
+        return (None, ctx.stats);
+    };
+    let tree =
+        ViterbiTree::new_with_score(arena, root, best_score, scorer.score_to_weight(best_score));
+    (Some(tree), ctx.stats)
+}
+
+fn astar_one_best_with_stats_and_index<R, H, S>(
+    left: &Explicit,
+    right: &R,
+    h: &H,
+    scorer: &S,
+) -> (Option<ViterbiTree>, AstarStats)
+where
+    R: CondensedTa,
+    R::State: Clone + Eq + Hash,
+    H: IntersectionHeuristic<R>,
+    S: WeightScorer,
+{
+    let left_rules: Vec<_> = left
+        .rules()
+        .map(|rule| OwnedRule {
+            symbol: rule.symbol,
+            children: rule.children.iter().copied().collect(),
+            result: rule.result,
+            weight: rule.weight,
+        })
+        .collect();
+    let left_index = LeftIndex::build(&left_rules);
+
+    let mut ctx = AstarContext::new(left, right, &left_rules, &left_index, false);
+    ctx.seed_nullary_edges(h, scorer);
 
     let mut goal_state: Option<(StateId, f64)> = None;
 
@@ -874,9 +1360,11 @@ where
 mod tests {
     use super::*;
     use crate::{
-        ExplicitBuilder, Symbol,
+        ExplicitBuilder, Homomorphism, Symbol,
         heuristic::{OutsideHeuristic, ZeroHeuristic},
-        materialize::materialize_indexed_condensed_intersection,
+        materialize::{
+            materialize_indexed_condensed_intersection, materialize_topdown_condensed_intersection,
+        },
     };
 
     /// Build a small grammar/automaton suitable for self-intersection tests.
@@ -921,6 +1409,134 @@ mod tests {
         builder.add_accepting(root);
 
         builder.build()
+    }
+
+    fn add_word_hom(hom: &mut Homomorphism, source: Symbol, word: Symbol) {
+        let term = hom.add_symbol(word, Vec::new());
+        hom.add(source, 0, term).unwrap();
+    }
+
+    fn add_identity_hom(hom: &mut Homomorphism, source: Symbol) {
+        let child = hom.add_var(0);
+        hom.add(source, 1, child).unwrap();
+    }
+
+    fn add_binary_concat_hom(hom: &mut Homomorphism, source: Symbol, concat: Symbol) {
+        let left = hom.add_var(0);
+        let right = hom.add_var(1);
+        let term = hom.add_symbol(concat, vec![left, right]);
+        hom.add(source, 2, term).unwrap();
+    }
+
+    fn add_ternary_concat_hom(hom: &mut Homomorphism, source: Symbol, concat: Symbol) {
+        let left = hom.add_var(0);
+        let middle = hom.add_var(1);
+        let first = hom.add_symbol(concat, vec![left, middle]);
+        let right = hom.add_var(2);
+        let term = hom.add_symbol(concat, vec![first, right]);
+        hom.add(source, 3, term).unwrap();
+    }
+
+    #[test]
+    fn string_sibling_astar_matches_old_index_and_topdown_for_binary_unary_rules() {
+        let concat = Symbol(0);
+        let word_a = Symbol(1);
+        let word_b = Symbol(2);
+        let g_a = Symbol(10);
+        let g_b = Symbol(11);
+        let g_ab = Symbol(12);
+        let g_id = Symbol(13);
+
+        let mut hom = Homomorphism::new();
+        add_word_hom(&mut hom, g_a, word_a);
+        add_word_hom(&mut hom, g_b, word_b);
+        add_binary_concat_hom(&mut hom, g_ab, concat);
+        add_identity_hom(&mut hom, g_id);
+
+        let mut builder = ExplicitBuilder::new();
+        let qa = builder.new_state();
+        let qb = builder.new_state();
+        let q_ab = builder.new_state();
+        let root = builder.new_state();
+        builder.add_weighted_rule(g_a, vec![], qa, 0.8);
+        builder.add_weighted_rule(g_b, vec![], qb, 0.7);
+        builder.add_weighted_rule(g_ab, vec![qa, qb], q_ab, 0.9);
+        builder.add_weighted_rule(g_id, vec![q_ab], root, 0.95);
+        builder.add_accepting(root);
+        let grammar = builder.build();
+
+        let right = InvHom::new(
+            StringDecompositionAutomaton::new(concat, vec![word_a, word_b]),
+            &hom,
+        );
+        let h = ZeroHeuristic;
+
+        let (new_best, new_stats) =
+            astar_string_one_best_with_stats(&grammar, &right, &h, &ProbabilityScorer);
+        let (old_best, _) =
+            astar_one_best_with_stats_and_index(&grammar, &right, &h, &ProbabilityScorer);
+        let (topdown_chart, _, _) = materialize_topdown_condensed_intersection(&grammar, &right);
+
+        let new_best = new_best.expect("sibling-finder A* should find a tree");
+        let old_best = old_best.expect("old indexed A* should find a tree");
+        let topdown_best = topdown_chart
+            .viterbi()
+            .expect("topdown should find the same tree");
+
+        assert!((new_best.weight() - old_best.weight()).abs() < 1e-10);
+        assert!((new_best.weight() - topdown_best.weight()).abs() < 1e-10);
+        assert!(new_stats.sibling_tuple_queries > 0);
+        assert!(new_stats.sibling_tuples_returned > 0);
+        assert!(new_stats.right_step_calls > 0);
+        assert!(new_stats.right_step_results > 0);
+        assert_eq!(new_stats.sibling_fallback_expansions, 0);
+    }
+
+    #[test]
+    fn string_sibling_astar_falls_back_for_higher_arity_rules() {
+        let concat = Symbol(0);
+        let word_a = Symbol(1);
+        let word_b = Symbol(2);
+        let word_c = Symbol(3);
+        let g_a = Symbol(10);
+        let g_b = Symbol(11);
+        let g_c = Symbol(12);
+        let g_abc = Symbol(13);
+
+        let mut hom = Homomorphism::new();
+        add_word_hom(&mut hom, g_a, word_a);
+        add_word_hom(&mut hom, g_b, word_b);
+        add_word_hom(&mut hom, g_c, word_c);
+        add_ternary_concat_hom(&mut hom, g_abc, concat);
+
+        let mut builder = ExplicitBuilder::new();
+        let qa = builder.new_state();
+        let qb = builder.new_state();
+        let qc = builder.new_state();
+        let root = builder.new_state();
+        builder.add_weighted_rule(g_a, vec![], qa, 0.8);
+        builder.add_weighted_rule(g_b, vec![], qb, 0.7);
+        builder.add_weighted_rule(g_c, vec![], qc, 0.6);
+        builder.add_weighted_rule(g_abc, vec![qa, qb, qc], root, 0.9);
+        builder.add_accepting(root);
+        let grammar = builder.build();
+
+        let right = InvHom::new(
+            StringDecompositionAutomaton::new(concat, vec![word_a, word_b, word_c]),
+            &hom,
+        );
+        let h = ZeroHeuristic;
+
+        let (new_best, new_stats) =
+            astar_string_one_best_with_stats(&grammar, &right, &h, &ProbabilityScorer);
+        let (old_best, _) =
+            astar_one_best_with_stats_and_index(&grammar, &right, &h, &ProbabilityScorer);
+
+        let new_best = new_best.expect("sibling-finder A* fallback should find a tree");
+        let old_best = old_best.expect("old indexed A* should find a tree");
+
+        assert!((new_best.weight() - old_best.weight()).abs() < 1e-10);
+        assert!(new_stats.sibling_fallback_expansions > 0);
     }
 
     // -----------------------------------------------------------------------

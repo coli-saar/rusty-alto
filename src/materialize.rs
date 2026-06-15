@@ -1003,6 +1003,22 @@ where
     (id, true)
 }
 
+pub(crate) fn get_or_create_product_id_direct(
+    left_state: StateId,
+    right_state: StateId,
+    ids: &mut ProductStateMap,
+    pairs: &mut Vec<(StateId, StateId)>,
+) -> (StateId, bool) {
+    if let Some(id) = ids.get(left_state, right_state) {
+        return (id, false);
+    }
+
+    let id = StateId(pairs.len() as u32);
+    ids.insert(left_state, right_state, id);
+    pairs.push((left_state, right_state));
+    (id, true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

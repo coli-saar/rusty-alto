@@ -8,6 +8,7 @@ use std::hash::Hash;
 pub use string::{
     SentenceSxHeuristic, Span, StringAlgebra, StringDecompositionAutomaton, UniversalSxHeuristic,
 };
+pub(crate) use string::{SpanProductSibling, SpanProductSiblingFinder};
 
 /// Algebra over a domain of values.
 ///

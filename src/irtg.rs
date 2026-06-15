@@ -7,7 +7,10 @@ use crate::{
     UniversalSxHeuristic, ViterbiTree, WeightScorer, ZeroHeuristic,
     alto_ast::{AstHomTerm, AstIrtg, AstState, LexError, Tok, lex},
     alto_grammar,
-    astar::{AstarOptions, AstarStats, astar_one_best_with_stats, materialize_astar_intersection},
+    astar::{
+        AstarOptions, AstarStats, astar_string_one_best_with_stats,
+        materialize_astar_string_intersection_with,
+    },
     materialize::{
         materialize_indexed_condensed_intersection, materialize_topdown_condensed_intersection,
     },
@@ -356,14 +359,30 @@ impl Irtg {
         let (new_chart, _, _) = match heuristic {
             AstarHeuristic::Zero => {
                 let h = ZeroHeuristic;
-                materialize_astar_intersection(chart, invhom, &h, options)
+                materialize_astar_string_intersection_with(
+                    chart,
+                    invhom,
+                    &h,
+                    options,
+                    &crate::ProbabilityScorer,
+                )
             }
-            AstarHeuristic::Outside(h) => {
-                materialize_astar_intersection(chart, invhom, *h, options)
-            }
+            AstarHeuristic::Outside(h) => materialize_astar_string_intersection_with(
+                chart,
+                invhom,
+                *h,
+                options,
+                &crate::ProbabilityScorer,
+            ),
             AstarHeuristic::UniversalSx { table, n } => {
                 let h = table.for_sentence(*n);
-                materialize_astar_intersection(chart, invhom, &h, options)
+                materialize_astar_string_intersection_with(
+                    chart,
+                    invhom,
+                    &h,
+                    options,
+                    &crate::ProbabilityScorer,
+                )
             }
         };
         Ok(new_chart)
@@ -380,12 +399,14 @@ impl Irtg {
         match heuristic {
             AstarHeuristic::Zero => {
                 let h = ScoredZeroHeuristic::new(scorer);
-                astar_one_best_with_stats(chart, invhom, &h, scorer)
+                astar_string_one_best_with_stats(chart, invhom, &h, scorer)
             }
-            AstarHeuristic::Outside(h) => astar_one_best_with_stats(chart, invhom, *h, scorer),
+            AstarHeuristic::Outside(h) => {
+                astar_string_one_best_with_stats(chart, invhom, *h, scorer)
+            }
             AstarHeuristic::UniversalSx { table, n } => {
                 let h = table.for_sentence(*n);
-                astar_one_best_with_stats(chart, invhom, &h, scorer)
+                astar_string_one_best_with_stats(chart, invhom, &h, scorer)
             }
         }
     }

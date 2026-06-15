@@ -77,6 +77,11 @@ struct Record {
     candidate_edges: usize,
     dominated_candidates: usize,
     finalized_candidate_discards: usize,
+    sibling_tuple_queries: usize,
+    sibling_tuples_returned: usize,
+    right_step_calls: usize,
+    right_step_results: usize,
+    sibling_fallback_expansions: usize,
 }
 
 struct ParsedSentence {
@@ -187,6 +192,11 @@ struct StrategyAccum {
     total_candidate_edges: usize,
     total_dominated_candidates: usize,
     total_finalized_candidate_discards: usize,
+    total_sibling_tuple_queries: usize,
+    total_sibling_tuples_returned: usize,
+    total_right_step_calls: usize,
+    total_right_step_results: usize,
+    total_sibling_fallback_expansions: usize,
 }
 
 impl StrategyAccum {
@@ -206,6 +216,11 @@ impl StrategyAccum {
         self.total_candidate_edges += r.candidate_edges;
         self.total_dominated_candidates += r.dominated_candidates;
         self.total_finalized_candidate_discards += r.finalized_candidate_discards;
+        self.total_sibling_tuple_queries += r.sibling_tuple_queries;
+        self.total_sibling_tuples_returned += r.sibling_tuples_returned;
+        self.total_right_step_calls += r.right_step_calls;
+        self.total_right_step_results += r.right_step_results;
+        self.total_sibling_fallback_expansions += r.sibling_fallback_expansions;
     }
 
     fn total_parse_ms(&self) -> f64 {
@@ -465,9 +480,14 @@ fn run() -> Result<(), Box<dyn Error>> {
                 || accum.total_stale_pops > 0
                 || accum.total_dominated_candidates > 0
                 || accum.total_finalized_candidate_discards > 0
+                || accum.total_sibling_tuple_queries > 0
+                || accum.total_sibling_tuples_returned > 0
+                || accum.total_right_step_calls > 0
+                || accum.total_right_step_results > 0
+                || accum.total_sibling_fallback_expansions > 0
             {
                 eprintln!(
-                    "{:<16} A* internals: right_queries={} right_rules={} left_joins={} left_matches={} candidates={} heap_updates={} stale_pops={} dominated={} finalized_discards={}",
+                    "{:<16} A* internals: right_queries={} right_rules={} left_joins={} left_matches={} candidates={} heap_updates={} stale_pops={} dominated={} finalized_discards={} sibling_queries={} sibling_tuples={} right_steps={} right_step_results={} sibling_fallbacks={}",
                     "",
                     accum.total_right_indexed_queries,
                     accum.total_right_rules_scanned,
@@ -478,6 +498,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                     accum.total_stale_pops,
                     accum.total_dominated_candidates,
                     accum.total_finalized_candidate_discards,
+                    accum.total_sibling_tuple_queries,
+                    accum.total_sibling_tuples_returned,
+                    accum.total_right_step_calls,
+                    accum.total_right_step_results,
+                    accum.total_sibling_fallback_expansions,
                 );
             }
         }
@@ -694,6 +719,11 @@ fn run_chart_strategy(
                 candidate_edges: 0,
                 dominated_candidates: 0,
                 finalized_candidate_discards: 0,
+                sibling_tuple_queries: 0,
+                sibling_tuples_returned: 0,
+                right_step_calls: 0,
+                right_step_results: 0,
+                sibling_fallback_expansions: 0,
             };
         }
     };
@@ -735,6 +765,11 @@ fn run_chart_strategy(
         candidate_edges: 0,
         dominated_candidates: 0,
         finalized_candidate_discards: 0,
+        sibling_tuple_queries: 0,
+        sibling_tuples_returned: 0,
+        right_step_calls: 0,
+        right_step_results: 0,
+        sibling_fallback_expansions: 0,
     }
 }
 
@@ -778,6 +813,11 @@ fn run_astar_strategy(
                 candidate_edges: 0,
                 dominated_candidates: 0,
                 finalized_candidate_discards: 0,
+                sibling_tuple_queries: 0,
+                sibling_tuples_returned: 0,
+                right_step_calls: 0,
+                right_step_results: 0,
+                sibling_fallback_expansions: 0,
             };
         }
     };
@@ -808,5 +848,10 @@ fn run_astar_strategy(
         candidate_edges: stats.candidate_edges,
         dominated_candidates: stats.dominated_candidates,
         finalized_candidate_discards: stats.finalized_candidate_discards,
+        sibling_tuple_queries: stats.sibling_tuple_queries,
+        sibling_tuples_returned: stats.sibling_tuples_returned,
+        right_step_calls: stats.right_step_calls,
+        right_step_results: stats.right_step_results,
+        sibling_fallback_expansions: stats.sibling_fallback_expansions,
     }
 }
