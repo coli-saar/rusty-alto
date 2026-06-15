@@ -1,7 +1,8 @@
 use super::Algebra;
 use crate::{
-    BottomUpTa, CondensedTa, Explicit, FxHashMap, IndexedBottomUpTa, InvHom, ProbabilityScorer,
-    Signature, StateId, StateUniverse, Symbol, SymbolSet, TopDownTa, WeightScorer,
+    BottomUpTa, CondensedTa, DetBottomUpTa, Explicit, FxHashMap, IndexedBottomUpTa, InvHom,
+    ProbabilityScorer, Signature, StateId, StateUniverse, Symbol, SymbolSet, TopDownTa,
+    WeightScorer,
     heuristic::IntersectionHeuristic,
     homomorphism::{HomLabel, Homomorphism},
 };
@@ -312,6 +313,27 @@ impl BottomUpTa for StringDecompositionAutomaton {
 
     fn is_accepting(&self, q: &Span) -> bool {
         *q == Span::new(0, self.len())
+    }
+}
+
+impl DetBottomUpTa for StringDecompositionAutomaton {
+    fn step_det(&self, f: Symbol, children: &[Span]) -> Option<Span> {
+        if f == self.concat {
+            let [left, right] = children else {
+                return None;
+            };
+            return (self.valid_span(*left) && self.valid_span(*right) && left.end == right.start)
+                .then_some(Span::new(left.start, right.end));
+        }
+
+        if !children.is_empty() {
+            return None;
+        }
+
+        self.positions_by_word
+            .get(&f)
+            .and_then(|positions| (positions.len() == 1).then_some(positions[0]))
+            .map(|i| Span::new(i, i + 1))
     }
 }
 
@@ -1596,6 +1618,33 @@ mod tests {
         let mut spans = Vec::new();
         decomp.step(a, &[], &mut |q| spans.push(q));
         assert_eq!(spans, vec![Span::new(0, 1), Span::new(2, 3)]);
+    }
+
+    #[test]
+    fn string_decomposition_step_det_handles_concat() {
+        let mut alg = StringAlgebra::new();
+        let a = alg.intern_word("a");
+        let b = alg.intern_word("b");
+        let decomp = alg.decompose(vec![a, b]);
+        let concat = alg.concat_symbol();
+
+        assert_eq!(
+            decomp.step_det(concat, &[Span::new(0, 1), Span::new(1, 2)]),
+            Some(Span::new(0, 2))
+        );
+        assert_eq!(
+            decomp.step_det(concat, &[Span::new(1, 2), Span::new(0, 1)]),
+            None
+        );
+    }
+
+    #[test]
+    fn string_decomposition_step_det_rejects_repeated_word_nullaries() {
+        let mut alg = StringAlgebra::new();
+        let a = alg.intern_word("a");
+        let decomp = alg.decompose(vec![a, a]);
+
+        assert_eq!(decomp.step_det(a, &[]), None);
     }
 
     #[test]
