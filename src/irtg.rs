@@ -2,9 +2,9 @@
 
 use crate::{
     Algebra, Explicit, ExplicitBuildError, ExplicitBuilder, FxHashMap, Homomorphism,
-    HomomorphismError, IndexedCondensedIntersectionStats, Interner, InvHom, OutsideHeuristic,
-    ScoredZeroHeuristic, Signature, SignatureError, StateId, StringAlgebra, Symbol,
-    UniversalSxHeuristic, ViterbiTree, WeightScorer, ZeroHeuristic,
+    HomomorphismError, IndexedCondensedIntersectionStats, Interner, InvHom, MinHeuristic,
+    ObligatoryLeafTables, OutsideHeuristic, ScoredZeroHeuristic, Signature, SignatureError,
+    StateId, StringAlgebra, Symbol, UniversalSxHeuristic, ViterbiTree, WeightScorer, ZeroHeuristic,
     alto_ast::{AstHomTerm, AstIrtg, AstState, LexError, Tok, lex},
     alto_grammar,
     astar::{
@@ -58,6 +58,16 @@ pub enum AstarHeuristic<'h> {
     /// Build once with [`UniversalSxHeuristic::new`] and reuse across all sentences.
     UniversalSx {
         table: &'h UniversalSxHeuristic,
+        n: usize,
+    },
+    /// Universal SX combined with the obligatory-leaf F filter via `min`. SX
+    /// bounds outside *weight*; F prunes spans whose context cannot supply an
+    /// obligatory leaf. Both are admissible, so the combination stays exact.
+    /// `oblig` is grammar-only (build once); the per-input terminal supply is
+    /// derived from the sentence at call time.
+    UniversalSxF {
+        table: &'h UniversalSxHeuristic,
+        oblig: &'h ObligatoryLeafTables,
         n: usize,
     },
 }
@@ -384,6 +394,18 @@ impl Irtg {
                     &crate::ProbabilityScorer,
                 )
             }
+            AstarHeuristic::UniversalSxF { table, oblig, n } => {
+                let sx = table.for_sentence(*n);
+                let f = oblig.for_sentence(invhom.inner().sentence(), &crate::ProbabilityScorer);
+                let h = MinHeuristic::new(sx, f);
+                materialize_astar_string_intersection_with(
+                    chart,
+                    invhom,
+                    &h,
+                    options,
+                    &crate::ProbabilityScorer,
+                )
+            }
         };
         Ok(new_chart)
     }
@@ -406,6 +428,12 @@ impl Irtg {
             }
             AstarHeuristic::UniversalSx { table, n } => {
                 let h = table.for_sentence(*n);
+                astar_string_one_best_with_stats(chart, invhom, &h, scorer)
+            }
+            AstarHeuristic::UniversalSxF { table, oblig, n } => {
+                let sx = table.for_sentence(*n);
+                let f = oblig.for_sentence(invhom.inner().sentence(), scorer);
+                let h = MinHeuristic::new(sx, f);
                 astar_string_one_best_with_stats(chart, invhom, &h, scorer)
             }
         }

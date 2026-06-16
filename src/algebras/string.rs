@@ -277,6 +277,12 @@ impl StringDecompositionAutomaton {
         self.sentence.len()
     }
 
+    /// Return the sentence tokens (used by the obligatory-leaf F heuristic to
+    /// build per-input terminal supply).
+    pub fn sentence(&self) -> &[Symbol] {
+        &self.sentence
+    }
+
     /// Return whether the sentence is empty.
     pub fn is_empty(&self) -> bool {
         self.sentence.is_empty()

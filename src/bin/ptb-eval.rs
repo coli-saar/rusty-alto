@@ -5,9 +5,9 @@
 
 use rusty_alto::{
     AstarHeuristic, AstarOptions, InvHom, Irtg, LogProbabilityScorer, MaterializationStrategy,
-    OutsideHeuristic, PreparedAstarGrammar, ScoredZeroHeuristic, StringAlgebra,
-    StringDecompositionAutomaton, UniversalSxHeuristic, astar_string_one_best_with_stats_prepared,
-    parse_irtg,
+    MinHeuristic, ObligatoryLeafTables, OutsideHeuristic, PreparedAstarGrammar, ScoredZeroHeuristic,
+    StringAlgebra, StringDecompositionAutomaton, UniversalSxHeuristic,
+    astar_string_one_best_with_stats_prepared, parse_irtg,
 };
 use std::{
     collections::HashMap,
@@ -31,6 +31,7 @@ enum Strategy {
     AstarZero,
     AstarOutside,
     AstarSx,
+    AstarSxF,
 }
 
 impl Strategy {
@@ -40,6 +41,7 @@ impl Strategy {
             Strategy::AstarZero => "astar-zero",
             Strategy::AstarOutside => "astar-outside",
             Strategy::AstarSx => "astar-sx",
+            Strategy::AstarSxF => "astar-sxf",
         }
     }
 
@@ -49,6 +51,7 @@ impl Strategy {
             "astar-zero" => Some(Strategy::AstarZero),
             "astar-outside" => Some(Strategy::AstarOutside),
             "astar-sx" => Some(Strategy::AstarSx),
+            "astar-sxf" => Some(Strategy::AstarSxF),
             _ => None,
         }
     }
@@ -154,7 +157,7 @@ impl Args {
                     .map(|s| {
                         Strategy::parse(s.trim()).ok_or_else(|| {
                             format!(
-                                "unknown strategy {:?}; valid: topdown,astar-zero,astar-outside,astar-sx",
+                                "unknown strategy {:?}; valid: topdown,astar-zero,astar-outside,astar-sx,astar-sxf",
                                 s.trim()
                             )
                         })
@@ -552,7 +555,7 @@ fn run_strategy(
     render_progress(strategy, 0, total);
     let prepared_astar = matches!(
         strategy,
-        Strategy::AstarZero | Strategy::AstarOutside | Strategy::AstarSx
+        Strategy::AstarZero | Strategy::AstarOutside | Strategy::AstarSx | Strategy::AstarSxF
     )
     .then(|| PreparedAstarGrammar::new(irtg.grammar()));
 
@@ -662,6 +665,71 @@ fn run_strategy(
                     prepared_astar.as_ref().expect("A* grammar was prepared"),
                     &MaterializationStrategy::Astar {
                         heuristic: AstarHeuristic::UniversalSx { table: &table, n },
+                        options: AstarOptions {
+                            stop_at_first_goal: true,
+                            beam: None,
+                        },
+                    },
+                    &scorer,
+                ));
+                render_progress(strategy, idx + 1, total);
+            }
+        }
+        Strategy::AstarSxF => {
+            let n_max = sentences.iter().map(|s| s.value.len()).max().unwrap_or(0);
+            if n_max == 0 {
+                eprintln!();
+                return records;
+            }
+
+            // SX table (reuse the on-disk cache, like astar-sx).
+            let table = if let Some((h, path)) = sx_load_covering(grammar_path, n_max) {
+                eprintln!(
+                    "\r{:<16} loaded SX cache n_max={} from {}",
+                    strategy.name(),
+                    h.n_max(),
+                    path.display()
+                );
+                h
+            } else {
+                let hom = interpretation.homomorphism();
+                let concat = interpretation
+                    .algebra_signature()
+                    .get("*")
+                    .unwrap_or(rusty_alto::Symbol(0));
+                eprint!("\r{:<16} SX precompute n_max={n_max}... ", strategy.name());
+                let _ = io::stderr().flush();
+                let setup_start = Instant::now();
+                let h = UniversalSxHeuristic::new_with(irtg.grammar(), hom, concat, n_max, &scorer);
+                eprintln!("done in {:.2} ms", millis(setup_start.elapsed()));
+                sx_save(&sx_cache_path(grammar_path, n_max), &h);
+                h
+            };
+
+            // Obligatory-leaf F tables (grammar-only; this is F's whole precompute).
+            eprint!("\r{:<16} building obligatory-leaf tables... ", strategy.name());
+            let _ = io::stderr().flush();
+            let setup_start = Instant::now();
+            let oblig =
+                ObligatoryLeafTables::from_grammar(irtg.grammar(), interpretation.homomorphism());
+            eprintln!("done in {:.2} ms", millis(setup_start.elapsed()));
+            render_progress(strategy, 0, total);
+
+            for (idx, sentence) in sentences.iter().enumerate() {
+                let n = sentence.value.len();
+                records.push(run_astar_strategy(
+                    irtg,
+                    interpretation,
+                    sentence.value.clone(),
+                    sentence.sentence_no,
+                    strategy,
+                    prepared_astar.as_ref().expect("A* grammar was prepared"),
+                    &MaterializationStrategy::Astar {
+                        heuristic: AstarHeuristic::UniversalSxF {
+                            table: &table,
+                            oblig: &oblig,
+                            n,
+                        },
                         options: AstarOptions {
                             stop_at_first_goal: true,
                             beam: None,
@@ -848,6 +916,16 @@ fn run_astar_strategy(
         } => {
             debug_assert_eq!(*sx_n, n);
             let h = table.for_sentence(*sx_n);
+            astar_string_one_best_with_stats_prepared(irtg.grammar(), prepared, &invhom, &h, scorer)
+        }
+        MaterializationStrategy::Astar {
+            heuristic: AstarHeuristic::UniversalSxF { table, oblig, n: sx_n },
+            ..
+        } => {
+            debug_assert_eq!(*sx_n, n);
+            let sx = table.for_sentence(*sx_n);
+            let f = oblig.for_sentence(invhom.inner().sentence(), scorer);
+            let h = MinHeuristic::new(sx, f);
             astar_string_one_best_with_stats_prepared(irtg.grammar(), prepared, &invhom, &h, scorer)
         }
         _ => unreachable!(),

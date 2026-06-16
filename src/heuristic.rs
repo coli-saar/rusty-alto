@@ -60,6 +60,44 @@ pub trait IntersectionHeuristic<R: BottomUpTa> {
 }
 
 // ---------------------------------------------------------------------------
+// MinHeuristic (combinator)
+// ---------------------------------------------------------------------------
+
+/// Combines two admissible heuristics by taking, per product state, the
+/// tighter (smaller) of the two estimates.
+///
+/// The minimum of two admissible upper bounds is itself an admissible upper
+/// bound (and at least as tight), so A* stays exact. The numeric `min` is
+/// correct in both probability space (estimates in `(0, 1]`, smaller = tighter)
+/// and log-prob space (estimates `≤ 0`, smaller = tighter), since the scorer
+/// representation is monotone in the true weight.
+pub struct MinHeuristic<A, B> {
+    a: A,
+    b: B,
+}
+
+impl<A, B> MinHeuristic<A, B> {
+    /// Combine heuristics `a` and `b`; `outside_estimate` returns `min(a, b)`.
+    pub fn new(a: A, b: B) -> Self {
+        Self { a, b }
+    }
+}
+
+impl<R, A, B> IntersectionHeuristic<R> for MinHeuristic<A, B>
+where
+    R: BottomUpTa,
+    A: IntersectionHeuristic<R>,
+    B: IntersectionHeuristic<R>,
+{
+    #[inline]
+    fn outside_estimate(&self, left: StateId, right: &R::State) -> f64 {
+        self.a
+            .outside_estimate(left, right)
+            .min(self.b.outside_estimate(left, right))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ZeroHeuristic (baseline)
 // ---------------------------------------------------------------------------
 

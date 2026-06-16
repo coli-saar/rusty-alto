@@ -59,6 +59,7 @@ pub mod interner;
 pub mod irtg;
 pub mod materialize;
 pub mod memo;
+pub mod obligatory_leaf;
 pub mod run;
 pub mod score;
 pub mod set_trie;
@@ -80,7 +81,10 @@ pub use astar::{
 };
 pub use combinators::{Determinized, InvHom, Mapped, Product};
 pub use explicit::{Explicit, ExplicitBuildError, ExplicitBuilder, Rule};
-pub use heuristic::{IntersectionHeuristic, OutsideHeuristic, ScoredZeroHeuristic, ZeroHeuristic};
+pub use heuristic::{
+    IntersectionHeuristic, MinHeuristic, OutsideHeuristic, ScoredZeroHeuristic, ZeroHeuristic,
+};
+pub use obligatory_leaf::{ObligatoryLeafHeuristic, ObligatoryLeafTables};
 pub use homomorphism::{HomLabel, HomTerm, Homomorphism, HomomorphismError};
 pub use ids::{Arity, StateId, Symbol};
 pub use interner::Interner;
