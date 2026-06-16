@@ -377,6 +377,12 @@ pub struct AstarStats {
     /// Number of candidate edges discarded because their parent product state
     /// had already been finalized.
     pub finalized_candidate_discards: usize,
+    /// Number of candidate edges skipped at construction time because the
+    /// heuristic's sound filter (`admits`) proved the parent product hopeless
+    /// (zero outside weight). The F obligatory-leaf filter drives this; on the
+    /// span path the skip happens *before* the deterministic right transition,
+    /// so it also avoids the `right_step_calls` work for those edges.
+    pub f_filtered_candidates: usize,
     /// Number of product-aware span sibling queries issued.
     pub sibling_tuple_queries: usize,
     /// Number of exact sibling products returned by the span sibling finder.
@@ -451,6 +457,18 @@ fn lazy_frontier_enabled() -> bool {
     )
 }
 
+/// Whether the heuristic's sound `admits` filter is consulted at
+/// candidate-construction time to skip building hopeless edges (the F
+/// obligatory-leaf filter). Defaults to **on**; set `RUSTY_ALTO_F_FILTER=0`
+/// (or `false`) to disable for same-binary A/B measurement. Heuristics without
+/// a filter (`admits` defaults to `true`) are unaffected either way.
+fn candidate_filter_enabled() -> bool {
+    !matches!(
+        std::env::var("RUSTY_ALTO_F_FILTER").as_deref(),
+        Ok("0") | Ok("false")
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Core A* loop (shared between the two entry points)
 // ---------------------------------------------------------------------------
@@ -488,6 +506,9 @@ where
     matches_scratch: Vec<usize>,
     right_rule_ids_scratch: Vec<usize>,
     span_product_siblings_scratch: Vec<SpanProductSibling>,
+    /// Whether to consult the heuristic's sound `admits` filter when generating
+    /// candidate edges (see [`candidate_filter_enabled`]).
+    candidate_filter: bool,
     stats: AstarStats,
 }
 
@@ -535,6 +556,7 @@ where
             matches_scratch: Vec::new(),
             right_rule_ids_scratch: Vec::new(),
             span_product_siblings_scratch: Vec::new(),
+            candidate_filter: candidate_filter_enabled(),
             stats: AstarStats::default(),
         }
     }
@@ -671,6 +693,21 @@ where
         h: &H,
     ) {
         let inside = scorer.times(scorer.rule_score(weight), child_score);
+
+        // Sound construction-time filter: if the heuristic proves this parent
+        // product hopeless (zero outside weight), never build the edge — skip
+        // before product-id creation and the heap push. Uses the true resolved
+        // parent span, so it is exact. Covers every expansion path (generic,
+        // higher-arity fallback, unary, binary); the span path additionally
+        // filters earlier, before the deterministic right transition.
+        if self.candidate_filter {
+            let right_raw = self.right_interner.resolve(parent_right);
+            if !h.admits(parent_left, right_raw) {
+                self.stats.f_filtered_candidates += 1;
+                return;
+            }
+        }
+
         let (parent, _) = if self.builder.is_some() {
             self.get_or_create_product_id(parent_left, parent_right)
         } else {
@@ -882,6 +919,17 @@ where
                     let left_rule = &self.left_rules[rule_idx];
                     (left_rule.result, left_rule.symbol, left_rule.weight)
                 };
+
+                // A unary projection keeps the child span, so the parent span is
+                // `raw_trigger` (any edge terminals only widen it, which can only
+                // make the filter admit more — still sound). Filter before the
+                // deterministic right transition to skip its work for hopeless
+                // parents.
+                if self.candidate_filter && !h.admits(parent_left, &raw_trigger) {
+                    self.stats.f_filtered_candidates += 1;
+                    continue;
+                }
+
                 let children = [trigger_product];
 
                 let raw_children = [raw_trigger];
@@ -925,6 +973,10 @@ where
                 self.stats.sibling_tuples_returned += sibling_products.len();
 
                 for &sibling in &sibling_products {
+                    if position == 1 && sibling.product == trigger_product {
+                        continue;
+                    }
+
                     let (children, right_children) = match position {
                         0 => (
                             [trigger_product, sibling.product],
@@ -937,35 +989,68 @@ where
                         _ => unreachable!(),
                     };
 
-                    if position == 1 && sibling.product == trigger_product {
-                        continue;
-                    }
+                    // Predicted parent span = the concatenation of the child
+                    // spans (pos 0: [trigger.start, sibling.end]; pos 1:
+                    // [sibling.start, trigger.end]). For any monotone string
+                    // homomorphism the true span from `step_det` can only widen
+                    // this (edge terminals), and supply_left/supply_right are
+                    // monotone in the span boundary, so a predicted-span F prune
+                    // implies a true-span prune: the filter under-prunes and is
+                    // sound. Testing F here lets us skip the deterministic right
+                    // transition for hopeless parents.
+                    let raw_sibling = *self.right_interner.resolve(sibling.right_state);
+                    let predicted = match position {
+                        0 => Span::new(raw_trigger.start, raw_sibling.end),
+                        _ => Span::new(raw_sibling.start, raw_trigger.end),
+                    };
 
                     let child_score = scorer.times(
                         self.best_inside[children[0].index()],
                         self.best_inside[children[1].index()],
                     );
                     for symbol_group in &group.symbol_groups {
-                        // All left rules in this group share the same symbol
-                        // and left-child requirements, so one deterministic
-                        // right transition gives the parent state for all of
-                        // them.
-                        let Some(parent_right) =
-                            self.binary_right_parent_det(symbol_group.symbol, right_children)
-                        else {
-                            continue;
-                        };
+                        let symbol = symbol_group.symbol;
+                        // All left rules in this group share the same symbol and
+                        // left-child requirements, so one deterministic right
+                        // transition gives the parent state for all of them.
+                        // Compute it lazily — only once a rule survives the F
+                        // filter — so a group whose every parent is hopeless
+                        // never pays for the right transition.
+                        let mut parent_right: Option<StateId> = None;
                         for &rule_idx in &symbol_group.rule_indexes {
                             let left_rule = &self.left_rules[rule_idx];
-                            debug_assert_eq!(left_rule.symbol, symbol_group.symbol);
+                            let result = left_rule.result;
+                            let weight = left_rule.weight;
+                            debug_assert_eq!(left_rule.symbol, symbol);
                             debug_assert_eq!(left_rule.children[position], trigger_left);
                             debug_assert_eq!(left_rule.children[1 - position], group.sibling_left);
+
+                            if self.candidate_filter && !h.admits(result, &predicted) {
+                                self.stats.f_filtered_candidates += 1;
+                                continue;
+                            }
+
+                            let pr = match parent_right {
+                                Some(pr) => pr,
+                                None => match self.binary_right_parent_det(symbol, right_children) {
+                                    Some(pr) => {
+                                        parent_right = Some(pr);
+                                        pr
+                                    }
+                                    // No parent right-state for these spans (a
+                                    // non-concat homomorphism rejecting them);
+                                    // matches the old `step_det`-failure skip of
+                                    // the whole symbol group.
+                                    None => break,
+                                },
+                            };
+
                             self.stats.candidate_edges += 1;
                             self.push_candidate_with_child_score(
-                                left_rule.result,
-                                parent_right,
-                                symbol_group.symbol,
-                                left_rule.weight,
+                                result,
+                                pr,
+                                symbol,
+                                weight,
                                 &children,
                                 child_score,
                                 scorer,

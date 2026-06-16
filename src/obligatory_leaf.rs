@@ -284,24 +284,38 @@ impl ObligatoryLeafHeuristic<'_> {
             .map_or(0, |p| p.len() - p.partition_point(|&q| (q as usize) < end))
     }
 
+    /// `true` iff the grammar forces `left`'s completion to emit an obligatory
+    /// leaf that the input cannot supply on the required side of `span` — i.e.
+    /// the item has zero outside weight and is hopeless. This is the sound test
+    /// shared by [`Self::estimate`] (priority) and `admits` (construction-time
+    /// filter).
     #[inline]
-    fn estimate(&self, left: StateId, span: &Span) -> f64 {
+    fn prunes(&self, left: StateId, span: &Span) -> bool {
         let idx = left.index();
         if let Some(Some(req)) = self.tables.req_left.get(idx).map(|o| o.as_deref()) {
             for &(t, need) in req {
                 if self.supply_left(t, span.start) < need as usize {
-                    return self.prune;
+                    return true;
                 }
             }
         }
         if let Some(Some(req)) = self.tables.req_right.get(idx).map(|o| o.as_deref()) {
             for &(t, need) in req {
                 if self.supply_right(t, span.end) < need as usize {
-                    return self.prune;
+                    return true;
                 }
             }
         }
-        self.pass
+        false
+    }
+
+    #[inline]
+    fn estimate(&self, left: StateId, span: &Span) -> f64 {
+        if self.prunes(left, span) {
+            self.prune
+        } else {
+            self.pass
+        }
     }
 }
 
@@ -309,6 +323,11 @@ impl IntersectionHeuristic<StringDecompositionAutomaton> for ObligatoryLeafHeuri
     #[inline]
     fn outside_estimate(&self, left: StateId, span: &Span) -> f64 {
         self.estimate(left, span)
+    }
+
+    #[inline]
+    fn admits(&self, left: StateId, span: &Span) -> bool {
+        !self.prunes(left, span)
     }
 }
 
@@ -319,6 +338,11 @@ impl IntersectionHeuristic<InvHom<'_, StringDecompositionAutomaton>>
     fn outside_estimate(&self, left: StateId, span: &Span) -> f64 {
         // InvHom<StringDecompositionAutomaton>::State = Span.
         self.estimate(left, span)
+    }
+
+    #[inline]
+    fn admits(&self, left: StateId, span: &Span) -> bool {
+        !self.prunes(left, span)
     }
 }
 
@@ -392,6 +416,32 @@ mod tests {
             ),
             f64::NEG_INFINITY
         );
+    }
+
+    #[test]
+    fn admits_is_complement_of_prune() {
+        let (tables, _s, a, _b) = worked_example();
+        let h = tables.for_sentence(&[Symbol(10), Symbol(11)], &LogProbabilityScorer);
+        // `admits` must agree with the priority sentinel: admit iff not pruned.
+        for span in [Span::new(0, 1), Span::new(0, 2), Span::new(1, 2)] {
+            let est = IntersectionHeuristic::<StringDecompositionAutomaton>::outside_estimate(
+                &h, a, &span,
+            );
+            let admitted =
+                IntersectionHeuristic::<StringDecompositionAutomaton>::admits(&h, a, &span);
+            assert_eq!(admitted, est != f64::NEG_INFINITY, "span {span:?}");
+        }
+        // A over [0,1): `y` lies right -> admitted; over [0,2): gone -> rejected.
+        assert!(IntersectionHeuristic::<StringDecompositionAutomaton>::admits(
+            &h,
+            a,
+            &Span::new(0, 1)
+        ));
+        assert!(!IntersectionHeuristic::<StringDecompositionAutomaton>::admits(
+            &h,
+            a,
+            &Span::new(0, 2)
+        ));
     }
 
     #[test]

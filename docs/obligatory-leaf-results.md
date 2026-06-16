@@ -278,3 +278,147 @@ negligible 0.3 s grammar-only precompute. The headroom beyond this is in
 candidate generation, not finalization — to convert more of the 53% finalized-state
 cut into wall-clock, F would need to suppress candidate *enumeration* for pruned
 states, not just their expansion.
+
+## Profiling — why −53% finalized is only −18% wall-clock
+
+Sampled `astar-sxf` with macOS `sample` (1 ms, 40 s window) on a heavy workload
+(the 5 longest `sentences20` repeated; debuginfo via `CARGO_PROFILE_RELEASE_DEBUG=true`),
+33,318 leaf samples. Self-time buckets:
+
+| bucket                                              | self-time | scales with    |
+|-----------------------------------------------------|-----------|----------------|
+| invhom `eval_term_det` (per candidate)              | 18.7%     | candidates     |
+| sibling + product-id generation (per candidate)     | 16.9%     | candidates     |
+| decomp `step_det` (per candidate)                   | 7.7%      | candidates     |
+| astar loop + `push_candidate_with_child_score`      | 21.3%     | mostly cand.   |
+| heap ops (`heapify_*`)                              | 11.2%     | heap pushes    |
+| **F+SX heuristic eval (`MinHeuristic`)**            | **8.3%**  | items (F cost) |
+| `log()` scoring                                     | 5.5%      | candidates     |
+| mem/alloc                                           | 9.8%      | mixed          |
+
+**The diagnosis.** The run generates **1.17 B candidate edges** to finalize
+**36.7 M** states — a **~32:1** candidate-to-finalized ratio. Roughly **43% of
+self-time** is per-candidate-edge work (`eval_term_det` + sibling/product gen +
+`step_det`), plus most of the 21% astar-loop bucket (`push_candidate…` 8.8%) is
+also per-candidate. F's pruning happens at the *priority/finalization* level: a
+state F kills gets priority `−∞` so it is never popped — but its incoming
+candidates were **already enumerated and scored**, and candidate edges only fell
+**−3.9%** (228.7 M vs 237.8 M on `sentences20`). So the 53% finalized-state cut
+only trims the slices that scale with *finalized states / heap pushes* — heap ops
+(−8%) and `pop_next_finalized` (~1.9%) — a minority of total time.
+
+On top of that, F **adds** the `MinHeuristic` per-item cost (**8.3%** of runtime:
+the F supply `partition_point` lookups + `min` + dispatch), which partially
+offsets its own savings.
+
+Net: dominant cost (candidate enumeration, ~64% of self-time) is upstream of the
+pop/finalize step F prunes and is barely reduced ⇒ −53% finalized → −18% wall.
+
+**To capture more of the 53%:** move the F test *earlier*, gating product-state
+**activation** so a span F proves impossible never triggers its sibling-join
+candidate generation (the `eval_term_det` / `step_det` / product-id work). Used
+purely as an admissible A\* heuristic, F can only reorder/skip finalization, not
+prevent the candidate enumeration that dominates runtime.
+
+---
+
+# Step 4 — F as a candidate-enumeration filter (the Step-3 follow-through)
+
+**Verdict: it works, and it roughly doubles the win.** Consulting F as a **sound
+edge filter at candidate-construction time** (not just as an A\* priority) cuts
+`astar-sxf` total parse time to **−33% vs. the same binary with the filter off**
+and **−44% vs. `astar-sx`** (up from Step 3's −18%), while staying **bit-exact**:
+identical per-sentence Viterbi scores and `finalized_states` **unchanged at
+7,134,727** (= the Step-2 `min(SX,F)` prediction).
+
+## The idea (K&M 2003 / Pauls & Klein 2009)
+
+F is not merely an admissible bound — it is a **sound 0/1 filter**: when F prunes,
+the true outside weight is genuinely 0, so the item is in *no* parse. K&M 2003's F
+got its bite as exactly this — "a sophisticated lookahead condition on suffixes …
+dotted-rule edges committed to a rule's terminals" that **blocks edges** (80%→95%
+edges blocked), not a collapsed-grammar reparse. Coarse-to-fine (Pauls & Klein
+2009) is the same move: never *build* a fine edge a sound coarse model rules out.
+Step 3 used F only as a priority (`merit = inside·min(SX,F)`, prune ⇒ `−∞`), which
+skips *finalization* but leaves every candidate edge *into* an F-pruned parent fully
+enumerated and `step_det`-ed. Step 4 consults F **before** building the edge.
+
+## Implementation (exact; pure-SX path untouched)
+
+- `IntersectionHeuristic` grows a sound filter hook `fn admits(left, right) -> bool`
+  (default `true`, so SX / Outside / Zero impose no filtering). `MinHeuristic`
+  admits iff **both** admit; `ObligatoryLeafHeuristic::admits = !prunes` (the same
+  `req_left`/`req_right` vs. terminal-supply test, refactored out of `estimate`).
+- The A\* span fast path
+  (`expand_from_finalized_with_span_product_siblings`) tests `admits` on the
+  **predicted concat span** of the parent (pos 0: `[trigger.start, sibling.end]`;
+  pos 1: `[sibling.start, trigger.end]`) **before** the deterministic right
+  transition, and computes `binary_right_parent_det` (= `step_det`) **lazily** —
+  only once a rule survives F. A group whose every parent is hopeless never pays
+  for `step_det`/`eval_term_det`. The unary path filters on the trigger span.
+- A universal gate in `push_candidate_with_child_score` (true resolved span)
+  catches the generic / higher-arity fallback path, skipping product-id creation +
+  heap push for pruned parents.
+- Gated by `RUSTY_ALTO_F_FILTER` (default **on**; `=0` reproduces Step-3 behavior
+  exactly, used for the A/B below). New stat `f_filtered_candidates`.
+
+**Why it stays exact.** For any monotone string homomorphism the true parent span
+only *widens* the predicted span (edge terminals), and `supply_left`/`supply_right`
+are monotone in the span boundary, so the predicted-span test yields **supply ≥
+true supply**: it can only *under*-prune. Hence `predicted-prune ⟹ true-prune ⟹
+parent gets merit −∞ ⟹ never finalized`. No finalized parent ever loses an incoming
+edge, so Viterbi scores, backpointers, and the finalized set are untouched.
+Confirmed empirically: `astar-sxf` `finalized_states` is **identical** off vs. on,
+and `f_filtered (117,320,539) + candidate_edges (111,337,504) = 228,658,043` =
+exactly the filter-off candidate count — the filter removed *precisely* the
+F-pruned-parent edges and skipped each one's `step_det`.
+
+## A/B (`sentences20`, same binary, `RUSTY_ALTO_F_FILTER` off vs on)
+
+| metric                         | astar-sx     | sxf filter OFF | sxf filter ON | ON vs OFF |
+|--------------------------------|--------------|----------------|---------------|-----------|
+| total parse ms (median of 4)   | 31,708       | 26,848         | **17,899**    | **−33.3%**|
+| finalized states               | 15,294,558   | 7,134,727      | 7,134,727     | 0 (exact) |
+| candidate edges                | 237,845,007  | 228,658,043    | 111,337,504   | −51.3%    |
+| right_step_calls (`step_det`)  | 237,845,007  | 228,658,043    | 111,337,504   | −51.3%    |
+| heap pushes                    | 36,361,455   | 33,439,845     | 14,089,918    | −57.9%    |
+| f_filtered_candidates          | 0            | 0              | 117,320,539   | —         |
+| reopen_attempts                | 0            | 0              | 0             | 0         |
+
+Edge counts are deterministic (the robust evidence); wall-clock is the median of 4
+runs each (per-run ON/OFF ratio is a stable 0.64–0.70; machine noise ±12%). Total
+parse: **−43.6% vs. `astar-sx`** (Step 3's F-as-priority was −18.2%). The filter-off
+column matches Step 3 exactly (`heap_pushes` 33,439,845, `candidate_edges`
+228,658,043), so it is a faithful baseline.
+
+## Asymptotics
+
+No change to the complexity class — the win is the constant on candidate
+enumeration. The candidate-to-finalized ratio drops from **32:1** (228.7M / 7.13M)
+to **15.6:1** (111.3M / 7.13M): F halves the edges built and, because the span path
+tests F *before* `step_det`, halves `right_step_calls` with them — directly cutting
+the `eval_term_det` / `step_det` buckets (Step-3 profile: 18.7% + 7.7% of self-time)
+that scale with candidates. Step 3 cut candidate edges only −3.9% (F as priority);
+Step 4 cuts them −53.2% vs. `astar-sx`.
+
+## Reproduce
+
+```
+cargo build --release --bin ptb-eval
+# filter on (default) vs astar-sx — exactness + timing:
+./target/release/ptb-eval ~/Documents/workspace/alto/ptb/out.irtg \
+    ~/Documents/workspace/alto/ptb/sentences20.txt --strategies astar-sx,astar-sxf
+# same-binary A/B baseline (Step-3 behavior):
+RUSTY_ALTO_F_FILTER=0 ./target/release/ptb-eval ~/Documents/workspace/alto/ptb/out.irtg \
+    ~/Documents/workspace/alto/ptb/sentences20.txt --strategies astar-sxf
+```
+
+## Remaining headroom
+
+`f_filtered_candidates` (117.3M) is still *enumerated as sibling pairs* before being
+rejected — the filter skips `step_det`/product-id/heap, but not the sibling-pair
+iteration itself (`sibling_tuple_queries` fell only 104.6M→104.6M). The next lever
+is the **group-level** early-out: when the *fixed* boundary alone dooms every rule
+in a group (`req_left` at `trigger.start` for pos 0, `req_right` at `trigger.end`
+for pos 1), skip the whole sibling query. Also out of scope here: wiring the same
+`admits` filter into the lazy frontier path (`RUSTY_ALTO_LAZY_FRONTIER`).

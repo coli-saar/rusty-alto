@@ -57,6 +57,20 @@ pub trait IntersectionHeuristic<R: BottomUpTa> {
     /// Return an optimistic (admissible) upper bound in `(0, 1]` on the best
     /// outside weight of any completion around product state `(left, right)`.
     fn outside_estimate(&self, left: StateId, right: &R::State) -> f64;
+
+    /// Sound hard filter consulted at candidate-construction time: return
+    /// `false` iff `(left, right)` provably has **zero** outside weight (it can
+    /// appear in no valid completion), so the A* loop may skip building the edge
+    /// entirely rather than merely deprioritizing it.
+    ///
+    /// This must be sound — only return `false` when the true outside weight is
+    /// genuinely zero — but it need not be complete (returning `true` is always
+    /// safe). The default admits everything, so heuristics that are pure
+    /// admissible bounds (SX, Outside, Zero) impose no filtering.
+    #[inline]
+    fn admits(&self, _left: StateId, _right: &R::State) -> bool {
+        true
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -94,6 +108,13 @@ where
         self.a
             .outside_estimate(left, right)
             .min(self.b.outside_estimate(left, right))
+    }
+
+    /// An item is admitted only if **both** sub-heuristics admit it (either
+    /// proving zero outside weight suffices to drop the edge).
+    #[inline]
+    fn admits(&self, left: StateId, right: &R::State) -> bool {
+        self.a.admits(left, right) && self.b.admits(left, right)
     }
 }
 

@@ -82,6 +82,7 @@ struct Record {
     candidate_edges: usize,
     dominated_candidates: usize,
     finalized_candidate_discards: usize,
+    f_filtered_candidates: usize,
     sibling_tuple_queries: usize,
     sibling_tuples_returned: usize,
     right_step_calls: usize,
@@ -97,7 +98,7 @@ struct ParsedSentence {
 impl Record {
     fn print_csv(&self) {
         println!(
-            "{},{},{},{:.4},{:.4},{:.4},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{:.4},{:.4},{:.4},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             self.sentence_no,
             self.strategy.name(),
             if self.weight.is_nan() {
@@ -122,6 +123,7 @@ impl Record {
             self.candidate_edges,
             self.dominated_candidates,
             self.finalized_candidate_discards,
+            self.f_filtered_candidates,
             self.sibling_tuple_queries,
             self.sibling_tuples_returned,
             self.right_step_calls,
@@ -214,6 +216,7 @@ struct StrategyAccum {
     total_candidate_edges: usize,
     total_dominated_candidates: usize,
     total_finalized_candidate_discards: usize,
+    total_f_filtered_candidates: usize,
     total_sibling_tuple_queries: usize,
     total_sibling_tuples_returned: usize,
     total_right_step_calls: usize,
@@ -238,6 +241,7 @@ impl StrategyAccum {
         self.total_candidate_edges += r.candidate_edges;
         self.total_dominated_candidates += r.dominated_candidates;
         self.total_finalized_candidate_discards += r.finalized_candidate_discards;
+        self.total_f_filtered_candidates += r.f_filtered_candidates;
         self.total_sibling_tuple_queries += r.sibling_tuple_queries;
         self.total_sibling_tuples_returned += r.sibling_tuples_returned;
         self.total_right_step_calls += r.right_step_calls;
@@ -434,7 +438,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     // --- CSV header ---
     println!(
-        "sentence_no,strategy,score,parse_ms,top_ms,total_ms,finalized_states,output_rules,heap_pushes,heap_updates,pops,stale_pops,reopen_attempts,right_indexed_queries,right_rules_scanned,rotated_left_join_queries,left_rule_matches,candidate_edges,dominated_candidates,finalized_candidate_discards,sibling_tuple_queries,sibling_tuples_returned,right_step_calls,right_step_results,sibling_fallback_expansions"
+        "sentence_no,strategy,score,parse_ms,top_ms,total_ms,finalized_states,output_rules,heap_pushes,heap_updates,pops,stale_pops,reopen_attempts,right_indexed_queries,right_rules_scanned,rotated_left_join_queries,left_rule_matches,candidate_edges,dominated_candidates,finalized_candidate_discards,f_filtered_candidates,sibling_tuple_queries,sibling_tuples_returned,right_step_calls,right_step_results,sibling_fallback_expansions"
     );
 
     let mut accums: HashMap<Strategy, StrategyAccum> = HashMap::new();
@@ -504,6 +508,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 || accum.total_stale_pops > 0
                 || accum.total_dominated_candidates > 0
                 || accum.total_finalized_candidate_discards > 0
+                || accum.total_f_filtered_candidates > 0
                 || accum.total_sibling_tuple_queries > 0
                 || accum.total_sibling_tuples_returned > 0
                 || accum.total_right_step_calls > 0
@@ -511,7 +516,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 || accum.total_sibling_fallback_expansions > 0
             {
                 eprintln!(
-                    "{:<16} A* internals: right_queries={} right_rules={} left_joins={} left_matches={} candidates={} heap_updates={} stale_pops={} dominated={} finalized_discards={} sibling_queries={} sibling_tuples={} right_steps={} right_step_results={} sibling_fallbacks={}",
+                    "{:<16} A* internals: right_queries={} right_rules={} left_joins={} left_matches={} candidates={} heap_updates={} stale_pops={} dominated={} finalized_discards={} f_filtered={} sibling_queries={} sibling_tuples={} right_steps={} right_step_results={} sibling_fallbacks={}",
                     "",
                     accum.total_right_indexed_queries,
                     accum.total_right_rules_scanned,
@@ -522,6 +527,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     accum.total_stale_pops,
                     accum.total_dominated_candidates,
                     accum.total_finalized_candidate_discards,
+                    accum.total_f_filtered_candidates,
                     accum.total_sibling_tuple_queries,
                     accum.total_sibling_tuples_returned,
                     accum.total_right_step_calls,
@@ -816,6 +822,7 @@ fn run_chart_strategy(
                 candidate_edges: 0,
                 dominated_candidates: 0,
                 finalized_candidate_discards: 0,
+                f_filtered_candidates: 0,
                 sibling_tuple_queries: 0,
                 sibling_tuples_returned: 0,
                 right_step_calls: 0,
@@ -862,6 +869,7 @@ fn run_chart_strategy(
         candidate_edges: 0,
         dominated_candidates: 0,
         finalized_candidate_discards: 0,
+        f_filtered_candidates: 0,
         sibling_tuple_queries: 0,
         sibling_tuples_returned: 0,
         right_step_calls: 0,
@@ -957,6 +965,7 @@ fn run_astar_strategy(
         candidate_edges: stats.candidate_edges,
         dominated_candidates: stats.dominated_candidates,
         finalized_candidate_discards: stats.finalized_candidate_discards,
+        f_filtered_candidates: stats.f_filtered_candidates,
         sibling_tuple_queries: stats.sibling_tuple_queries,
         sibling_tuples_returned: stats.sibling_tuples_returned,
         right_step_calls: stats.right_step_calls,
