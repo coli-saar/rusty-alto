@@ -284,7 +284,24 @@ into within-expansion vs cross-expansion (and report
 Only then implement the gate. `src/bin/astar-join-replay.rs` is the isolation
 harness; `src/bin/ptb-eval.rs` is the end-to-end one.
 
-## N10: lazy candidate generation (attacks the survivor/heap ceiling)
+## N10: lazy candidate generation (attacks the survivor/heap ceiling) — **TRIED — GATED OFF**
+
+**Verdict.** Implemented (span/binary fast path, behind `RUSTY_ALTO_LAZY_FRONTIER`)
+and measured. Exact (all 20 PTB `sentences20` parses bit-identical, identical
+`finalized_states`, 0 reopens) and **lower memory** (2.79 GB vs 3.07 GB — the
+opposite of P5). The frontier behaves as designed: parent-agenda heap pushes
+0.54×, heap **updates 0.008×**, candidate edges pushed 0.30×. **But total
+wall-clock regresses ~1.25× (40.2 s vs 32.1 s)** even though the *median*
+per-sentence improves ~22%: short/medium sentences get faster, long ones regress
+(41-word sentence 1.70× slower). Root cause: the frontier must order candidates
+by exact merit, which has no static order in the sibling axis, so finding each
+generator's best still costs the full per-candidate `step_det`/`h` compute, and
+advancing to the next-best adds an `O(L)` rescan → `O(L²)` per drained generator.
+Heap traffic was not the wall-clock gate; the per-candidate merit compute is
+(same conclusion as P5). **Recommendation: keep gated off; full analysis in
+`docs/n10-lazy-frontier-results.md`.** Original proposal preserved below.
+
+---
 
 **Framing.** The agenda is already a decrease-key heap with ≤ one entry per
 *pending product* (`heap.update_or_push(parent.index(), merit)` +

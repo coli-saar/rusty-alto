@@ -128,27 +128,33 @@ impl SpanProductSiblingFinder {
         out: &mut Vec<SpanProductSibling>,
     ) {
         out.clear();
-        match position {
-            0 => {
-                if let Some(siblings) = self
-                    .right_seen_by_start
-                    .get(span.end)
-                    .and_then(|by_left| by_left.get(required_left.index()))
-                {
-                    out.extend_from_slice(siblings);
-                }
-            }
-            1 => {
-                if let Some(siblings) = self
-                    .left_seen_by_end
-                    .get(span.start)
-                    .and_then(|by_left| by_left.get(required_left.index()))
-                {
-                    out.extend_from_slice(siblings);
-                }
-            }
-            _ => {}
-        }
+        out.extend_from_slice(self.siblings_slice(span, position, required_left));
+    }
+
+    /// Borrow the active sibling products for `span` at `position`.
+    ///
+    /// The underlying per-`[boundary][left]` vectors are append-only, so a slice
+    /// length captured now stays valid for the same prefix later: the lazy A*
+    /// frontier records `snapshot_len` at generator creation and re-borrows the
+    /// stable prefix `[..snapshot_len]` on each rescan.
+    pub(crate) fn siblings_slice(
+        &self,
+        span: Span,
+        position: usize,
+        required_left: StateId,
+    ) -> &[SpanProductSibling] {
+        let slot = match position {
+            0 => self
+                .right_seen_by_start
+                .get(span.end)
+                .and_then(|by_left| by_left.get(required_left.index())),
+            1 => self
+                .left_seen_by_end
+                .get(span.start)
+                .and_then(|by_left| by_left.get(required_left.index())),
+            _ => None,
+        };
+        slot.map_or(&[], Vec::as_slice)
     }
 }
 

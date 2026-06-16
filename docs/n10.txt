@@ -1,0 +1,150 @@
+N10: Lazy candidate generation (span/binary fast path)
+
+ Context
+
+ docs/astar-performance-next-phase.md item N10 attacks the A* parser's
+ dominant remaining cost: the survivor/heap ceiling. Today, every time a product
+ state finalizes, expand_from_finalized* eagerly enumerates all
+ siblings × rules combinations, computes each one's inside/merit, resolves
+ its parent product id, and offers it to the per-product agenda. On PTB
+ sentences20 (astar-sx, one-best) this is tens of millions of candidate
+ computations and heap re-keys, against only ~5.6M finalized states — a ~10–20×
+ candidate:finalized ratio. P5 (the dense dominance gate) tried to make rejecting
+ those candidates cheaper and was reverted: it was time-neutral and ~10× more
+ memory. N10 instead avoids computing/offering the doomed candidates at all.
+
+ Idea (Pauls & Klein 2009, lazy A).* When a product finalizes, do not fan out
+ all its combinations. Generate combinations lazily, in non-increasing merit
+ order, so that — especially in one-best mode with stop_at_first_goal — low-merit
+ combinations are never realized and the parent agenda only ever sees candidates
+ that can still matter. The decrease-key parent agenda stays (the same parent
+ is reachable from many sites, so parent dedup is still needed); N10 adds a lazy
+ frontier of generators in front of it.
+
+ Scope (confirmed): span/binary deterministic fast path only
+ (R: CondensedTa<State=Span> + DetBottomUpTa<State=Span>), behind a flag, with
+ the existing eager path kept as the fallback for higher-arity/generic rules and
+ as the A/B baseline. Build the generator purpose-built; defer any
+ LazyBestMerge/SLI extraction until the prototype proves the win.
+
+ Key correctness insight
+
+ The eager code combines a finalizing product X with already-finalized
+ partners, so each combination (X,Y) is produced once — by whichever child
+ finalizes last (see first_trigger and the position==1 && sibling==trigger
+ guard in src/astar.rs:907). The lazy design flips the trigger:
+
+ - The earlier-finalized child is the trigger; its sibling stream grows with
+ later-finalized matches. Combination (X,Y) with X finalized first is owned
+ by X's generator and realized when Y feeds in. Y's own generator only accepts
+ siblings finalized after Y, so it never re-produces (X,Y). No double count.
+ - Later siblings have merit ≤ the trigger's finalize merit (merits are
+ non-increasing), and by consistency of the SX heuristic the combination merit
+ is ≤ min(merit_trigger, merit_sibling). So each generator's per-site stream,
+ keyed by exact combination merit, is an exact, admissible source: its current
+ max is a true upper bound on everything it can still emit.
+
+ Exactness of the interleave. Finalize a parent Z from the parent agenda only
+ when merit_a (best realized edge) ≥ merit_f (best frontier generator). Any
+ unrealized combination then has merit ≤ merit_a; since h(Z) is fixed per
+ parent, no unrealized edge for Z can have higher inside. So Z's current
+ realized edge is its optimal inside. Bit-identical to the eager baseline. Keep
+ the existing pop-side reopen guard (src/astar.rs:1023) for the known 1-ULP
+ float-tie re-pushes.
+
+ Data structures (new: src/astar/lazy_span.rs)
+
+ /// One combination site: the earlier-finalized trigger product, the child slot
+ /// it fills, and the rule group that fixes symbol + sibling-left requirement.
+ /// Allocated lazily on first matching sibling (empty sites cost nothing).
+ struct SpanGenerator {
+     trigger: StateId,        // product (earlier-finalized child)
+     trigger_inside: f64,
+     position: u8,            // 0 = trigger is left child; 1 = right child
+     group: GroupRef,         // -> sibling_left, symbol_groups, rule indexes
+     pending: BinaryHeap<SiteCandidate>,  // max-heap by exact combination merit
+ }
+
+ struct SiteCandidate { merit: f64, parent_left: StateId, parent_right: StateId,
+                        children: [StateId; 2], weight: f64, child_score: f64 }
+
+ pub(super) struct SpanLazyFrontier {
+     generators: Vec<SpanGenerator>,              // arena; id = index
+     frontier: QuaternaryHeapOfIndices<usize,f64>,// generator id -> -merit (lazy-dup)
+     // Routing (dual of SpanProductSiblingFinder), keyed [boundary][sibling_left]:
+     pos0_waiters: Vec<Vec<Vec<TriggerRef>>>, // triggers needing a RIGHT sibling at start=boundary
+     pos1_waiters: Vec<Vec<Vec<TriggerRef>>>, // triggers needing a LEFT  sibling at end=boundary
+ }
+
+ TriggerRef is a lightweight { trigger, trigger_inside, group } registered when
+ a product finalizes; the heavy SpanGenerator (with its pending heap) is
+ materialized only when the first sibling actually arrives. This keeps memory
+ proportional to active sites, not to all finalized products (the P5 lesson).
+
+ The waiter index has the same [boundary][left] shape as the existing
+ SpanProductSiblingFinder (src/algebras/string.rs:42) and replaces it on
+ the lazy path: under the earlier-triggers rule we never combine with
+ already-finalized partners, so the forward sibling lookup is no longer needed.
+
+ Integration (src/astar.rs)
+
+ 1. AstarOptions (src/astar.rs:323): add pub lazy_frontier: bool
+ (default false). Thread it through
+ materialize_astar_string_intersection_with_prepared /
+ materialize_astar_intersection_with_span_sibling.
+ 2. New loop run_with_lazy_span_frontier beside
+ run_with_span_product_sibling_finder (src/astar.rs:1085), selected when
+ lazy_frontier is set and the deterministic span bound holds. Each iteration:
+   - Peek merit_a = parent-agenda top, merit_f = frontier top (both stored as
+ -merit; verify QuaternaryHeapOfIndices::peek exists, else track tops).
+   - Parent agenda wins (merit_a ≥ merit_f, or frontier empty): finalize Z
+ via the existing pop_next_finalized body (minus the eager expand), run
+ on_finalize, stop if goal+stop_at_first_goal. Then (a) route Z as a
+ sibling into matching waiters — pos0_waiters[Z.start][Z.left] (Z is a right
+ child) and pos1_waiters[Z.end][Z.left] (Z is a left child) — materializing
+ each generator and pushing SiteCandidates (one per rule in the symbol
+ group, parent via binary_right_parent_det, src/astar.rs:799), updating
+ frontier keys; (b) register Z's own TriggerRefs from
+ SpanAstarLeftIndex::binary_groups (src/astar/span.rs) into the waiter
+ index; (c) handle Z's unary rules eagerly exactly as today
+ (src/astar.rs:846) — one push_candidate each, no siblings.
+   - Frontier wins: pop generator g, take its top SiteCandidate, feed it to
+ the existing push_candidate_with_child_score (src/astar.rs:629, keeps
+ parent dedup + decrease-key); advance g (re-insert with new top merit, or
+ drop if empty).
+   - Replicate the position==1 && sibling==trigger / first_trigger parity so
+ s(X,X)-style edges match the eager path exactly.
+ 3. Seeds unchanged (push_seed, src/astar.rs:951) — they enter the parent
+ agenda and bootstrap the first finalizations.
+ 4. Stats (AstarStats, src/astar.rs:335): add generators_created,
+ frontier_pops, site_candidates_pushed, candidates_realized to confirm
+ the realized-candidate count collapses toward finalized_states and to A/B
+ against eager candidate_edges/heap_pushes/heap_updates.
+
+ Verification
+
+ - Unit (src/astar/lazy_span.rs tests): small hand-built grammars; assert the
+ multiset of realized (parent, edge) and final best_inside equal the eager
+ path; cover s(X,X), ties, and a non-goal-reaching beam.
+ - Exactness gate (the bar from the doc): run src/bin/astar-join-replay.rs
+ (isolation) and src/bin/ptb-eval.rs (end-to-end) on sentences20 with
+ lazy_frontier off vs on; assert all 20 parse weights bit-identical and
+ finalized_states unchanged. reopen_attempts may stay at the known 192.
+ - Benchmark / decision gate: interleave on/off runs (machine noise is ±~12%,
+ per P5); record wall-clock, the new stats, and peak RSS (P5 died on
+ memory). Keep N10 only if it shows a real wall-clock win without a memory
+ regression. If the win only appears under stop_at_first_goal (expected) and
+ not full-chart, scope it to one-best.
+ - cargo test + cargo clippy clean.
+
+ Risks / notes
+
+ - Memory: generator arena + per-site heaps. Mitigated by lazy
+ materialization (TriggerRef until first sibling). Measure RSS explicitly.
+ - Peek/interleave: correctness hinges on the merit_a ≥ merit_f gate and on
+ skipping stale parent-agenda tops (existing pending[idx].take() logic).
+ - Full-chart mode: lazy still realizes everything eventually, so the win is
+ concentrated in one-best early-stop; acceptable since that is the benchmarked
+ workload.
+ - Per the doc, this is the largest/riskiest item — prototype behind the flag and
+ let the A/B + RSS numbers decide before removing the eager path.
