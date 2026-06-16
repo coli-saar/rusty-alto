@@ -594,6 +594,30 @@ where
     R: CondensedTa,
     R::State: Clone + Eq + Hash,
 {
+    let (explicit, right_interner, _pairs, stats) =
+        materialize_indexed_condensed_intersection_with_pairs(left, right);
+    (explicit, right_interner, stats)
+}
+
+/// Like [`materialize_indexed_condensed_intersection`], but also returns the
+/// `product_pairs` mapping: `pairs[s.index()] = (left_state, right_state)` for
+/// every output product state `s`, where `right_state` resolves through the
+/// returned interner. Used by analysis tooling (e.g. the F-heuristic probe) that
+/// needs to recover the `(grammar state, right state)` identity of each fine
+/// product state.
+pub fn materialize_indexed_condensed_intersection_with_pairs<R>(
+    left: &Explicit,
+    right: &R,
+) -> (
+    Explicit,
+    Interner<R::State>,
+    Vec<(StateId, StateId)>,
+    IndexedCondensedIntersectionStats,
+)
+where
+    R: CondensedTa,
+    R::State: Clone + Eq + Hash,
+{
     let left_rules: Vec<_> = left
         .rules()
         .map(|rule| OwnedRule {
@@ -700,7 +724,7 @@ where
     stats.output_states = product_pairs.len();
     let explicit = builder.build_trusted();
     stats.output_rules = explicit.rules().count();
-    (explicit, right_interner, stats)
+    (explicit, right_interner, product_pairs, stats)
 }
 
 /// Materialize the intersection using parent-indexed condensed right queries.

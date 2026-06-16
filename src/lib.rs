@@ -90,6 +90,7 @@ pub use irtg::{
 };
 pub use materialize::{
     IndexedCondensedIntersectionStats, materialize, materialize_indexed_condensed_intersection,
+    materialize_indexed_condensed_intersection_with_pairs,
     materialize_topdown_condensed_intersection,
 };
 pub use memo::{Memo, MemoStats};
