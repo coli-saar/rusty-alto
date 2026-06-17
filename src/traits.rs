@@ -58,11 +58,27 @@ pub trait DetBottomUpTa: BottomUpTa {
     /// `Some(q)`, then `step` should emit exactly `q`; if it returns `None`,
     /// then `step` should emit no states.
     fn step_det(&self, f: Symbol, children: &[Self::State]) -> Option<Self::State>;
+
+    /// Group key for symbols that share a transition function.
+    ///
+    /// Any two symbols returning the same `det_group` value must yield the same
+    /// [`step_det`](DetBottomUpTa::step_det) result for every child tuple. The
+    /// default puts each symbol in its own group (`f.0`), i.e. no sharing.
+    /// Condensed automata override this so a caller can compute one transition
+    /// per group and reuse it for every symbol in the group (e.g. `InvHom`, whose
+    /// transition depends only on the image term shared by a whole symbol set).
+    fn det_group(&self, f: Symbol) -> u32 {
+        f.0
+    }
 }
 
 impl<A: DetBottomUpTa + ?Sized> DetBottomUpTa for &A {
     fn step_det(&self, f: Symbol, children: &[Self::State]) -> Option<Self::State> {
         (**self).step_det(f, children)
+    }
+
+    fn det_group(&self, f: Symbol) -> u32 {
+        (**self).det_group(f)
     }
 }
 

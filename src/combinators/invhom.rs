@@ -121,6 +121,15 @@ impl<A: DetBottomUpTa> DetBottomUpTa for InvHom<'_, A> {
         let term = self.hom.get(f_src)?;
         eval_term_det(self.hom.arena(), term, children, &self.inner)
     }
+
+    /// Source symbols sharing an image term yield identical `step_det` results
+    /// for any given children, so the structurally-deduplicated term id groups
+    /// them: callers can compute one transition per group and reuse it for every
+    /// symbol in the set. Unmapped symbols (`step_det` is always `None`) map to a
+    /// sentinel group.
+    fn det_group(&self, f_src: Symbol) -> u32 {
+        self.hom.term_id(f_src).map_or(u32::MAX, |tid| tid as u32)
+    }
 }
 
 impl<A: StateUniverse> StateUniverse for InvHom<'_, A> {

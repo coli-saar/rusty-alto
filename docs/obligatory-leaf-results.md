@@ -422,3 +422,100 @@ is the **group-level** early-out: when the *fixed* boundary alone dooms every ru
 in a group (`req_left` at `trigger.start` for pos 0, `req_right` at `trigger.end`
 for pos 1), skip the whole sibling query. Also out of scope here: wiring the same
 `admits` filter into the lazy frontier path (`RUSTY_ALTO_LAZY_FRONTIER`).
+
+---
+
+# Step 5 — condensed lazy memo of the invhom step
+
+Follow-through on `docs/astar-candidate-gen-next-phase.md` Finding 1, but at the **right
+granularity**. The A* candidate path calls the right (invhom) transition once per built
+candidate — **111.3M** `step_det` calls on `sentences20` (`astar-sxf`; 237.8M for
+`astar-sx`). Almost all of that is redundant for two reasons:
+
+- **Cross-symbol.** The invhom is *condensed*: its transition depends only on the source
+  symbol's **image term**, shared by a whole symbol set. Every binary rule whose image is
+  `*(?0,?1)` gives the identical span transition. We were re-invoking `step_det` per left-
+  rule symbol instead of once per term.
+- **Both-endpoints.** A binary parent `P → X Y` is derived twice — once when `X` finalizes
+  (paired with `Y`) and once when `Y` finalizes — recomputing the *same* `(symbol, child
+  pair)`.
+
+> An earlier attempt at Finding 1 precomputed a per-symbol *interpretation* table to make
+> each `step_det` cheaper (kept all counts identical). It was the wrong target — identical
+> counts can't reduce work, and it bought only ~3% — and was reverted. The relaxed
+> invariant is what matters: only **the first goal item popped must keep its value**; every
+> upstream count is fair to shrink. Deduplicating an identical transition trivially
+> satisfies it.
+
+## What was implemented (algebra-independent core; condensed speedup behind a trait)
+
+- **`DetBottomUpTa::det_group(symbol) -> u32`** (`src/traits.rs`): a group key such that all
+  symbols with the same group yield the same `step_det` for any children. Default `= symbol`
+  (no sharing — every other automaton unaffected). `InvHom` overrides it to the
+  homomorphism's **term id** (`src/combinators/invhom.rs`), so a whole symbol set shares one
+  key. This matches the doc's "specific speedup behind a trait with a generic default."
+- **`right_parent_memoized`** (`src/astar.rs`): a per-parse memo
+  `(det_group(symbol), child0, child1) → Option<parent>` (sentinel second child for unary
+  rules), checked before `step_det`. Miss → evaluate + intern + store; hit → reuse. All
+  candidate-path transitions (binary `binary_right_parent_det`, the eager unary block, and
+  the lazy-frontier unary block) route through it.
+
+The memo is keyed by `(term, child-pair)`, so it holds only the **distinct** transitions —
+~56k entries, not one per call.
+
+## Exactness — confirmed (goal value preserved; here, all counts too)
+
+`ptb-eval out.irtg sentences20.txt --strategies astar-sx,astar-sxf`: Viterbi weights
+bit-identical, `astar-sxf` finalized states **7,134,727**, `astar-sx` **15,294,558** — both
+unchanged. `cargo test` green (133 lib tests). The memo only caches a deterministic
+transition, so search order and every downstream count are identical; only the *evaluation*
+count drops.
+
+## Invhom step evaluations — the headline
+
+| metric (`sentences20`)        | astar-sx     | astar-sxf    |
+|-------------------------------|--------------|--------------|
+| `right_steps` (requests)      | 237,845,007  | 111,337,504  |
+| **`right_step_evals` (actual)** | **56,583**   | **56,165**   |
+| `right_step_memo_hits`        | 237,788,424  | 111,281,339  |
+
+A **99.98% reduction** in actual `step_det` evaluations. Because the string algebra has
+essentially one binary term (concat), the per-call work collapses to one evaluation per
+distinct `(term, adjacent-span-pair)`, reused for every symbol and both-endpoints
+re-derivation.
+
+## Timing A/B (`astar-sxf`, baseline = HEAD `df139f0`, same machine, interleaved)
+
+Interleaved BASE/NEW per round so machine drift cancels:
+
+| round | BASE ms | NEW ms | delta   |
+|-------|---------|--------|---------|
+| 1     | 17,547  | 17,106 | −2.5%   |
+| 2     | 17,877  | 16,478 | −7.8%   |
+| 3     | 17,802  | 16,395 | −7.9%   |
+| 4     | 17,842  | 16,254 | −8.8%   |
+
+NEW faster in all 4 rounds, **≈ −8%** post-warmup. The wall-clock win is far smaller than
+the 99.98% eval cut because `step_det` for concat was already cheap, and we still do 111M
+memo *lookups* and still enumerate / push / dominance-gate every candidate. The memo proves
+the invhom step itself was a modest slice of total time.
+
+## Reproduce
+
+```
+cargo build --release --bin ptb-eval
+# exactness + the eval counters (right_step_evals on the A* internals line):
+./target/release/ptb-eval ~/Documents/workspace/alto/ptb/out.irtg \
+    ~/Documents/workspace/alto/ptb/sentences20.txt --strategies astar-sx,astar-sxf
+# interleaved A/B vs HEAD: build df139f0 via `git archive HEAD | tar -x -C <tmp>`
+# (no working-tree churn), then alternate BASE/NEW summing per-sentence parse_ms.
+```
+
+## Bottom line
+
+The invhom step is no longer a cost worth chasing (111.3M → 56k evals). The remaining
+wall-clock lives in the **candidate count itself** — the 111M enumerations and the 76M
+dominated re-derivations. The natural next lever reuses this same memo to short-circuit the
+*duplicate candidate push* (not just the transition) when a `(term, child-pair)` is seen
+again, attacking the both-endpoints churn directly; beyond that, the deferred early-
+dominance gate.

@@ -79,6 +79,11 @@ impl StateInterner<Span> for SpanInterner {
     }
 }
 
+/// Sentinel second-child key for unary rules in the right transition memo
+/// (`right_parent_memoized`). Real right child states are interned span ids,
+/// which never reach `u32::MAX` for realistic sentence lengths.
+const RIGHT_UNARY_SENTINEL: StateId = StateId(u32::MAX);
+
 pub struct PreparedAstarGrammar {
     left_rules: Vec<OwnedRule>,
     left_index: LeftIndex,
@@ -393,6 +398,14 @@ pub struct AstarStats {
     pub right_step_calls: usize,
     /// Number of right parent states returned by exact right-transition calls.
     pub right_step_results: usize,
+    /// Number of *actual* `step_det` evaluations performed (memo misses). With
+    /// the condensed transition memo this is far below `right_step_calls`,
+    /// because symbols sharing an image term and both-endpoints re-derivations of
+    /// the same child pair reuse one computation.
+    pub right_step_evals: usize,
+    /// Number of `right_step_calls` served from the condensed transition memo
+    /// (memo hits) instead of evaluating `step_det`.
+    pub right_step_memo_hits: usize,
     /// Number of finalized products expanded by the old set-trie path because
     /// at least one relevant left occurrence had arity greater than 2.
     pub sibling_fallback_expansions: usize,
@@ -509,6 +522,13 @@ where
     /// Whether to consult the heuristic's sound `admits` filter when generating
     /// candidate edges (see [`candidate_filter_enabled`]).
     candidate_filter: bool,
+    /// Lazy memo of the right (invhom) transition, keyed by
+    /// `(det_group(symbol), child0, child1)` with a sentinel second child for
+    /// unary rules. Because the condensed right automaton's transition depends
+    /// only on the symbol's group (its image term) and the child states, every
+    /// symbol in a group and both-endpoints re-derivations of the same child
+    /// pair reuse one `step_det`. Cleared per parse with the rest of the context.
+    right_step_memo: FxHashMap<(u32, StateId, StateId), Option<StateId>>,
     stats: AstarStats,
 }
 
@@ -557,6 +577,7 @@ where
             right_rule_ids_scratch: Vec::new(),
             span_product_siblings_scratch: Vec::new(),
             candidate_filter: candidate_filter_enabled(),
+            right_step_memo: FxHashMap::default(),
             stats: AstarStats::default(),
         }
     }
@@ -874,14 +895,57 @@ where
     where
         R: CondensedTa<State = Span> + DetBottomUpTa<State = Span>,
     {
-        let raw_right_children = [
-            *self.right_interner.resolve(right_children[0]),
-            *self.right_interner.resolve(right_children[1]),
-        ];
+        self.right_parent_memoized(symbol, &right_children)
+    }
+
+    /// Memoized right (invhom) transition for a unary or binary span rule.
+    ///
+    /// `right_children` is the one or two interned right child states. The result
+    /// is the interned parent right state, or `None` if no transition exists.
+    ///
+    /// The condensed right automaton's transition depends only on the symbol's
+    /// *group* ([`DetBottomUpTa::det_group`] — for `InvHom` the image term shared
+    /// by a whole symbol set) and the child states. So a single `step_det` is
+    /// computed per `(group, children)` and reused for every symbol in the group
+    /// and for both-endpoints re-derivations of the same child pair; the rest are
+    /// memo hits. This is exact: a hit returns the identical parent, so no item's
+    /// best score — and hence the first goal popped — can change.
+    fn right_parent_memoized(
+        &mut self,
+        symbol: Symbol,
+        right_children: &[StateId],
+    ) -> Option<StateId>
+    where
+        R: DetBottomUpTa<State = Span>,
+    {
         self.stats.right_step_calls += 1;
-        let parent = self.right.step_det(symbol, &raw_right_children)?;
-        self.stats.right_step_results += 1;
-        Some(RightStateInterner::intern(&mut self.right_interner, parent))
+        let (c0, c1) = match *right_children {
+            [c0] => (c0, RIGHT_UNARY_SENTINEL),
+            [c0, c1] => (c0, c1),
+            _ => unreachable!("span-path right rules are unary or binary"),
+        };
+        let key = (self.right.det_group(symbol), c0, c1);
+        if let Some(&cached) = self.right_step_memo.get(&key) {
+            self.stats.right_step_memo_hits += 1;
+            if cached.is_some() {
+                self.stats.right_step_results += 1;
+            }
+            return cached;
+        }
+
+        self.stats.right_step_evals += 1;
+        let mut raw = SmallVec::<[Span; 2]>::new();
+        for &child in right_children {
+            raw.push(*self.right_interner.resolve(child));
+        }
+        let parent = self.right.step_det(symbol, &raw);
+        let interned =
+            parent.map(|parent| RightStateInterner::intern(&mut self.right_interner, parent));
+        self.right_step_memo.insert(key, interned);
+        if interned.is_some() {
+            self.stats.right_step_results += 1;
+        }
+        interned
     }
 
     fn expand_from_finalized_with_span_product_siblings<
@@ -932,13 +996,9 @@ where
 
                 let children = [trigger_product];
 
-                let raw_children = [raw_trigger];
-                self.stats.right_step_calls += 1;
-                let Some(parent) = self.right.step_det(symbol, &raw_children) else {
+                let Some(parent_right) = self.right_parent_memoized(symbol, &[trigger_right]) else {
                     continue;
                 };
-                self.stats.right_step_results += 1;
-                let parent_right = RightStateInterner::intern(&mut self.right_interner, parent);
                 self.stats.candidate_edges += 1;
                 self.push_candidate_with_child_score(
                     parent_left,
@@ -1533,7 +1593,14 @@ where
                     scorer,
                     h,
                 );
-                self.lazy_expand_unary(item.product, item.left_state, span, span_left_index, scorer, h);
+                self.lazy_expand_unary(
+                    item.product,
+                    item.left_state,
+                    item.right_state,
+                    span_left_index,
+                    scorer,
+                    h,
+                );
             } else {
                 let Some(id) = frontier.frontier.pop() else {
                     continue;
@@ -1556,7 +1623,7 @@ where
         &mut self,
         product: StateId,
         left_state: StateId,
-        raw_trigger: Span,
+        right_state: StateId,
         span_left_index: &SpanAstarLeftIndex,
         scorer: &S,
         h: &H,
@@ -1571,13 +1638,9 @@ where
                 let rule = &self.left_rules[rule_idx];
                 (rule.result, rule.symbol, rule.weight)
             };
-            let raw_children = [raw_trigger];
-            self.stats.right_step_calls += 1;
-            let Some(parent) = self.right.step_det(symbol, &raw_children) else {
+            let Some(parent_right) = self.right_parent_memoized(symbol, &[right_state]) else {
                 continue;
             };
-            self.stats.right_step_results += 1;
-            let parent_right = RightStateInterner::intern(&mut self.right_interner, parent);
             self.stats.candidate_edges += 1;
             self.push_candidate_with_child_score(
                 parent_left,
