@@ -25,7 +25,7 @@
 
 use super::AstarAgenda;
 use crate::StateId;
-use crate::algebras::SpanProductSiblingFinder;
+use crate::algebras::{SpanAstarLeftIndex, SpanProductSiblingFinder};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
@@ -84,8 +84,8 @@ pub(super) struct SpanGenerator {
 
 /// Owns the shared sibling index, the generator arena, and the frontier heap.
 ///
-/// Lives for the duration of one lazy A* run (one per `run_with_lazy_span_frontier`
-/// invocation), alongside the existing per-product agenda in [`super::AstarContext`].
+/// Lives for the duration of one lazy candidate-source run, alongside the
+/// existing per-product agenda in [`super::AstarContext`].
 #[derive(Default)]
 pub(super) struct SpanLazyFrontier {
     /// Shared per-`[boundary][left]` index of finalized products, reused exactly
@@ -101,5 +101,21 @@ pub(super) struct SpanLazyFrontier {
 impl SpanLazyFrontier {
     pub(super) fn new() -> Self {
         Self::default()
+    }
+}
+
+/// Explicit experimental candidate source used only by lazy-frontier
+/// equivalence tests and benchmark entry points.
+pub(super) struct LazyStringAstarSource<'a> {
+    pub(super) left_index: &'a SpanAstarLeftIndex,
+    pub(super) frontier: SpanLazyFrontier,
+}
+
+impl<'a> LazyStringAstarSource<'a> {
+    pub(super) fn new(left_index: &'a SpanAstarLeftIndex) -> Self {
+        Self {
+            left_index,
+            frontier: SpanLazyFrontier::new(),
+        }
     }
 }

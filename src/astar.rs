@@ -11,6 +11,7 @@
 mod agenda;
 mod generic_source;
 mod lazy_span;
+mod product_state;
 
 use crate::{
     BottomUpTa, CondensedTa, DetBottomUpTa, Explicit, ExplicitBuilder, FxHashMap, Interner, InvHom,
@@ -32,9 +33,12 @@ use rusty_tree::tree::TreeArena;
 use smallvec::SmallVec;
 use std::hash::Hash;
 
-use lazy_span::{SiblingEntry, SpanGenerator, SpanLazyFrontier};
 use agenda::{AgendaUpdate, AstarAgenda};
 use generic_source::{ChildStateRightRuleIndex, GenericCandidateSource, PartnerSet};
+use lazy_span::{
+    LazyStringAstarSource, SiblingEntry, SpanGenerator, SpanLazyFrontier,
+};
+use product_state::{AgendaItem, FinalizedItem, PendingEdge};
 
 trait RightStateInterner<T> {
     fn intern(&mut self, state: T) -> StateId;
@@ -123,32 +127,6 @@ impl PreparedAstarGrammar {
         );
     }
 }
-// ---------------------------------------------------------------------------
-// Agenda item
-// ---------------------------------------------------------------------------
-
-/// The edge information stored with an agenda item.
-struct PendingEdge {
-    rule_index: u32,
-    children: SmallVec<[StateId; 2]>,
-}
-
-/// The payload for a pending item on the A* agenda. The heap itself stores only
-/// the product-state index and the priority key.
-struct AgendaItem {
-    edge: PendingEdge,
-}
-
-struct FinalizedItem {
-    product: StateId,
-    edge: PendingEdge,
-    inside: f64,
-    merit: f64,
-    left_state: StateId,
-    right_state: StateId,
-    is_goal: bool,
-}
-
 /// Candidate generation boundary for the eager A* search.
 ///
 /// The core owns scoring, filtering, dominance, agenda operations,
@@ -167,6 +145,15 @@ where
         S: WeightScorer,
     {
         ctx.seed_nullary_edges(h, scorer);
+    }
+
+    /// Realize enough deferred work for the product agenda's maximum to be
+    /// globally safe to finalize. Eager sources have no deferred work.
+    fn prepare_next<H, S>(&mut self, _ctx: &mut AstarContext<'_, R, I>, _h: &H, _scorer: &S)
+    where
+        H: IntersectionHeuristic<R>,
+        S: WeightScorer,
+    {
     }
 
     fn activate(&mut self, ctx: &mut AstarContext<'_, R, I>, item: &FinalizedItem);
@@ -210,11 +197,8 @@ pub struct AstarStats {
     pub max_heap_len: usize,
     /// Maximum size of the agenda's product-position table.
     pub max_heap_position_capacity: usize,
-    /// Number of items popped from the heap (including re-opens that are skipped).
+    /// Number of items popped from the heap.
     pub pops: usize,
-    /// Number of popped heap items discarded because a better version for the
-    /// same product state was pushed later.
-    pub stale_pops: usize,
     /// Number of distinct product states finalized.
     pub finalized_states: usize,
     /// Number of product expansions, including re-expansions after reopening.
@@ -1113,7 +1097,11 @@ where
         OnFin: FnMut(&mut Self, StateId, &PendingEdge, f64, f64),
     {
         source.seed(self, h, scorer);
-        while let Some(item) = self.pop_next_finalized() {
+        loop {
+            source.prepare_next(self, h, scorer);
+            let Some(item) = self.pop_next_finalized() else {
+                break;
+            };
             source.activate(self, &item);
             on_finalize(self, item.product, &item.edge, item.inside, item.merit);
 
@@ -1359,89 +1347,6 @@ where
         frontier.generators[id].pending.peek().map(|e| e.merit)
     }
 
-    /// Lazy-frontier variant of [`Self::run_with_span_product_sibling_finder`].
-    ///
-    /// Interleaves, by merit, finalizing products off the parent agenda against
-    /// lazily generating binary candidates off the frontier. A product is
-    /// finalized only when its best realized edge dominates every generator's
-    /// best unrealized candidate, so the result is bit-identical to eager.
-    fn run_with_lazy_span_frontier<H, S, OnFin>(
-        &mut self,
-        h: &H,
-        scorer: &S,
-        span_left_index: &SpanAstarLeftIndex,
-        stop_at_first_goal: bool,
-        mut on_finalize: OnFin,
-    ) where
-        R: CondensedTa<State = Span> + DetBottomUpTa<State = Span>,
-        H: IntersectionHeuristic<R>,
-        S: WeightScorer,
-        OnFin: FnMut(&mut Self, StateId, &PendingEdge, f64, f64),
-    {
-        let mut frontier = SpanLazyFrontier::new();
-
-        loop {
-            let merit_a = self.heap.peek_merit();
-            let merit_f = frontier.frontier.peek_merit();
-            let take_parent = match (merit_a, merit_f) {
-                (None, None) => break,
-                (Some(_), None) => true,
-                (None, Some(_)) => false,
-                (Some(a), Some(f)) => a >= f,
-            };
-
-            if take_parent {
-                let Some(item) = self.pop_next_finalized() else {
-                    continue;
-                };
-                let span = *self.right_interner.resolve(item.right_state);
-                // Record the finalized product as an available sibling before
-                // expanding, matching the eager path's activate-then-expand order.
-                span_left_index.activate_product(
-                    &mut frontier.finder,
-                    item.product,
-                    item.left_state,
-                    item.right_state,
-                    span,
-                );
-
-                on_finalize(self, item.product, &item.edge, item.inside, item.merit);
-                if item.is_goal && stop_at_first_goal {
-                    break;
-                }
-
-                self.lazy_spawn_generators(
-                    &mut frontier,
-                    item.product,
-                    item.left_state,
-                    item.right_state,
-                    span,
-                    span_left_index,
-                    scorer,
-                    h,
-                );
-                self.lazy_expand_unary(
-                    item.product,
-                    item.left_state,
-                    item.right_state,
-                    span_left_index,
-                    scorer,
-                    h,
-                );
-            } else {
-                let Some((id, _)) = frontier.frontier.pop() else {
-                    continue;
-                };
-                self.stats.frontier_pops += 1;
-                if let Some(next_merit) =
-                    self.lazy_realize_generator(&mut frontier, id, span_left_index, scorer, h)
-                {
-                    frontier.frontier.update_or_push(id, next_merit);
-                }
-            }
-        }
-    }
-
     /// Expand the unary rules of a finalized product directly onto the parent
     /// agenda (unary edges have no sibling, so they never enter the frontier).
     /// Mirrors the unary block of
@@ -1554,6 +1459,97 @@ where
             self.fallback_rules,
             h,
             scorer,
+        );
+    }
+}
+
+impl<'source, R> CandidateSource<R, SpanInterner> for LazyStringAstarSource<'source>
+where
+    R: CondensedTa<State = Span> + DetBottomUpTa<State = Span>,
+{
+    fn prepare_next<H, S>(
+        &mut self,
+        ctx: &mut AstarContext<'_, R, SpanInterner>,
+        h: &H,
+        scorer: &S,
+    ) where
+        H: IntersectionHeuristic<R>,
+        S: WeightScorer,
+    {
+        loop {
+            let realize_frontier = match (
+                ctx.heap.peek_merit(),
+                self.frontier.frontier.peek_merit(),
+            ) {
+                (_, None) => false,
+                (None, Some(_)) => true,
+                (Some(agenda), Some(frontier)) => frontier > agenda,
+            };
+            if !realize_frontier {
+                break;
+            }
+
+            let (id, _) = self
+                .frontier
+                .frontier
+                .pop()
+                .expect("peeked lazy frontier entry must still be present");
+            ctx.stats.frontier_pops += 1;
+            if let Some(next_merit) = ctx.lazy_realize_generator(
+                &mut self.frontier,
+                id,
+                self.left_index,
+                scorer,
+                h,
+            ) {
+                self.frontier.frontier.update_or_push(id, next_merit);
+            }
+        }
+    }
+
+    fn activate(
+        &mut self,
+        ctx: &mut AstarContext<'_, R, SpanInterner>,
+        item: &FinalizedItem,
+    ) {
+        let span = *ctx.right_interner.resolve(item.right_state);
+        self.left_index.activate_product(
+            &mut self.frontier.finder,
+            item.product,
+            item.left_state,
+            item.right_state,
+            span,
+        );
+    }
+
+    fn enumerate<H, S>(
+        &mut self,
+        ctx: &mut AstarContext<'_, R, SpanInterner>,
+        item: &FinalizedItem,
+        h: &H,
+        scorer: &S,
+    ) where
+        H: IntersectionHeuristic<R>,
+        S: WeightScorer,
+    {
+        let span = *ctx.right_interner.resolve(item.right_state);
+        ctx.lazy_spawn_generators(
+            &mut self.frontier,
+            item.product,
+            item.left_state,
+            item.right_state,
+            span,
+            self.left_index,
+            scorer,
+            h,
+        );
+        ctx.lazy_expand_unary(
+            item.product,
+            item.left_state,
+            item.right_state,
+            self.left_index,
+            scorer,
+            h,
         );
     }
 }
@@ -1751,11 +1747,11 @@ where
         && fallback_rules.is_none_or(|fallback| fallback.ones().next().is_none())
         && !prepared.span_left_index.has_any_higher_arity();
     if use_lazy {
-        ctx.seed_nullary_edges(h, scorer);
-        ctx.run_with_lazy_span_frontier(
+        let mut source = LazyStringAstarSource::new(&prepared.span_left_index);
+        ctx.run_with_source(
+            &mut source,
             h,
             scorer,
-            &prepared.span_left_index,
             stop_at_first_goal,
             on_finalize,
         );
@@ -1952,6 +1948,47 @@ where
     )
 }
 
+/// Run the experimental lazy string frontier for controlled benchmarks.
+///
+/// This is deliberately separate from the production entry point: it accepts
+/// only grammars whose rules are all handled by the binary string
+/// specialization and never selects itself through an environment variable or
+/// runtime heuristic.
+#[doc(hidden)]
+pub fn astar_string_one_best_lazy_benchmark_with_stats_prepared<'h, H, S>(
+    left: &Explicit,
+    prepared: &PreparedAstarGrammar,
+    right: &InvHom<'h, StringDecompositionAutomaton>,
+    h: &H,
+    scorer: &S,
+) -> (Option<ViterbiTree>, AstarStats)
+where
+    H: IntersectionHeuristic<InvHom<'h, StringDecompositionAutomaton>>,
+    S: WeightScorer,
+{
+    prepared.assert_matches(left);
+    let fallback_rules = string_fallback_rules(
+        &prepared.left_rules,
+        right.homomorphism(),
+        right.inner().concat_symbol(),
+    );
+    assert!(
+        fallback_rules.ones().next().is_none()
+            && !prepared.span_left_index.has_any_higher_arity(),
+        "lazy A* benchmark supports only specialized nullary, unary-identity, and binary-concat rules"
+    );
+    astar_one_best_with_stats_and_span_sibling(
+        left,
+        prepared,
+        right,
+        h,
+        scorer,
+        right.inner().len(),
+        None,
+        true,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn astar_one_best_with_stats_and_span_sibling<R, H, S>(
     left: &Explicit,
@@ -2005,8 +2042,8 @@ where
         && fallback_rules.is_none_or(|fallback| fallback.ones().next().is_none())
         && !prepared.span_left_index.has_any_higher_arity();
     if use_lazy {
-        ctx.seed_nullary_edges(h, scorer);
-        ctx.run_with_lazy_span_frontier(h, scorer, &prepared.span_left_index, true, on_finalize);
+        let mut source = LazyStringAstarSource::new(&prepared.span_left_index);
+        ctx.run_with_source(&mut source, h, scorer, true, on_finalize);
     } else {
         let mut source = StringAstarSource::new(&prepared.span_left_index, fallback_rules);
         ctx.run_with_source(
@@ -2545,27 +2582,22 @@ mod tests {
         let right = InvHom::new(StringDecompositionAutomaton::new(concat, sentence), &hom);
         let h = ZeroHeuristic;
         let prepared = PreparedAstarGrammar::new(&grammar);
-        let n = right.inner().len();
-
         let (eager, eager_stats) = astar_one_best_with_stats_and_span_sibling(
             &grammar,
             &prepared,
             &right,
             &h,
             &ProbabilityScorer,
-            n,
+            right.inner().len(),
             None,
             false,
         );
-        let (lazy, lazy_stats) = astar_one_best_with_stats_and_span_sibling(
+        let (lazy, lazy_stats) = astar_string_one_best_lazy_benchmark_with_stats_prepared(
             &grammar,
             &prepared,
             &right,
             &h,
             &ProbabilityScorer,
-            n,
-            None,
-            true,
         );
 
         let eager = eager.expect("eager span A* should find a tree");

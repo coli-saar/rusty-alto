@@ -73,7 +73,6 @@ struct Record {
     heap_pushes: usize,
     heap_updates: usize,
     pops: usize,
-    stale_pops: usize,
     reopen_attempts: usize,
     right_indexed_queries: usize,
     right_rules_scanned: usize,
@@ -100,7 +99,7 @@ struct ParsedSentence {
 impl Record {
     fn print_csv(&self) {
         println!(
-            "{},{},{},{:.4},{:.4},{:.4},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{:.4},{:.4},{:.4},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             self.sentence_no,
             self.strategy.name(),
             if self.weight.is_nan() {
@@ -116,7 +115,6 @@ impl Record {
             self.heap_pushes,
             self.heap_updates,
             self.pops,
-            self.stale_pops,
             self.reopen_attempts,
             self.right_indexed_queries,
             self.right_rules_scanned,
@@ -209,7 +207,6 @@ struct StrategyAccum {
     total_heap_pushes: usize,
     total_heap_updates: usize,
     total_pops: usize,
-    total_stale_pops: usize,
     total_reopen_attempts: usize,
     total_right_indexed_queries: usize,
     total_right_rules_scanned: usize,
@@ -236,7 +233,6 @@ impl StrategyAccum {
         self.total_heap_pushes += r.heap_pushes;
         self.total_heap_updates += r.heap_updates;
         self.total_pops += r.pops;
-        self.total_stale_pops += r.stale_pops;
         self.total_reopen_attempts += r.reopen_attempts;
         self.total_right_indexed_queries += r.right_indexed_queries;
         self.total_right_rules_scanned += r.right_rules_scanned;
@@ -440,7 +436,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     // --- CSV header ---
     println!(
-        "sentence_no,strategy,score,parse_ms,top_ms,total_ms,finalized_states,output_rules,heap_pushes,heap_updates,pops,stale_pops,reopen_attempts,right_indexed_queries,right_rules_scanned,rotated_left_join_queries,left_rule_matches,candidate_edges,dominated_candidates,finalized_candidate_discards,f_filtered_candidates,sibling_tuple_queries,sibling_tuples_returned,right_step_calls,right_step_results,sibling_fallback_expansions"
+        "sentence_no,strategy,score,parse_ms,top_ms,total_ms,finalized_states,output_rules,heap_pushes,heap_updates,pops,reopen_attempts,right_indexed_queries,right_rules_scanned,rotated_left_join_queries,left_rule_matches,candidate_edges,dominated_candidates,finalized_candidate_discards,f_filtered_candidates,sibling_tuple_queries,sibling_tuples_returned,right_step_calls,right_step_results,sibling_fallback_expansions"
     );
 
     let mut accums: HashMap<Strategy, StrategyAccum> = HashMap::new();
@@ -507,7 +503,6 @@ fn run() -> Result<(), Box<dyn Error>> {
                 || accum.total_left_rule_matches > 0
                 || accum.total_candidate_edges > 0
                 || accum.total_heap_updates > 0
-                || accum.total_stale_pops > 0
                 || accum.total_dominated_candidates > 0
                 || accum.total_finalized_candidate_discards > 0
                 || accum.total_f_filtered_candidates > 0
@@ -518,7 +513,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 || accum.total_sibling_fallback_expansions > 0
             {
                 eprintln!(
-                    "{:<16} A* internals: right_queries={} right_rules={} left_joins={} left_matches={} candidates={} heap_updates={} stale_pops={} dominated={} finalized_discards={} f_filtered={} sibling_queries={} sibling_tuples={} right_steps={} right_step_evals={} right_step_memo_hits={} right_step_results={} sibling_fallbacks={}",
+                    "{:<16} A* internals: right_queries={} right_rules={} left_joins={} left_matches={} candidates={} heap_updates={} dominated={} finalized_discards={} f_filtered={} sibling_queries={} sibling_tuples={} right_steps={} right_step_evals={} right_step_memo_hits={} right_step_results={} sibling_fallbacks={}",
                     "",
                     accum.total_right_indexed_queries,
                     accum.total_right_rules_scanned,
@@ -526,7 +521,6 @@ fn run() -> Result<(), Box<dyn Error>> {
                     accum.total_left_rule_matches,
                     accum.total_candidate_edges,
                     accum.total_heap_updates,
-                    accum.total_stale_pops,
                     accum.total_dominated_candidates,
                     accum.total_finalized_candidate_discards,
                     accum.total_f_filtered_candidates,
@@ -817,7 +811,6 @@ fn run_chart_strategy(
                 heap_pushes: 0,
                 heap_updates: 0,
                 pops: 0,
-                stale_pops: 0,
                 reopen_attempts: 0,
                 right_indexed_queries: 0,
                 right_rules_scanned: 0,
@@ -866,7 +859,6 @@ fn run_chart_strategy(
         heap_pushes: 0,
         heap_updates: 0,
         pops: 0,
-        stale_pops: 0,
         reopen_attempts: 0,
         right_indexed_queries: 0,
         right_rules_scanned: 0,
@@ -965,7 +957,6 @@ fn run_astar_strategy(
         heap_pushes: stats.heap_pushes,
         heap_updates: stats.heap_updates,
         pops: stats.pops,
-        stale_pops: stats.stale_pops,
         reopen_attempts: stats.reopen_attempts,
         right_indexed_queries: stats.right_indexed_queries,
         right_rules_scanned: stats.right_rules_scanned,

@@ -78,7 +78,8 @@ pub use algebras::{
 pub use alto::{AltoParseError, ParsedTreeAutomaton, parse_alto, parse_alto_with_signature};
 pub use astar::{
     AstarOptions, AstarStats, PreparedAstarGrammar, astar_one_best, astar_one_best_with,
-    astar_one_best_with_stats, astar_string_one_best_with_stats_prepared,
+    astar_one_best_with_stats, astar_string_one_best_lazy_benchmark_with_stats_prepared,
+    astar_string_one_best_with_stats_prepared,
     materialize_astar_intersection, materialize_astar_intersection_with,
     materialize_astar_viterbi_forest, materialize_astar_viterbi_forest_with,
     materialize_astar_string_intersection_with_prepared,
