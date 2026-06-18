@@ -5,16 +5,21 @@
 //!   eval <grammar.irtg> <corpus|-> [-o out.corpus] [--limit N]
 //!        [--algorithm exhaustive|astar] [--heuristic zero|outside|sx|sxf]
 //!        [--times times.csv] [--input INTERP]
+//!        [--parseval INTERP] [--parseval-output FILE] [--evalb-param FILE]
 
 use rusty_alto::{
-    AstarHeuristic, AstarOptions, CorpusWriter, LogProbabilityScorer, MaterializationStrategy,
-    ObligatoryLeafTables, OutsideHeuristic, Symbol, UniversalSxHeuristic, parse_irtg, read_corpus,
+    AstarHeuristic, AstarOptions, Binarizing, CorpusWriter, EvalbParams, Irtg,
+    LogProbabilityScorer, MaterializationStrategy, ObligatoryLeafTables, OutsideHeuristic,
+    ParsevalCounts, ParsevalSkip, Symbol, TreeAlgebra, TreeValue, UniversalSxHeuristic,
+    compare_trees, count_gold, parse_irtg, read_corpus,
 };
+use rusty_tree::{parser::parse_tree, tree::TreeArena};
 use std::{
     env,
     error::Error,
-    fs::File,
+    fs::{self, File},
     io::{self, Write},
+    path::{Path, PathBuf},
     process,
     sync::{
         Arc, Mutex,
@@ -49,6 +54,15 @@ struct Args {
     heuristic: Heuristic,
     times: Option<String>,
     input: Option<String>,
+    parseval: Option<String>,
+    parseval_output: Option<String>,
+    evalb_param: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum TreeInterpretationKind {
+    Plain,
+    Binarizing,
 }
 
 fn main() {
@@ -62,6 +76,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let args = parse_args()?;
 
     let irtg = parse_irtg(File::open(&args.grammar)?)?;
+    let parseval = prepare_parseval(&args, &irtg)?;
 
     // Read + parse all objects (respecting --limit).
     let mut corpus = if args.corpus == "-" {
@@ -69,6 +84,15 @@ fn run() -> Result<(), Box<dyn Error>> {
     } else {
         read_corpus(File::open(&args.corpus)?, &irtg, args.limit)?
     };
+    if let Some(config) = parseval.as_ref()
+        && !corpus.interpretation_order.contains(&config.interpretation)
+    {
+        return Err(format!(
+            "corpus does not declare Parseval interpretation {:?}",
+            config.interpretation
+        )
+        .into());
+    }
 
     if corpus.interpretation_order.is_empty() {
         return Err("corpus declares no interpretations".into());
@@ -98,7 +122,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         && args.algorithm == Algorithm::Astar
         && !inputable.contains(&primary)
     {
-        return Err(format!("input interpretation {primary:?} is not an inputable interpretation").into());
+        return Err(
+            format!("input interpretation {primary:?} is not an inputable interpretation").into(),
+        );
     }
 
     let scorer = LogProbabilityScorer;
@@ -120,13 +146,27 @@ fn run() -> Result<(), Box<dyn Error>> {
         (Algorithm::Astar, Heuristic::Sx) | (Algorithm::Astar, Heuristic::Sxf)
     )
     .then(|| {
-        let interp = irtg.interpretation_ref(&primary).expect("primary present");
-        let concat = interp
-            .algebra_signature()
-            .get("*")
-            .unwrap_or(Symbol(0));
-        eprintln!("building SX heuristic table (n_max={n_max})...");
-        UniversalSxHeuristic::new_with(irtg.grammar(), interp.homomorphism(), concat, n_max, &scorer)
+        if let Some((table, path)) = sx_load_covering(&args.grammar, n_max) {
+            eprintln!(
+                "loaded SX cache n_max={} from {}",
+                table.n_max(),
+                path.display()
+            );
+            table
+        } else {
+            let interp = irtg.interpretation_ref(&primary).expect("primary present");
+            let concat = interp.algebra_signature().get("*").unwrap_or(Symbol(0));
+            eprintln!("building SX heuristic table (n_max={n_max})...");
+            let table = UniversalSxHeuristic::new_with(
+                irtg.grammar(),
+                interp.homomorphism(),
+                concat,
+                n_max,
+                &scorer,
+            );
+            sx_save(&sx_cache_path(&args.grammar, n_max), &table);
+            table
+        }
     });
     let oblig = matches!(
         (args.algorithm, args.heuristic),
@@ -161,9 +201,21 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut times = match &args.times {
         Some(path) => {
             let mut f = File::create(path)?;
-            writeln!(f, "sentence_no,length,parsed,score,parse_ms,output_ms,total_ms")?;
+            writeln!(
+                f,
+                "sentence_no,length,parsed,score,parse_ms,output_ms,total_ms"
+            )?;
             f.flush()?;
             Some(f)
+        }
+        None => None,
+    };
+    let mut parseval_report = match parseval.as_ref() {
+        Some(config) => {
+            let path = args.parseval_output.as_deref().unwrap_or("parseval.txt");
+            let mut file = File::create(path)?;
+            write_parseval_header(&mut file, &args, config)?;
+            Some(file)
         }
         None => None,
     };
@@ -193,6 +245,9 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let run_start = Instant::now();
     let mut parsed_count = 0usize;
+    let mut parseval_total = ParsevalCounts::default();
+    let mut parseval_scored = 0usize;
+    let mut parseval_skipped = 0usize;
 
     let interp_order = corpus.interpretation_order.clone();
     let result: Result<(), Box<dyn Error>> = (|| {
@@ -233,6 +288,60 @@ fn run() -> Result<(), Box<dyn Error>> {
                 parsed_count += 1;
             }
 
+            if let Some(config) = parseval.as_ref() {
+                let gold_text = instance.text(&config.interpretation).ok_or_else(|| {
+                    format!(
+                        "instance {sentence_no} has no {:?} interpretation",
+                        config.interpretation
+                    )
+                })?;
+                let mut gold_arena = TreeArena::new();
+                let gold_root = parse_tree(&mut gold_arena, gold_text).map_err(|err| {
+                    format!(
+                        "instance {sentence_no}: cannot parse gold tree for interpretation {:?}: {err}",
+                        config.interpretation
+                    )
+                })?;
+
+                let score = match derivation {
+                    Some((arena, root)) => {
+                        let predicted =
+                            evaluate_tree(&irtg, &config.interpretation, config.kind, arena, root)?;
+                        compare_trees(
+                            predicted.arena(),
+                            predicted.root(),
+                            &gold_arena,
+                            gold_root,
+                            &config.params,
+                        )
+                    }
+                    None => count_gold(&gold_arena, gold_root, &config.params),
+                };
+
+                match score {
+                    Ok(counts) => {
+                        parseval_total.add_assign(counts);
+                        parseval_scored += 1;
+                        write_parseval_row(
+                            parseval_report.as_mut().expect("report created"),
+                            sentence_no,
+                            length,
+                            derivation.is_some(),
+                            counts,
+                        )?;
+                    }
+                    Err(skip) => {
+                        parseval_skipped += 1;
+                        write_parseval_skip(
+                            parseval_report.as_mut().expect("report created"),
+                            sentence_no,
+                            length,
+                            skip,
+                        )?;
+                    }
+                }
+            }
+
             let output_start = Instant::now();
             writer.write_instance(&irtg, &interp_order, derivation, instance)?;
             let output_ms = millis(output_start.elapsed());
@@ -266,7 +375,234 @@ fn run() -> Result<(), Box<dyn Error>> {
         total,
         run_start.elapsed().as_secs_f64()
     );
+    if let Some(report) = parseval_report.as_mut() {
+        write_parseval_summary(report, parseval_total, parseval_scored, parseval_skipped)?;
+    }
     Ok(())
+}
+
+struct ParsevalConfig {
+    interpretation: String,
+    kind: TreeInterpretationKind,
+    params: EvalbParams,
+}
+
+fn prepare_parseval(args: &Args, irtg: &Irtg) -> Result<Option<ParsevalConfig>, Box<dyn Error>> {
+    let Some(name) = args.parseval.as_ref() else {
+        if args.evalb_param.is_some() || args.parseval_output.is_some() {
+            return Err("--evalb-param and --parseval-output require --parseval INTERP".into());
+        }
+        return Ok(None);
+    };
+
+    let interpretation = irtg
+        .interpretation_ref(name)
+        .ok_or_else(|| format!("unknown Parseval interpretation {name:?}"))?;
+    let kind = if irtg.interpretation::<TreeAlgebra>(name).is_ok() {
+        TreeInterpretationKind::Plain
+    } else if irtg.interpretation::<Binarizing<TreeAlgebra>>(name).is_ok() {
+        TreeInterpretationKind::Binarizing
+    } else {
+        return Err(format!(
+            "Parseval interpretation {name:?} uses {}, not a supported constituency-tree algebra",
+            interpretation.class_name()
+        )
+        .into());
+    };
+    let params = match args.evalb_param.as_ref() {
+        Some(path) => EvalbParams::parse(&std::fs::read_to_string(path)?)
+            .map_err(|err| format!("cannot parse EVALB parameter file {path:?}: {err}"))?,
+        None => EvalbParams::collins_ptb(),
+    };
+    Ok(Some(ParsevalConfig {
+        interpretation: name.clone(),
+        kind,
+        params,
+    }))
+}
+
+fn evaluate_tree(
+    irtg: &Irtg,
+    name: &str,
+    kind: TreeInterpretationKind,
+    arena: &TreeArena<Symbol>,
+    root: rusty_tree::tree::Tree,
+) -> Result<TreeValue, Box<dyn Error>> {
+    Ok(match kind {
+        TreeInterpretationKind::Plain => irtg
+            .interpretation::<TreeAlgebra>(name)?
+            .interpret_derivation(arena, root)?,
+        TreeInterpretationKind::Binarizing => irtg
+            .interpretation::<Binarizing<TreeAlgebra>>(name)?
+            .interpret_derivation(arena, root)?,
+    })
+}
+
+fn write_parseval_header(out: &mut File, args: &Args, config: &ParsevalConfig) -> io::Result<()> {
+    writeln!(out, "rusty-alto Parseval evaluation")?;
+    writeln!(out, "Grammar:        {}", args.grammar)?;
+    writeln!(out, "Corpus:         {}", args.corpus)?;
+    writeln!(out, "Interpretation: {}", config.interpretation)?;
+    writeln!(
+        out,
+        "Parameters:     {}",
+        args.evalb_param
+            .as_deref()
+            .unwrap_or("built-in Collins/PTB")
+    )?;
+    writeln!(out)?;
+    writeln!(
+        out,
+        " Sent  Len Status       Gold  Pred  LMatch     LP     LR    LF1  UMatch     UP     UR    UF1"
+    )?;
+    writeln!(
+        out,
+        "----- ---- ----------- ----- ----- ------- ------ ------ ------ ------- ------ ------ ------"
+    )
+}
+
+fn write_parseval_row(
+    out: &mut File,
+    sentence_no: usize,
+    length: usize,
+    parsed: bool,
+    counts: ParsevalCounts,
+) -> io::Result<()> {
+    writeln!(
+        out,
+        "{sentence_no:>5} {length:>4} {:<11} {:>5} {:>5} {:>7} {:>6.2} {:>6.2} {:>6.2} {:>7} {:>6.2} {:>6.2} {:>6.2}",
+        if parsed { "scored" } else { "no-parse" },
+        counts.gold,
+        counts.predicted,
+        counts.matched_labeled,
+        100.0 * counts.labeled_precision(),
+        100.0 * counts.labeled_recall(),
+        100.0 * counts.labeled_f1(),
+        counts.matched_unlabeled,
+        100.0 * counts.unlabeled_precision(),
+        100.0 * counts.unlabeled_recall(),
+        100.0 * counts.unlabeled_f1(),
+    )?;
+    out.flush()
+}
+
+fn write_parseval_skip(
+    out: &mut File,
+    sentence_no: usize,
+    length: usize,
+    skip: ParsevalSkip,
+) -> io::Result<()> {
+    let reason = match skip {
+        ParsevalSkip::LengthMismatch { predicted, gold } => {
+            format!("length-mismatch predicted={predicted} gold={gold}")
+        }
+        ParsevalSkip::Cutoff { length, cutoff } => {
+            format!("cutoff normalized-length={length} limit={cutoff}")
+        }
+    };
+    writeln!(out, "{sentence_no:>5} {length:>4} skipped     {reason}")?;
+    out.flush()
+}
+
+fn write_parseval_summary(
+    out: &mut File,
+    counts: ParsevalCounts,
+    scored: usize,
+    skipped: usize,
+) -> io::Result<()> {
+    writeln!(out)?;
+    writeln!(
+        out,
+        "==============================================================================="
+    )?;
+    writeln!(out, "Corpus summary ({scored} scored, {skipped} skipped)")?;
+    writeln!(
+        out,
+        "                         Gold  Pred   Match  Precision  Recall      F1"
+    )?;
+    writeln!(
+        out,
+        "Labeled constituents    {:>5} {:>5} {:>7} {:>9.2} {:>7.2} {:>7.2}",
+        counts.gold,
+        counts.predicted,
+        counts.matched_labeled,
+        100.0 * counts.labeled_precision(),
+        100.0 * counts.labeled_recall(),
+        100.0 * counts.labeled_f1(),
+    )?;
+    writeln!(
+        out,
+        "Unlabeled constituents  {:>5} {:>5} {:>7} {:>9.2} {:>7.2} {:>7.2}",
+        counts.gold,
+        counts.predicted,
+        counts.matched_unlabeled,
+        100.0 * counts.unlabeled_precision(),
+        100.0 * counts.unlabeled_recall(),
+        100.0 * counts.unlabeled_f1(),
+    )?;
+    out.flush()
+}
+
+/// Return the cache path `<grammar>.sxcache/nmax<N>.bin`, shared with `ptb-eval`.
+fn sx_cache_path(grammar_path: &str, n_max: usize) -> PathBuf {
+    sx_cache_dir(grammar_path).join(format!("nmax{n_max}.bin"))
+}
+
+fn sx_cache_dir(grammar_path: &str) -> PathBuf {
+    PathBuf::from(format!("{grammar_path}.sxcache"))
+}
+
+fn parse_sx_cache_nmax(path: &Path) -> Option<usize> {
+    let stem = path.file_stem()?.to_str()?;
+    stem.strip_prefix("nmax")?.parse().ok()
+}
+
+fn sx_load(path: &Path) -> Option<UniversalSxHeuristic> {
+    let bytes = fs::read(path).ok()?;
+    UniversalSxHeuristic::from_bytes(&bytes)
+}
+
+/// Load the exact cache entry, or the smallest valid cached table covering `n_needed`.
+fn sx_load_covering(
+    grammar_path: &str,
+    n_needed: usize,
+) -> Option<(UniversalSxHeuristic, PathBuf)> {
+    let exact_path = sx_cache_path(grammar_path, n_needed);
+    if let Some(table) = sx_load(&exact_path).filter(|table| table.n_max() >= n_needed) {
+        return Some((table, exact_path));
+    }
+
+    let entries = fs::read_dir(sx_cache_dir(grammar_path)).ok()?;
+    let mut candidates = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("bin") {
+            continue;
+        }
+        let Some(n_max) = parse_sx_cache_nmax(&path) else {
+            continue;
+        };
+        if n_max >= n_needed {
+            candidates.push((n_max, path));
+        }
+    }
+    candidates.sort_by_key(|(n_max, _)| *n_max);
+
+    for (_, path) in candidates {
+        if let Some(table) = sx_load(&path).filter(|table| table.n_max() >= n_needed) {
+            return Some((table, path));
+        }
+    }
+    None
+}
+
+fn sx_save(path: &Path, table: &UniversalSxHeuristic) {
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(dir).is_ok() {
+        let _ = fs::write(path, table.to_bytes());
+    }
 }
 
 /// Build the per-sentence materialization strategy.
@@ -390,6 +726,9 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
     let mut heuristic = Heuristic::Zero;
     let mut times = None;
     let mut input = None;
+    let mut parseval = None;
+    let mut parseval_output = None;
+    let mut evalb_param = None;
 
     let mut it = env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -419,6 +758,9 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
             }
             "--times" => times = Some(next()?),
             "--input" => input = Some(next()?),
+            "--parseval" => parseval = Some(next()?),
+            "--parseval-output" => parseval_output = Some(next()?),
+            "--evalb-param" => evalb_param = Some(next()?),
             other if other.starts_with('-') && other != "-" => {
                 return Err(format!("unknown option {other:?}").into());
             }
@@ -443,6 +785,9 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
         heuristic,
         times,
         input,
+        parseval,
+        parseval_output,
+        evalb_param,
     })
 }
 
@@ -456,6 +801,9 @@ fn print_usage() {
          \x20 --algorithm <exhaustive|astar> intersection algorithm (default: exhaustive)\n\
          \x20 --heuristic <zero|outside|sx|sxf> A* heuristic (default: zero)\n\
          \x20 --times <file.csv>             write per-sentence timing as CSV\n\
-         \x20 --input <interp>               interpretation parameterizing sx/sxf (default: auto)"
+         \x20 --input <interp>               interpretation parameterizing sx/sxf (default: auto)\n\
+         \x20 --parseval <interp>            score this constituency-tree interpretation\n\
+         \x20 --parseval-output <file>       write Parseval table (default: parseval.txt)\n\
+         \x20 --evalb-param <file.prm>       EVALB parameters (default: built-in Collins/PTB)"
     );
 }

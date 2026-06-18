@@ -62,6 +62,7 @@ pub mod irtg;
 pub mod materialize;
 pub mod memo;
 pub mod obligatory_leaf;
+pub mod parseval;
 pub mod run;
 pub mod score;
 pub mod set_trie;
@@ -102,6 +103,9 @@ pub use materialize::{
     materialize_topdown_condensed_intersection,
 };
 pub use memo::{Memo, MemoStats};
+pub use parseval::{
+    EvalbParamError, EvalbParams, ParsevalCounts, ParsevalSkip, compare_trees, count_gold,
+};
 pub use run::{DetRun, NonDetRun, StateSet, run_det, run_nondet};
 pub use score::{LogProbabilityScorer, ProbabilityScorer, WeightScorer};
 pub use set_trie::{KeySet, SetTrie};

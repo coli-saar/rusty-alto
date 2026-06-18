@@ -2,12 +2,13 @@ use criterion::{
     BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
 };
 use rusty_alto::{
-    BottomUpTa, CondensedTa, DetBottomUpTa, Determinized, Explicit, ExplicitBuilder, HomLabel,
-    Homomorphism, IndexedBottomUpTa, InvHom, Memo, Product, Span, StateId, StringAlgebra,
-    StringDecompositionAutomaton, Symbol, TopDownTa, materialize,
+    BottomUpTa, CondensedTa, DetBottomUpTa, Determinized, EvalbParams, Explicit, ExplicitBuilder,
+    HomLabel, Homomorphism, IndexedBottomUpTa, InvHom, Memo, Product, Span, StateId, StringAlgebra,
+    StringDecompositionAutomaton, Symbol, TopDownTa, compare_trees, materialize,
     materialize_indexed_condensed_intersection, parse_irtg, run_det, run_nondet,
 };
 use rusty_tree::tree::{Tree, TreeArena};
+use std::collections::HashSet;
 
 const A: Symbol = Symbol(0);
 const U: Symbol = Symbol(1);
@@ -51,6 +52,82 @@ fn unary_chain(len: usize) -> (TreeArena<Symbol>, Tree) {
         node = arena.add_node(U, vec![node]);
     }
     (arena, node)
+}
+
+fn constituency_tree(depth: usize) -> (TreeArena<String>, Tree) {
+    fn build(arena: &mut TreeArena<String>, depth: usize, next_word: &mut usize) -> Tree {
+        if depth == 0 {
+            let word = arena.add_node(format!("w{}", *next_word), vec![]);
+            *next_word += 1;
+            arena.add_node("NN".to_owned(), vec![word])
+        } else {
+            let left = build(arena, depth - 1, next_word);
+            let right = build(arena, depth - 1, next_word);
+            arena.add_node("X".to_owned(), vec![left, right])
+        }
+    }
+
+    let mut arena = TreeArena::new();
+    let mut next_word = 0;
+    let root = build(&mut arena, depth, &mut next_word);
+    (arena, root)
+}
+
+fn parseval(c: &mut Criterion) {
+    let params = EvalbParams::default();
+    let (predicted, predicted_root) = constituency_tree(10);
+    let (gold, gold_root) = constituency_tree(10);
+    let mut group = c.benchmark_group("parseval_depth_10");
+    group.bench_function("joint_postorder", |b| {
+        b.iter(|| {
+            black_box(compare_trees(&predicted, predicted_root, &gold, gold_root, &params).unwrap())
+        })
+    });
+    group.bench_function("collect_hash_sets", |b| {
+        b.iter(|| {
+            black_box(hash_set_parseval(
+                &predicted,
+                predicted_root,
+                &gold,
+                gold_root,
+            ))
+        })
+    });
+    group.finish();
+}
+
+fn hash_set_parseval(
+    predicted: &TreeArena<String>,
+    predicted_root: Tree,
+    gold: &TreeArena<String>,
+    gold_root: Tree,
+) -> usize {
+    fn collect<'a>(
+        arena: &'a TreeArena<String>,
+        node: Tree,
+        start: usize,
+        out: &mut HashSet<(usize, usize, &'a str)>,
+    ) -> usize {
+        let children = arena.get_children(node);
+        if children.is_empty() {
+            return start + 1;
+        }
+        let mut end = start;
+        for &child in children {
+            end = collect(arena, child, end, out);
+        }
+        let preterminal = children.len() == 1 && arena.get_children(children[0]).is_empty();
+        if !preterminal {
+            out.insert((start, end, arena.get_label(node)));
+        }
+        end
+    }
+
+    let mut predicted_set = HashSet::new();
+    let mut gold_set = HashSet::new();
+    collect(predicted, predicted_root, 0, &mut predicted_set);
+    collect(gold, gold_root, 0, &mut gold_set);
+    predicted_set.intersection(&gold_set).count()
 }
 
 fn nondet_explicit() -> Explicit {
@@ -429,6 +506,7 @@ criterion_group!(
     materialization,
     reachability,
     string_decomposition,
-    irtg_condensed_parsing
+    irtg_condensed_parsing,
+    parseval
 );
 criterion_main!(benches);

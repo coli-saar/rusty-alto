@@ -36,6 +36,16 @@ impl TreeValue {
     pub fn new(arena: TreeArena<String>, root: Tree) -> Self {
         Self { arena, root }
     }
+
+    /// Return the arena that owns this tree.
+    pub fn arena(&self) -> &TreeArena<String> {
+        &self.arena
+    }
+
+    /// Return the root handle of this tree.
+    pub fn root(&self) -> Tree {
+        self.root
+    }
 }
 
 /// Copy the subtree rooted at `node` in `src` into `dst`, returning its new root.

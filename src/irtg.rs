@@ -728,6 +728,33 @@ where
             value: Box::new(value),
         }
     }
+
+    /// Interpret a derivation tree and return the typed external algebra value.
+    pub fn interpret_derivation(
+        &self,
+        arena: &TreeArena<Symbol>,
+        root: Tree,
+    ) -> Result<A::Value, IrtgError> {
+        let algebra = self.interpretation.algebra.borrow();
+        let algebra =
+            algebra
+                .as_ref()
+                .downcast_ref::<A>()
+                .ok_or_else(|| IrtgError::WrongInputType {
+                    interpretation: self.interpretation.name.clone(),
+                })?;
+        let mut image = TreeArena::new();
+        let image_root = self
+            .interpretation
+            .homomorphism
+            .apply(arena, root, &mut image)?;
+        algebra
+            .evaluate_term(&image, image_root)
+            .ok_or_else(|| IrtgError::ObjectParse {
+                interpretation: self.interpretation.name.clone(),
+                message: "derivation tree did not evaluate in the algebra".to_owned(),
+            })
+    }
 }
 
 /// Type-erased parse input created by a typed interpretation handle.
@@ -1046,6 +1073,45 @@ mod tests {
         let bad = english.parse_object("john sleeps").unwrap();
         let chart = irtg.parse([english.input(bad)]).unwrap();
         assert!(chart.automaton.is_empty());
+    }
+
+    #[test]
+    fn typed_interpretation_returns_tree_value_without_rendering() {
+        let irtg = parse_irtg(
+            br#"
+            interpretation string: de.up.ling.irtg.algebra.StringAlgebra
+            interpretation tree: de.up.ling.irtg.algebra.TreeWithAritiesAlgebra
+
+            S! -> r(A,B)
+              [string] *(?1,?2)
+              [tree] S_2(?1,?2)
+
+            A -> a
+              [string] a
+              [tree] NN_1(a_0)
+
+            B -> b
+              [string] b
+              [tree] VB_1(b_0)
+            "# as &[u8],
+        )
+        .unwrap();
+
+        let string = irtg.interpretation::<StringAlgebra>("string").unwrap();
+        let input = string.parse_object("a b").unwrap();
+        let best = irtg
+            .best_with(
+                [string.input(input)],
+                &MaterializationStrategy::TopDownCondensed,
+            )
+            .unwrap()
+            .unwrap();
+        let tree = irtg.interpretation::<TreeAlgebra>("tree").unwrap();
+        let value = tree
+            .interpret_derivation(best.arena(), best.root())
+            .unwrap();
+        assert_eq!(value.to_string(), "S(NN(a), VB(b))");
+        assert_eq!(value.arena().get_label(value.root()), "S");
     }
 
     #[test]

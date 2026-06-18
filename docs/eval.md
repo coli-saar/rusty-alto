@@ -28,6 +28,9 @@ eval <grammar.irtg> <corpus|-> [options]
   --times <file.csv>                write per-sentence timing as CSV
   --input <interp>                  interpretation that parameterizes the sx/sxf heuristic
                                     (default: chosen automatically)
+  --parseval <interp>               score a constituency-tree interpretation
+  --parseval-output <file>          write Parseval table (default: parseval.txt)
+  --evalb-param <file.prm>          EVALB parameters (default: Collins/PTB profile)
 ```
 
 - `<corpus>` may be `-` to read from standard input.
@@ -117,6 +120,10 @@ interpretation). It is chosen automatically (preferring an interpretation named 
 string interpretation — the usual case — this is automatic. With multiple string interpretations,
 `sx`/`sxf` are exact only for the primary one, so prefer `zero`/`outside` there.
 
+SX tables are cached beside the grammar in `<grammar>.sxcache/nmax<N>.bin`. `eval` first looks for
+an exact entry, then reuses the smallest cached table whose `n_max` covers the corpus. The cache is
+compatible with `ptb-eval`.
+
 ## Timing CSV
 
 With `--times <file.csv>`, one row per instance is written (flushed as it goes):
@@ -129,6 +136,26 @@ sentence_no,length,parsed,score,parse_ms,output_ms,total_ms
 - `parsed` — whether a derivation was found.
 - `score` — the best tree's score (log-probability with the default scorer); empty if no parse.
 - `parse_ms` / `output_ms` — parse time and value-interpretation/write time.
+
+## Parseval scoring
+
+`--parseval <interp>` compares each predicted tree with the tree stored on that interpretation's
+corpus line. The interpretation must use `TreeWithAritiesAlgebra` or
+`BinarizingTreeWithAritiesAlgebra`.
+
+For every scored sentence, `eval` writes labeled and unlabeled precision, recall, and F1 to a
+human-readable EVALB-style table. The report defaults to `parseval.txt`; override it with
+`--parseval-output`. The report ends with corpus-level micro-averages from the summed matched,
+predicted, and gold constituent counts. Parseval scores are not printed to the console.
+
+Failed parses contribute zero predicted constituents and retain their gold constituent count.
+Sentences whose normalized terminal counts differ are marked as skipped.
+
+Without `--evalb-param`, scoring uses a built-in Collins/PTB profile: conventional root, trace,
+auxiliary, and punctuation labels are deleted, `ADVP` and `PRT` are equivalent, and sentences
+longer than 40 normalized terminals are skipped. Custom parameter files may use `DELETE_LABEL`,
+`DELETE_WORD`, `EQ_LABEL`, and `CUTOFF_LEN`. Standard non-scoring controls such as `DEBUG` and
+`MAX_ERROR` are accepted and ignored.
 
 ## Examples
 
@@ -153,10 +180,18 @@ Read a corpus from stdin:
 cat my.corpus | ./target/release/eval grammar.irtg -
 ```
 
+Score a tree interpretation with custom EVALB parameters:
+
+```sh
+./target/release/eval grammar.irtg gold.corpus \
+    --parseval tree --parseval-output scores.txt \
+    --evalb-param COLLINS.prm -o predicted.corpus
+```
+
 ## Notes and limitations
 
 - The output is the parser's **best** tree, which generally differs from any gold tree in the
-  input corpus — that is the point of an evaluation run. `eval` does not score against gold trees.
+  input corpus — that is the point of an evaluation run. Scoring is opt-in with `--parseval`.
 - Tree interpretations are output-only (no decomposition yet), so a corpus whose *only*
   interpretation is a tree algebra has nothing to parse from and is rejected.
 - A* requires probability weights (≤ 1); use `exhaustive` for grammars with arbitrary weights.
