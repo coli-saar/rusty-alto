@@ -2,15 +2,15 @@
 //! [`Binarizing`] adapter (Alto's `BinarizingAlgebra<E>`).
 //!
 //! Java uses inheritance; Rust replaces it with composition:
-//! - [`TreeAlgebra`] is the low-level algebra that builds a tree value, optionally stripping
-//!   arity suffixes (`f_2` -> `f`).
+//! - [`TreeAlgebra`] is the low-level algebra that builds a tree, optionally stripping arity
+//!   suffixes (`f_2` -> `f`).
 //! - [`Binarizing`] is an **adapter around any algebra** that collapses a binary append symbol
 //!   (`_@_`) before delegating evaluation to the wrapped algebra. It is not tree-specific.
 //!
-//! Tree values reuse [`TreeArena`] rather than a bespoke node type. They use `String` labels
-//! (not `Symbol`) because arity stripping creates new labels (`f_2` -> `f`); interning those under
-//! the `&self` of [`Algebra::evaluate`] is not possible, and plain strings keep `parse_object`
-//! trivial.
+//! The **internal value** is a [`Tree`] handle into a scratch [`TreeArena`] the algebra owns, so
+//! per-node [`evaluate`](Algebra::evaluate) just appends a node (O(arity), no copying). The
+//! **public value** ([`TreeValue`]) is produced once by [`to_external`](Algebra::to_external),
+//! which copies the finished tree out into its own arena and resets the scratch.
 //!
 //! These algebras are **output-only**: they evaluate a derivation tree into a value, but do not
 //! provide decomposition, so an interpretation backed by them cannot be a parse input.
@@ -18,13 +18,13 @@
 use crate::{Algebra, Signature, Symbol};
 use rusty_tree::parser::{TreeParseError, parse_tree};
 use rusty_tree::tree::{Tree, TreeArena};
+use std::cell::RefCell;
 use std::fmt;
-use std::hash::{Hash, Hasher};
 
 /// The default binary append (concatenation) symbol of a binarizing algebra.
 pub const APPEND_SYMBOL: &str = "_@_";
 
-/// An owned tree value, stored in a [`TreeArena`] with `String` labels.
+/// A standalone public tree value, owning a [`TreeArena`] with `String` labels.
 #[derive(Debug)]
 pub struct TreeValue {
     arena: TreeArena<String>,
@@ -36,19 +36,9 @@ impl TreeValue {
     pub fn new(arena: TreeArena<String>, root: Tree) -> Self {
         Self { arena, root }
     }
-
-    /// The backing arena.
-    pub fn arena(&self) -> &TreeArena<String> {
-        &self.arena
-    }
-
-    /// The root node handle.
-    pub fn root(&self) -> Tree {
-        self.root
-    }
 }
 
-/// Deep-copy the subtree rooted at `node` in `src` into `dst`, returning its new root.
+/// Copy the subtree rooted at `node` in `src` into `dst`, returning its new root.
 fn copy_subtree(src: &TreeArena<String>, node: Tree, dst: &mut TreeArena<String>) -> Tree {
     let children: Vec<Tree> = src
         .get_children(node)
@@ -56,47 +46,6 @@ fn copy_subtree(src: &TreeArena<String>, node: Tree, dst: &mut TreeArena<String>
         .map(|&child| copy_subtree(src, child, dst))
         .collect();
     dst.add_node(src.get_label(node).clone(), children)
-}
-
-impl Clone for TreeValue {
-    fn clone(&self) -> Self {
-        let mut arena = TreeArena::new();
-        let root = copy_subtree(&self.arena, self.root, &mut arena);
-        Self { arena, root }
-    }
-}
-
-fn subtree_eq(a: &TreeArena<String>, x: Tree, b: &TreeArena<String>, y: Tree) -> bool {
-    let (cx, cy) = (a.get_children(x), b.get_children(y));
-    a.get_label(x) == b.get_label(y)
-        && cx.len() == cy.len()
-        && cx
-            .iter()
-            .zip(cy)
-            .all(|(&xc, &yc)| subtree_eq(a, xc, b, yc))
-}
-
-impl PartialEq for TreeValue {
-    fn eq(&self, other: &Self) -> bool {
-        subtree_eq(&self.arena, self.root, &other.arena, other.root)
-    }
-}
-
-impl Eq for TreeValue {}
-
-fn hash_subtree<H: Hasher>(arena: &TreeArena<String>, node: Tree, state: &mut H) {
-    arena.get_label(node).hash(state);
-    let children = arena.get_children(node);
-    children.len().hash(state);
-    for &child in children {
-        hash_subtree(arena, child, state);
-    }
-}
-
-impl Hash for TreeValue {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        hash_subtree(&self.arena, self.root, state);
-    }
 }
 
 impl fmt::Display for TreeValue {
@@ -163,10 +112,14 @@ fn strip_arity(label: &str) -> &str {
 
 /// The low-level tree algebra: operation symbols build tree nodes. With `with_arities`, the
 /// arity suffix on each symbol (`f_2`) is stripped when producing the node label.
-#[derive(Clone, Debug)]
+///
+/// `scratch` is the arena that internal values ([`Tree`] handles) point into; it is reset by
+/// [`to_external`](Algebra::to_external) after each term is harvested.
+#[derive(Debug)]
 pub struct TreeAlgebra {
     signature: Signature,
     with_arities: bool,
+    scratch: RefCell<TreeArena<String>>,
 }
 
 impl TreeAlgebra {
@@ -175,6 +128,7 @@ impl TreeAlgebra {
         Self {
             signature,
             with_arities: false,
+            scratch: RefCell::new(TreeArena::new()),
         }
     }
 
@@ -183,6 +137,7 @@ impl TreeAlgebra {
         Self {
             signature,
             with_arities: true,
+            scratch: RefCell::new(TreeArena::new()),
         }
     }
 
@@ -195,19 +150,10 @@ impl TreeAlgebra {
             name.to_owned()
         }
     }
-
-    fn build(&self, src: &TreeArena<Symbol>, node: Tree, dst: &mut TreeArena<String>) -> Tree {
-        let label = self.node_label(*src.get_label(node));
-        let children: Vec<Tree> = src
-            .get_children(node)
-            .iter()
-            .map(|&child| self.build(src, child, dst))
-            .collect();
-        dst.add_node(label, children)
-    }
 }
 
 impl Algebra for TreeAlgebra {
+    type InternalValue = Tree; // a handle into `self.scratch`
     type Value = TreeValue;
     type ParseError = TreeParseError;
 
@@ -215,29 +161,27 @@ impl Algebra for TreeAlgebra {
         &self.signature
     }
 
-    fn evaluate(&self, symbol: Symbol, children: &[Self::Value]) -> Option<Self::Value> {
-        let mut arena = TreeArena::new();
-        let child_roots: Vec<Tree> = children
-            .iter()
-            .map(|child| copy_subtree(&child.arena, child.root, &mut arena))
-            .collect();
-        let root = arena.add_node(self.node_label(symbol), child_roots);
-        Some(TreeValue { arena, root })
+    fn evaluate(
+        &self,
+        symbol: Symbol,
+        children: &[Self::InternalValue],
+    ) -> Option<Self::InternalValue> {
+        let label = self.node_label(symbol);
+        Some(self.scratch.borrow_mut().add_node(label, children.to_vec()))
     }
 
-    fn evaluate_term(&self, arena: &TreeArena<Symbol>, root: Tree) -> Option<Self::Value> {
+    fn to_external(&self, value: &Self::InternalValue) -> Self::Value {
         let mut out = TreeArena::new();
-        let new_root = self.build(arena, root, &mut out);
-        Some(TreeValue {
-            arena: out,
-            root: new_root,
-        })
+        let root = copy_subtree(&self.scratch.borrow(), *value, &mut out);
+        // The internal value has been harvested into its own arena; reset the scratch.
+        *self.scratch.borrow_mut() = TreeArena::new();
+        TreeValue::new(out, root)
     }
 
-    fn parse_object(&mut self, input: &str) -> Result<Self::Value, Self::ParseError> {
-        let mut arena = TreeArena::new();
-        let root = parse_tree(&mut arena, input)?;
-        Ok(TreeValue { arena, root })
+    fn parse_object(&mut self, input: &str) -> Result<Self::InternalValue, Self::ParseError> {
+        // Tree algebras are output-only; this is provided for completeness and parses the surface
+        // tree into the scratch arena, returning its root handle.
+        parse_tree(&mut self.scratch.borrow_mut(), input)
     }
 }
 
@@ -247,7 +191,7 @@ impl Algebra for TreeAlgebra {
 /// node splices its children's forests together, so a right-branching binary spine becomes a flat
 /// child list of the surrounding node. The unbinarization is purely structural and independent of
 /// what `inner` does with the resulting term.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Binarizing<A> {
     inner: A,
     append: Option<Symbol>,
@@ -287,6 +231,7 @@ impl<A> Binarizing<A> {
 }
 
 impl<A: Algebra> Algebra for Binarizing<A> {
+    type InternalValue = A::InternalValue;
     type Value = A::Value;
     type ParseError = A::ParseError;
 
@@ -294,10 +239,18 @@ impl<A: Algebra> Algebra for Binarizing<A> {
         self.inner.signature()
     }
 
-    fn evaluate(&self, _symbol: Symbol, _children: &[Self::Value]) -> Option<Self::Value> {
+    fn evaluate(
+        &self,
+        _symbol: Symbol,
+        _children: &[Self::InternalValue],
+    ) -> Option<Self::InternalValue> {
         // A per-node combinator is undefined for binarization (intermediate values are forests);
         // `evaluate_term` is overridden instead. Mirrors Alto's `UnsupportedOperationException`.
         None
+    }
+
+    fn to_external(&self, value: &Self::InternalValue) -> Self::Value {
+        self.inner.to_external(value)
     }
 
     fn evaluate_term(&self, arena: &TreeArena<Symbol>, root: Tree) -> Option<Self::Value> {
@@ -309,7 +262,7 @@ impl<A: Algebra> Algebra for Binarizing<A> {
         self.inner.evaluate_term(&unbinarized, forest[0])
     }
 
-    fn parse_object(&mut self, input: &str) -> Result<Self::Value, Self::ParseError> {
+    fn parse_object(&mut self, input: &str) -> Result<Self::InternalValue, Self::ParseError> {
         self.inner.parse_object(input)
     }
 }
@@ -398,18 +351,7 @@ mod tests {
     #[test]
     fn parse_object_round_trips() {
         let mut algebra = TreeAlgebra::with_arities(Signature::new());
-        let value = algebra.parse_object("S(NP, VP(V, NP))").unwrap();
-        assert_eq!(value.to_string(), "S(NP, VP(V, NP))");
-    }
-
-    #[test]
-    fn value_equality_is_structural() {
-        let mut algebra = TreeAlgebra::tree(Signature::new());
-        let a = algebra.parse_object("f(a, b)").unwrap();
-        let b = algebra.parse_object("f(a, b)").unwrap();
-        let c = algebra.parse_object("f(a, c)").unwrap();
-        assert_eq!(a, b);
-        assert_eq!(a, a.clone());
-        assert_ne!(a, c);
+        let internal = algebra.parse_object("S(NP, VP(V, NP))").unwrap();
+        assert_eq!(algebra.to_external(&internal).to_string(), "S(NP, VP(V, NP))");
     }
 }

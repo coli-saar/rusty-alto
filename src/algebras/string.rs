@@ -214,14 +214,19 @@ impl Default for StringAlgebra {
 }
 
 impl Algebra for StringAlgebra {
-    type Value = Vec<Symbol>;
+    type InternalValue = Vec<Symbol>;
+    type Value = Vec<String>;
     type ParseError = Infallible;
 
     fn signature(&self) -> &Signature {
         &self.signature
     }
 
-    fn evaluate(&self, symbol: Symbol, children: &[Self::Value]) -> Option<Self::Value> {
+    fn evaluate(
+        &self,
+        symbol: Symbol,
+        children: &[Self::InternalValue],
+    ) -> Option<Self::InternalValue> {
         if symbol == self.concat {
             let [left, right] = children else {
                 return None;
@@ -237,8 +242,15 @@ impl Algebra for StringAlgebra {
         }
     }
 
-    fn parse_object(&mut self, input: &str) -> Result<Self::Value, Self::ParseError> {
+    fn parse_object(&mut self, input: &str) -> Result<Self::InternalValue, Self::ParseError> {
         Ok(self.parse_string(input))
+    }
+
+    fn to_external(&self, value: &Self::InternalValue) -> Self::Value {
+        value
+            .iter()
+            .map(|&symbol| self.signature.resolve(symbol).to_owned())
+            .collect()
     }
 }
 

@@ -548,7 +548,6 @@ impl<A, C: fmt::Debug> fmt::Debug for TypedDerivationCodec<A, C> {
 impl<A, C> DerivationRenderer for TypedDerivationCodec<A, C>
 where
     A: Algebra + 'static,
-    A::Value: 'static,
     C: OutputCodec<A::Value> + fmt::Debug,
 {
     fn render(
@@ -574,7 +573,7 @@ where
                     interpretation: name.to_owned(),
                     message: "derivation tree did not evaluate in the algebra".to_owned(),
                 })?;
-        Ok(self.codec.encode(algebra.signature(), &value))
+        Ok(self.codec.encode(&value))
     }
 }
 
@@ -686,7 +685,7 @@ pub struct TypedInterpretation<'i, A> {
 impl<'i, A> TypedInterpretation<'i, A>
 where
     A: Algebra + 'static,
-    A::Value: 'static,
+    A::InternalValue: 'static,
     A::ParseError: fmt::Display,
 {
     /// Return the interpretation name.
@@ -704,8 +703,8 @@ where
         self.interpretation.homomorphism()
     }
 
-    /// Parse a textual object using the interpretation's algebra.
-    pub fn parse_object(&self, input: &str) -> Result<A::Value, IrtgError> {
+    /// Parse a textual object using the interpretation's algebra (to its internal value).
+    pub fn parse_object(&self, input: &str) -> Result<A::InternalValue, IrtgError> {
         let mut algebra = self.interpretation.algebra.borrow_mut();
         let algebra =
             algebra
@@ -722,8 +721,8 @@ where
             })
     }
 
-    /// Package a typed algebra value as an input for [`Irtg::parse`].
-    pub fn input(&self, value: A::Value) -> ParseInput<'i> {
+    /// Package a typed internal value as an input for [`Irtg::parse`].
+    pub fn input(&self, value: A::InternalValue) -> ParseInput<'i> {
         ParseInput {
             interpretation: self.interpretation,
             value: Box::new(value),
