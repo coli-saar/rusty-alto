@@ -50,7 +50,9 @@ lalrpop_util::lalrpop_mod!(
     #[allow(clippy::all)]
     alto_grammar
 );
+pub mod codec;
 pub mod combinators;
+pub mod corpus;
 pub mod explicit;
 pub mod heuristic;
 pub mod homomorphism;
@@ -69,8 +71,8 @@ pub mod traits;
 pub mod viterbi;
 
 pub use algebras::{
-    Algebra, EvaluatingDecompositionAutomaton, SentenceSxHeuristic, Span, StringAlgebra,
-    StringDecompositionAutomaton, UniversalSxHeuristic,
+    APPEND_SYMBOL, Algebra, Binarizing, EvaluatingDecompositionAutomaton, SentenceSxHeuristic, Span,
+    StringAlgebra, StringDecompositionAutomaton, TreeAlgebra, TreeValue, UniversalSxHeuristic,
 };
 pub use alto::{AltoParseError, ParsedTreeAutomaton, parse_alto, parse_alto_with_signature};
 pub use astar::{
@@ -79,7 +81,9 @@ pub use astar::{
     materialize_astar_intersection, materialize_astar_intersection_with,
     materialize_astar_string_intersection_with_prepared,
 };
+pub use codec::{DisplayCodec, OutputCodec, SpaceJoinCodec};
 pub use combinators::{Determinized, InvHom, Mapped, Product};
+pub use corpus::{Corpus, CorpusError, CorpusWriter, Instance, read_corpus};
 pub use explicit::{Explicit, ExplicitBuildError, ExplicitBuilder, Rule};
 pub use heuristic::{
     IntersectionHeuristic, MinHeuristic, OutsideHeuristic, ScoredZeroHeuristic, ZeroHeuristic,

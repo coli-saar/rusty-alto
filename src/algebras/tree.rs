@@ -1,0 +1,415 @@
+//! Tree algebras, ported from Alto's `TreeAlgebra` / `TreeWithAritiesAlgebra`, plus a generic
+//! [`Binarizing`] adapter (Alto's `BinarizingAlgebra<E>`).
+//!
+//! Java uses inheritance; Rust replaces it with composition:
+//! - [`TreeAlgebra`] is the low-level algebra that builds a tree value, optionally stripping
+//!   arity suffixes (`f_2` -> `f`).
+//! - [`Binarizing`] is an **adapter around any algebra** that collapses a binary append symbol
+//!   (`_@_`) before delegating evaluation to the wrapped algebra. It is not tree-specific.
+//!
+//! Tree values reuse [`TreeArena`] rather than a bespoke node type. They use `String` labels
+//! (not `Symbol`) because arity stripping creates new labels (`f_2` -> `f`); interning those under
+//! the `&self` of [`Algebra::evaluate`] is not possible, and plain strings keep `parse_object`
+//! trivial.
+//!
+//! These algebras are **output-only**: they evaluate a derivation tree into a value, but do not
+//! provide decomposition, so an interpretation backed by them cannot be a parse input.
+
+use crate::{Algebra, Signature, Symbol};
+use rusty_tree::parser::{TreeParseError, parse_tree};
+use rusty_tree::tree::{Tree, TreeArena};
+use std::fmt;
+use std::hash::{Hash, Hasher};
+
+/// The default binary append (concatenation) symbol of a binarizing algebra.
+pub const APPEND_SYMBOL: &str = "_@_";
+
+/// An owned tree value, stored in a [`TreeArena`] with `String` labels.
+#[derive(Debug)]
+pub struct TreeValue {
+    arena: TreeArena<String>,
+    root: Tree,
+}
+
+impl TreeValue {
+    /// Wrap an arena and its root.
+    pub fn new(arena: TreeArena<String>, root: Tree) -> Self {
+        Self { arena, root }
+    }
+
+    /// The backing arena.
+    pub fn arena(&self) -> &TreeArena<String> {
+        &self.arena
+    }
+
+    /// The root node handle.
+    pub fn root(&self) -> Tree {
+        self.root
+    }
+}
+
+/// Deep-copy the subtree rooted at `node` in `src` into `dst`, returning its new root.
+fn copy_subtree(src: &TreeArena<String>, node: Tree, dst: &mut TreeArena<String>) -> Tree {
+    let children: Vec<Tree> = src
+        .get_children(node)
+        .iter()
+        .map(|&child| copy_subtree(src, child, dst))
+        .collect();
+    dst.add_node(src.get_label(node).clone(), children)
+}
+
+impl Clone for TreeValue {
+    fn clone(&self) -> Self {
+        let mut arena = TreeArena::new();
+        let root = copy_subtree(&self.arena, self.root, &mut arena);
+        Self { arena, root }
+    }
+}
+
+fn subtree_eq(a: &TreeArena<String>, x: Tree, b: &TreeArena<String>, y: Tree) -> bool {
+    let (cx, cy) = (a.get_children(x), b.get_children(y));
+    a.get_label(x) == b.get_label(y)
+        && cx.len() == cy.len()
+        && cx
+            .iter()
+            .zip(cy)
+            .all(|(&xc, &yc)| subtree_eq(a, xc, b, yc))
+}
+
+impl PartialEq for TreeValue {
+    fn eq(&self, other: &Self) -> bool {
+        subtree_eq(&self.arena, self.root, &other.arena, other.root)
+    }
+}
+
+impl Eq for TreeValue {}
+
+fn hash_subtree<H: Hasher>(arena: &TreeArena<String>, node: Tree, state: &mut H) {
+    arena.get_label(node).hash(state);
+    let children = arena.get_children(node);
+    children.len().hash(state);
+    for &child in children {
+        hash_subtree(arena, child, state);
+    }
+}
+
+impl Hash for TreeValue {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        hash_subtree(&self.arena, self.root, state);
+    }
+}
+
+impl fmt::Display for TreeValue {
+    /// Render as a term `label(c1, c2, ...)`, quoting labels that are not bare identifiers so the
+    /// output round-trips through [`parse_tree`].
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_subtree(f, &self.arena, self.root)
+    }
+}
+
+fn write_subtree(f: &mut fmt::Formatter<'_>, arena: &TreeArena<String>, node: Tree) -> fmt::Result {
+    write_label(f, arena.get_label(node))?;
+    let children = arena.get_children(node);
+    if !children.is_empty() {
+        write!(f, "(")?;
+        for (i, &child) in children.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write_subtree(f, arena, child)?;
+        }
+        write!(f, ")")?;
+    }
+    Ok(())
+}
+
+fn is_bare(label: &str) -> bool {
+    !label.is_empty()
+        && label
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+fn write_label(f: &mut fmt::Formatter<'_>, label: &str) -> fmt::Result {
+    if is_bare(label) {
+        return f.write_str(label);
+    }
+    f.write_str("'")?;
+    for c in label.chars() {
+        match c {
+            '\\' => f.write_str("\\\\")?,
+            '\'' => f.write_str("\\'")?,
+            '\n' => f.write_str("\\n")?,
+            '\r' => f.write_str("\\r")?,
+            '\t' => f.write_str("\\t")?,
+            _ => write!(f, "{c}")?,
+        }
+    }
+    f.write_str("'")
+}
+
+/// Strip a trailing `_<digits>` arity suffix from a label (`S_2` -> `S`, `woman_0` -> `woman`),
+/// leaving labels without such a suffix unchanged. Mirrors Alto's `stripArities` (permissive).
+fn strip_arity(label: &str) -> &str {
+    if let Some(idx) = label.rfind('_')
+        && idx > 0
+        && idx + 1 < label.len()
+        && label[idx + 1..].bytes().all(|b| b.is_ascii_digit())
+    {
+        return &label[..idx];
+    }
+    label
+}
+
+/// The low-level tree algebra: operation symbols build tree nodes. With `with_arities`, the
+/// arity suffix on each symbol (`f_2`) is stripped when producing the node label.
+#[derive(Clone, Debug)]
+pub struct TreeAlgebra {
+    signature: Signature,
+    with_arities: bool,
+}
+
+impl TreeAlgebra {
+    /// Plain tree algebra (`TreeAlgebra`).
+    pub fn tree(signature: Signature) -> Self {
+        Self {
+            signature,
+            with_arities: false,
+        }
+    }
+
+    /// Arity-annotated tree algebra (`TreeWithAritiesAlgebra`).
+    pub fn with_arities(signature: Signature) -> Self {
+        Self {
+            signature,
+            with_arities: true,
+        }
+    }
+
+    /// Resolve an operation symbol to its node label, stripping the arity suffix if configured.
+    fn node_label(&self, symbol: Symbol) -> String {
+        let name = self.signature.resolve(symbol);
+        if self.with_arities {
+            strip_arity(name).to_owned()
+        } else {
+            name.to_owned()
+        }
+    }
+
+    fn build(&self, src: &TreeArena<Symbol>, node: Tree, dst: &mut TreeArena<String>) -> Tree {
+        let label = self.node_label(*src.get_label(node));
+        let children: Vec<Tree> = src
+            .get_children(node)
+            .iter()
+            .map(|&child| self.build(src, child, dst))
+            .collect();
+        dst.add_node(label, children)
+    }
+}
+
+impl Algebra for TreeAlgebra {
+    type Value = TreeValue;
+    type ParseError = TreeParseError;
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn evaluate(&self, symbol: Symbol, children: &[Self::Value]) -> Option<Self::Value> {
+        let mut arena = TreeArena::new();
+        let child_roots: Vec<Tree> = children
+            .iter()
+            .map(|child| copy_subtree(&child.arena, child.root, &mut arena))
+            .collect();
+        let root = arena.add_node(self.node_label(symbol), child_roots);
+        Some(TreeValue { arena, root })
+    }
+
+    fn evaluate_term(&self, arena: &TreeArena<Symbol>, root: Tree) -> Option<Self::Value> {
+        let mut out = TreeArena::new();
+        let new_root = self.build(arena, root, &mut out);
+        Some(TreeValue {
+            arena: out,
+            root: new_root,
+        })
+    }
+
+    fn parse_object(&mut self, input: &str) -> Result<Self::Value, Self::ParseError> {
+        let mut arena = TreeArena::new();
+        let root = parse_tree(&mut arena, input)?;
+        Ok(TreeValue { arena, root })
+    }
+}
+
+/// A binarizing adapter around an arbitrary algebra (Alto's `BinarizingAlgebra<E>`).
+///
+/// Before delegating evaluation to `inner`, it collapses the binary append symbol: an `_@_(a, b)`
+/// node splices its children's forests together, so a right-branching binary spine becomes a flat
+/// child list of the surrounding node. The unbinarization is purely structural and independent of
+/// what `inner` does with the resulting term.
+#[derive(Clone, Debug)]
+pub struct Binarizing<A> {
+    inner: A,
+    append: Option<Symbol>,
+}
+
+impl<A> Binarizing<A> {
+    /// Wrap `inner`, collapsing `append` (typically [`APPEND_SYMBOL`]). If `append` is `None`,
+    /// evaluation is delegated unchanged.
+    pub fn new(inner: A, append: Option<Symbol>) -> Self {
+        Self { inner, append }
+    }
+
+    /// Unbinarize the subtree at `node`, building the result into `dst`; returns the resulting
+    /// forest (a single tree, except where an append node spliced several together).
+    fn unbinarize(
+        &self,
+        src: &TreeArena<Symbol>,
+        node: Tree,
+        dst: &mut TreeArena<Symbol>,
+    ) -> Vec<Tree> {
+        let label = *src.get_label(node);
+        let children = src.get_children(node);
+        if self.append == Some(label) {
+            let mut forest = Vec::new();
+            for &child in children {
+                forest.extend(self.unbinarize(src, child, dst));
+            }
+            forest
+        } else {
+            let mut flattened = Vec::new();
+            for &child in children {
+                flattened.extend(self.unbinarize(src, child, dst));
+            }
+            vec![dst.add_node(label, flattened)]
+        }
+    }
+}
+
+impl<A: Algebra> Algebra for Binarizing<A> {
+    type Value = A::Value;
+    type ParseError = A::ParseError;
+
+    fn signature(&self) -> &Signature {
+        self.inner.signature()
+    }
+
+    fn evaluate(&self, _symbol: Symbol, _children: &[Self::Value]) -> Option<Self::Value> {
+        // A per-node combinator is undefined for binarization (intermediate values are forests);
+        // `evaluate_term` is overridden instead. Mirrors Alto's `UnsupportedOperationException`.
+        None
+    }
+
+    fn evaluate_term(&self, arena: &TreeArena<Symbol>, root: Tree) -> Option<Self::Value> {
+        let mut unbinarized = TreeArena::new();
+        let forest = self.unbinarize(arena, root, &mut unbinarized);
+        if forest.len() != 1 {
+            return None;
+        }
+        self.inner.evaluate_term(&unbinarized, forest[0])
+    }
+
+    fn parse_object(&mut self, input: &str) -> Result<Self::Value, Self::ParseError> {
+        self.inner.parse_object(input)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sig(symbols: &[(&str, usize)]) -> Signature {
+        let mut signature = Signature::new();
+        for &(name, arity) in symbols {
+            signature.intern(name.to_owned(), arity).unwrap();
+        }
+        signature
+    }
+
+    /// Build a `TreeArena<Symbol>` term from a rusty_tree-parsed repr (symbols must be in `sig`).
+    fn term(signature: &Signature, repr: &str) -> (TreeArena<Symbol>, Tree) {
+        let mut str_arena = TreeArena::new();
+        let root = parse_tree(&mut str_arena, repr).unwrap();
+        fn map(
+            sig: &Signature,
+            src: &TreeArena<String>,
+            node: Tree,
+            dst: &mut TreeArena<Symbol>,
+        ) -> Tree {
+            let symbol = sig.get(src.get_label(node)).expect("symbol in signature");
+            let children: Vec<Tree> = src
+                .get_children(node)
+                .iter()
+                .map(|&c| map(sig, src, c, dst))
+                .collect();
+            dst.add_node(symbol, children)
+        }
+        let mut arena = TreeArena::new();
+        let new_root = map(signature, &str_arena, root, &mut arena);
+        (arena, new_root)
+    }
+
+    #[test]
+    fn display_quotes_special_labels() {
+        let mut arena = TreeArena::new();
+        let comma = arena.add_node(",".to_owned(), vec![]);
+        let np = arena.add_node("NP-SBJ".to_owned(), vec![]);
+        let root = arena.add_node("S".to_owned(), vec![comma, np]);
+        assert_eq!(TreeValue::new(arena, root).to_string(), "S(',', NP-SBJ)");
+    }
+
+    #[test]
+    fn with_arities_strips_suffixes() {
+        let signature = sig(&[("S_2", 2), ("NP_0", 0), ("VP_0", 0)]);
+        let algebra = TreeAlgebra::with_arities(signature.clone());
+        let (arena, root) = term(&signature, "S_2(NP_0, VP_0)");
+        assert_eq!(
+            algebra.evaluate_term(&arena, root).unwrap().to_string(),
+            "S(NP, VP)"
+        );
+    }
+
+    #[test]
+    fn binarizing_unbinarizes_then_strips() {
+        // S_3('_@_'(NP_0, '_@_'(V_0, NP_0))) -> S(NP, V, NP). `_@_` is quoted only because this
+        // test parses via rusty_tree; real hom images are built by `Homomorphism::apply`.
+        let signature = sig(&[("S_3", 3), ("NP_0", 0), ("V_0", 0), (APPEND_SYMBOL, 2)]);
+        let inner = TreeAlgebra::with_arities(signature.clone());
+        let algebra = Binarizing::new(inner, signature.get(APPEND_SYMBOL));
+        let (arena, root) = term(&signature, "S_3('_@_'(NP_0, '_@_'(V_0, NP_0)))");
+        assert_eq!(
+            algebra.evaluate_term(&arena, root).unwrap().to_string(),
+            "S(NP, V, NP)"
+        );
+    }
+
+    #[test]
+    fn binarizing_without_append_is_identity() {
+        let signature = sig(&[("S_1", 1), ("NP_0", 0)]);
+        let inner = TreeAlgebra::with_arities(signature.clone());
+        let algebra = Binarizing::new(inner, None);
+        let (arena, root) = term(&signature, "S_1(NP_0)");
+        assert_eq!(
+            algebra.evaluate_term(&arena, root).unwrap().to_string(),
+            "S(NP)"
+        );
+    }
+
+    #[test]
+    fn parse_object_round_trips() {
+        let mut algebra = TreeAlgebra::with_arities(Signature::new());
+        let value = algebra.parse_object("S(NP, VP(V, NP))").unwrap();
+        assert_eq!(value.to_string(), "S(NP, VP(V, NP))");
+    }
+
+    #[test]
+    fn value_equality_is_structural() {
+        let mut algebra = TreeAlgebra::tree(Signature::new());
+        let a = algebra.parse_object("f(a, b)").unwrap();
+        let b = algebra.parse_object("f(a, b)").unwrap();
+        let c = algebra.parse_object("f(a, c)").unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a, a.clone());
+        assert_ne!(a, c);
+    }
+}

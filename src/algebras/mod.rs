@@ -1,13 +1,16 @@
 //! Algebra interfaces and decomposition automata.
 
 mod string;
+mod tree;
 
 use crate::{BottomUpTa, DetBottomUpTa, Signature, Symbol};
+use rusty_tree::tree::{Tree, TreeArena};
 use std::hash::Hash;
 
 pub use string::{
     SentenceSxHeuristic, Span, StringAlgebra, StringDecompositionAutomaton, UniversalSxHeuristic,
 };
+pub use tree::{APPEND_SYMBOL, Binarizing, TreeAlgebra, TreeValue};
 pub(crate) use string::{SpanProductSibling, SpanProductSiblingFinder};
 
 /// Algebra over a domain of values.
@@ -32,6 +35,19 @@ pub trait Algebra {
 
     /// Parse a textual representation of an algebra value.
     fn parse_object(&mut self, input: &str) -> Result<Self::Value, Self::ParseError>;
+
+    /// Evaluate a term tree bottom-up to a value, applying [`evaluate`](Self::evaluate)
+    /// at every node (e.g. a homomorphic image produced from a derivation tree).
+    ///
+    /// Returns `None` if any node's operation is undefined for its children.
+    fn evaluate_term(&self, arena: &TreeArena<Symbol>, root: Tree) -> Option<Self::Value> {
+        let children: Vec<Self::Value> = arena
+            .get_children(root)
+            .iter()
+            .map(|&child| self.evaluate_term(arena, child))
+            .collect::<Option<_>>()?;
+        self.evaluate(*arena.get_label(root), &children)
+    }
 
     /// Return whether `value` is a valid algebra value.
     fn is_valid_value(&self, _value: &Self::Value) -> bool {

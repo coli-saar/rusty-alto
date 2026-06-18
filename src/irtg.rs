@@ -1,10 +1,11 @@
 //! Interpreted regular tree grammars.
 
 use crate::{
-    Algebra, Explicit, ExplicitBuildError, ExplicitBuilder, FxHashMap, Homomorphism,
-    HomomorphismError, IndexedCondensedIntersectionStats, Interner, InvHom, MinHeuristic,
-    ObligatoryLeafTables, OutsideHeuristic, ScoredZeroHeuristic, Signature, SignatureError,
-    StateId, StringAlgebra, Symbol, UniversalSxHeuristic, ViterbiTree, WeightScorer, ZeroHeuristic,
+    APPEND_SYMBOL, Algebra, Binarizing, DisplayCodec, Explicit, ExplicitBuildError, ExplicitBuilder,
+    FxHashMap, Homomorphism, HomomorphismError, IndexedCondensedIntersectionStats, Interner, InvHom,
+    MinHeuristic, ObligatoryLeafTables, OutputCodec, OutsideHeuristic, ScoredZeroHeuristic,
+    Signature, SignatureError, SpaceJoinCodec, StateId, StringAlgebra, Symbol, TreeAlgebra,
+    UniversalSxHeuristic, ViterbiTree, WeightScorer, ZeroHeuristic,
     alto_ast::{AstHomTerm, AstIrtg, AstState, LexError, Tok, lex},
     alto_grammar,
     astar::{
@@ -16,11 +17,14 @@ use crate::{
     },
 };
 use lalrpop_util::ParseError;
-use rusty_tree::tree::Tree;
+use rusty_tree::tree::{Tree, TreeArena};
 use std::{any::Any, cell::RefCell, fmt, io::Read, marker::PhantomData};
 use thiserror::Error;
 
 const STRING_ALGEBRA: &str = "de.up.ling.irtg.algebra.StringAlgebra";
+const TREE_WITH_ARITIES_ALGEBRA: &str = "de.up.ling.irtg.algebra.TreeWithAritiesAlgebra";
+const BINARIZING_TREE_WITH_ARITIES_ALGEBRA: &str =
+    "de.up.ling.irtg.algebra.BinarizingTreeWithAritiesAlgebra";
 
 // ---------------------------------------------------------------------------
 // Materialization strategy
@@ -107,6 +111,16 @@ impl Irtg {
             .collect();
         names.sort_unstable();
         names
+    }
+
+    /// Iterate over all interpretations (in unspecified order).
+    pub fn interpretations(&self) -> impl Iterator<Item = &Interpretation> {
+        self.interpretations.values()
+    }
+
+    /// Return a reference to a named interpretation, or `None` if absent.
+    pub fn interpretation_ref(&self, name: &str) -> Option<&Interpretation> {
+        self.interpretations.get(name)
     }
 
     /// Return a typed handle for a named interpretation.
@@ -205,10 +219,9 @@ impl Irtg {
                     };
                     chart = next_chart;
                 }
-                InterpretationKind::Unsupported => {
-                    return Err(IrtgError::UnsupportedAlgebra {
+                InterpretationKind::OutputOnly => {
+                    return Err(IrtgError::NotInputable {
                         interpretation: interpretation.name.clone(),
-                        class_name: interpretation.class_name.clone(),
                     });
                 }
             }
@@ -315,9 +328,8 @@ impl Irtg {
                     );
                     Ok((tree, Some(stats)))
                 }
-                InterpretationKind::Unsupported => Err(IrtgError::UnsupportedAlgebra {
+                InterpretationKind::OutputOnly => Err(IrtgError::NotInputable {
                     interpretation: interpretation.name.clone(),
-                    class_name: interpretation.class_name.clone(),
                 }),
             }
         } else {
@@ -481,16 +493,88 @@ impl Irtg {
                         chart = next;
                     }
                 }
-                InterpretationKind::Unsupported => {
-                    return Err(IrtgError::UnsupportedAlgebra {
+                InterpretationKind::OutputOnly => {
+                    return Err(IrtgError::NotInputable {
                         interpretation: interpretation.name.clone(),
-                        class_name: interpretation.class_name.clone(),
                     });
                 }
             }
         }
 
         Ok((chart.viterbi_with(scorer), None))
+    }
+}
+
+/// Object-safe bridge that interprets a derivation tree through an interpretation's
+/// homomorphism and algebra, then renders the resulting value with a fixed output codec.
+///
+/// One concrete `Box<dyn DerivationRenderer>` is bound per algebra when the IRTG is built,
+/// so [`Interpretation`] can render values without the caller knowing concrete algebra types.
+trait DerivationRenderer: fmt::Debug {
+    fn render(
+        &self,
+        algebra: &dyn Any,
+        homomorphism: &Homomorphism,
+        arena: &TreeArena<Symbol>,
+        root: Tree,
+        name: &str,
+    ) -> Result<String, IrtgError>;
+}
+
+/// [`DerivationRenderer`] for a concrete algebra `A` paired with codec `C`.
+struct TypedDerivationCodec<A, C> {
+    codec: C,
+    _algebra: PhantomData<fn() -> A>,
+}
+
+impl<A, C> TypedDerivationCodec<A, C> {
+    fn new(codec: C) -> Self {
+        Self {
+            codec,
+            _algebra: PhantomData,
+        }
+    }
+}
+
+// Manual `Debug` so the bound is only on `C` (the derive would also require `A: Debug`).
+impl<A, C: fmt::Debug> fmt::Debug for TypedDerivationCodec<A, C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TypedDerivationCodec")
+            .field("codec", &self.codec)
+            .finish()
+    }
+}
+
+impl<A, C> DerivationRenderer for TypedDerivationCodec<A, C>
+where
+    A: Algebra + 'static,
+    A::Value: 'static,
+    C: OutputCodec<A::Value> + fmt::Debug,
+{
+    fn render(
+        &self,
+        algebra: &dyn Any,
+        homomorphism: &Homomorphism,
+        arena: &TreeArena<Symbol>,
+        root: Tree,
+        name: &str,
+    ) -> Result<String, IrtgError> {
+        let algebra = algebra
+            .downcast_ref::<A>()
+            .ok_or_else(|| IrtgError::WrongInputType {
+                interpretation: name.to_owned(),
+            })?;
+        // Map the derivation tree through the homomorphism, then evaluate in the algebra.
+        let mut image = TreeArena::new();
+        let image_root = homomorphism.apply(arena, root, &mut image)?;
+        let value =
+            algebra
+                .evaluate_term(&image, image_root)
+                .ok_or_else(|| IrtgError::ObjectParse {
+                    interpretation: name.to_owned(),
+                    message: "derivation tree did not evaluate in the algebra".to_owned(),
+                })?;
+        Ok(self.codec.encode(algebra.signature(), &value))
     }
 }
 
@@ -503,6 +587,7 @@ pub struct Interpretation {
     algebra: RefCell<Box<dyn Any>>,
     algebra_signature: Signature,
     homomorphism: Homomorphism,
+    renderer: Box<dyn DerivationRenderer>,
 }
 
 impl Interpretation {
@@ -525,12 +610,71 @@ impl Interpretation {
     pub fn homomorphism(&self) -> &Homomorphism {
         &self.homomorphism
     }
+
+    /// Return whether this interpretation can serve as a parse input (its algebra is decomposable).
+    /// Output-only interpretations (e.g. tree algebras) return `false`.
+    pub fn is_inputable(&self) -> bool {
+        matches!(self.kind, InterpretationKind::String)
+    }
+
+    /// Parse a textual object with this interpretation's algebra, returning a type-erased
+    /// value suitable for [`input_erased`](Self::input_erased).
+    pub fn parse_object_erased(&self, input: &str) -> Result<Box<dyn Any>, IrtgError> {
+        match self.kind {
+            InterpretationKind::String => {
+                let mut algebra = self.algebra.borrow_mut();
+                let algebra = algebra
+                    .as_mut()
+                    .downcast_mut::<StringAlgebra>()
+                    .ok_or_else(|| IrtgError::WrongInputType {
+                        interpretation: self.name.clone(),
+                    })?;
+                let value =
+                    algebra
+                        .parse_object(input)
+                        .map_err(|err| IrtgError::ObjectParse {
+                            interpretation: self.name.clone(),
+                            message: err.to_string(),
+                        })?;
+                Ok(Box::new(value))
+            }
+            InterpretationKind::OutputOnly => Err(IrtgError::ObjectParse {
+                interpretation: self.name.clone(),
+                message: "interpretation is output-only and cannot be parsed as a parse input"
+                    .to_owned(),
+            }),
+        }
+    }
+
+    /// Package a type-erased value (from [`parse_object_erased`](Self::parse_object_erased))
+    /// as a [`ParseInput`] for [`Irtg::parse`].
+    pub fn input_erased(&self, value: Box<dyn Any>) -> ParseInput<'_> {
+        ParseInput {
+            interpretation: self,
+            value,
+        }
+    }
+
+    /// Interpret a derivation tree (over grammar symbols) through this interpretation and
+    /// render the resulting algebra value as text using the interpretation's output codec.
+    pub fn interpret_to_string(
+        &self,
+        arena: &TreeArena<Symbol>,
+        root: Tree,
+    ) -> Result<String, IrtgError> {
+        let algebra = self.algebra.borrow();
+        self.renderer
+            .render(&**algebra, &self.homomorphism, arena, root, &self.name)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InterpretationKind {
+    /// A [`StringAlgebra`] interpretation: can be a parse input (decomposable).
     String,
-    Unsupported,
+    /// An output-only interpretation (e.g. a tree algebra): values can be produced from a
+    /// derivation tree, but the algebra cannot be decomposed for use as a parse input.
+    OutputOnly,
 }
 
 /// Typed access to an interpretation.
@@ -642,6 +786,12 @@ pub enum IrtgError {
         /// Interpretation name.
         interpretation: String,
     },
+    /// An output-only interpretation was used as a parse input.
+    #[error("interpretation {interpretation:?} is output-only and cannot be a parse input")]
+    NotInputable {
+        /// Interpretation name.
+        interpretation: String,
+    },
     /// The algebra could not parse an object.
     #[error("failed to parse object for interpretation {interpretation:?}: {message}")]
     ObjectParse {
@@ -729,18 +879,54 @@ fn build_irtg(ast: AstIrtg) -> Result<Irtg, IrtgError> {
 
     let mut interpretations = FxHashMap::default();
     for decl in ast.interpretations {
-        let (kind, algebra, algebra_signature): (InterpretationKind, Box<dyn Any>, Signature) =
-            if decl.algebra == STRING_ALGEBRA {
-                let signature = algebra_signatures.remove(&decl.name).unwrap_or_default();
-                let algebra = StringAlgebra::with_signature(signature.clone());
-                (InterpretationKind::String, Box::new(algebra), signature)
-            } else {
-                (
-                    InterpretationKind::Unsupported,
-                    Box::new(()),
-                    Signature::new(),
-                )
-            };
+        let (kind, algebra, algebra_signature, renderer): (
+            InterpretationKind,
+            Box<dyn Any>,
+            Signature,
+            Box<dyn DerivationRenderer>,
+        ) = if decl.algebra == STRING_ALGEBRA {
+            let signature = algebra_signatures.remove(&decl.name).unwrap_or_default();
+            let algebra = StringAlgebra::with_signature(signature.clone());
+            let renderer = Box::new(TypedDerivationCodec::<StringAlgebra, SpaceJoinCodec>::new(
+                SpaceJoinCodec,
+            ));
+            (
+                InterpretationKind::String,
+                Box::new(algebra),
+                signature,
+                renderer,
+            )
+        } else if decl.algebra == TREE_WITH_ARITIES_ALGEBRA {
+            let signature = algebra_signatures.remove(&decl.name).unwrap_or_default();
+            let algebra = TreeAlgebra::with_arities(signature.clone());
+            let renderer =
+                Box::new(TypedDerivationCodec::<TreeAlgebra, DisplayCodec>::new(DisplayCodec));
+            (
+                InterpretationKind::OutputOnly,
+                Box::new(algebra),
+                signature,
+                renderer,
+            )
+        } else if decl.algebra == BINARIZING_TREE_WITH_ARITIES_ALGEBRA {
+            let signature = algebra_signatures.remove(&decl.name).unwrap_or_default();
+            let append = signature.get(APPEND_SYMBOL);
+            let algebra = Binarizing::new(TreeAlgebra::with_arities(signature.clone()), append);
+            let renderer = Box::new(TypedDerivationCodec::<
+                Binarizing<TreeAlgebra>,
+                DisplayCodec,
+            >::new(DisplayCodec));
+            (
+                InterpretationKind::OutputOnly,
+                Box::new(algebra),
+                signature,
+                renderer,
+            )
+        } else {
+            return Err(IrtgError::UnsupportedAlgebra {
+                interpretation: decl.name.clone(),
+                class_name: decl.algebra.clone(),
+            });
+        };
         let homomorphism = homs.remove(&decl.name).unwrap_or_else(Homomorphism::new);
         interpretations.insert(
             decl.name.clone(),
@@ -751,6 +937,7 @@ fn build_irtg(ast: AstIrtg) -> Result<Irtg, IrtgError> {
                 algebra: RefCell::new(algebra),
                 algebra_signature,
                 homomorphism,
+                renderer,
             },
         );
     }

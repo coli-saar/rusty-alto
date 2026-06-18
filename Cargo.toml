@@ -13,6 +13,7 @@ smallvec = "1"
 thiserror = "2"
 lalrpop-util = "0.23"
 orx-priority-queue = "1.8"
+indicatif = "0.17"
 
 [dev-dependencies]
 criterion = "0.5"
@@ -27,6 +28,10 @@ stats = []
 [[bin]]
 name = "ptb-eval"
 path = "src/bin/ptb-eval.rs"
+
+[[bin]]
+name = "eval"
+path = "src/bin/eval.rs"
 
 [[bench]]
 name = "phase1"
