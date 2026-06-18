@@ -25,7 +25,7 @@ use crate::{
         ProductStateMap, StateInterner, TrustedRuleTracker, for_each_nullary_edge,
         get_or_create_product_id_direct,
     },
-    viterbi::{Backpointer, ViterbiTree, build_tree},
+    viterbi::{Backpointer, ViterbiTree, build_tree_from_arena},
 };
 use fixedbitset::FixedBitSet;
 use rusty_tree::tree::TreeArena;
@@ -128,21 +128,20 @@ impl PreparedAstarGrammar {
 // ---------------------------------------------------------------------------
 
 /// The edge information stored with an agenda item.
-struct EmitEdge {
-    symbol: Symbol,
+struct PendingEdge {
+    rule_index: u32,
     children: SmallVec<[StateId; 2]>,
-    weight: f64,
 }
 
 /// The payload for a pending item on the A* agenda. The heap itself stores only
 /// the product-state index and the priority key.
 struct AgendaItem {
-    edge: EmitEdge,
+    edge: PendingEdge,
 }
 
 struct FinalizedItem {
     product: StateId,
-    edge: EmitEdge,
+    edge: PendingEdge,
     inside: f64,
     merit: f64,
     left_state: StateId,
@@ -205,9 +204,7 @@ pub struct AstarStats {
     /// Number of items pushed onto the heap.
     pub heap_pushes: usize,
     /// Number of candidate pushes that superseded an older heap entry for the
-    /// same product state. With the current lazy-duplicate heap, these are not
-    /// decrease-key updates; they are the entries that a decrease-key heap
-    /// would update in place.
+    /// same product state. The indexed heap updates these entries in place.
     pub heap_updates: usize,
     /// Maximum number of live product entries in the agenda.
     pub max_heap_len: usize,
@@ -313,11 +310,6 @@ fn first_trigger(
         .all(|&c| c != trigger_product)
 }
 
-fn string_product_heap_bound(left: &Explicit, n: usize) -> usize {
-    let spans = n.saturating_mul(n + 1) / 2;
-    (left.num_states() as usize).saturating_mul(spans).max(1024)
-}
-
 /// Whether the heuristic's sound `admits` filter is consulted at
 /// candidate-construction time to skip building hopeless edges (the F
 /// obligatory-leaf filter). Defaults to **on**; set `RUSTY_ALTO_F_FILTER=0`
@@ -362,7 +354,8 @@ where
     /// Best discovered inside score for each product state. For closed products
     /// this is also the finalized inside score.
     best_score: Vec<f64>,
-    back: Vec<Option<Backpointer>>,
+    backpointer_ids: Vec<Option<u32>>,
+    backpointers: Vec<Backpointer>,
     store_backpointers: bool,
     heap: AstarAgenda,
     pending: Vec<Option<AgendaItem>>,
@@ -395,7 +388,6 @@ where
         left_index: &'a LeftIndex,
         right_interner: I,
         with_builder: bool,
-        _heap_index_bound: usize,
         scorer: &impl WeightScorer,
         use_generic_source: bool,
     ) -> Self {
@@ -425,7 +417,8 @@ where
             ever_finalized: FixedBitSet::new(),
             finalized_partners: Vec::new(),
             best_score: Vec::new(),
-            back: Vec::new(),
+            backpointer_ids: Vec::new(),
+            backpointers: Vec::new(),
             store_backpointers,
             heap: AstarAgenda::new(),
             pending: Vec::new(),
@@ -449,8 +442,8 @@ where
         if self.best_score.len() < idx {
             self.best_score.resize(idx, zero);
         }
-        if self.back.len() < idx && self.store_backpointers {
-            self.back.resize(idx, None);
+        if self.backpointer_ids.len() < idx && self.store_backpointers {
+            self.backpointer_ids.resize(idx, None);
         }
         if self.pending.len() < idx {
             self.pending.resize_with(idx, || None);
@@ -567,7 +560,6 @@ where
         h: &H,
     ) {
         let inside = scorer.times(self.rule_scores[rule_index], child_score);
-        let rule = &self.left_rules[rule_index];
 
         // Sound construction-time filter and outside estimate. Keeping these
         // together lets composite heuristics share their lookup work.
@@ -613,10 +605,9 @@ where
 
         let merit = scorer.times(inside, outside);
         self.pending[parent.index()] = Some(AgendaItem {
-            edge: EmitEdge {
-                symbol: rule.symbol,
+            edge: PendingEdge {
+                rule_index: u32::try_from(rule_index).expect("too many A* rules"),
                 children: children.iter().copied().collect(),
-                weight: rule.weight,
             },
         });
         match self.heap.update_or_push(parent.index(), merit) {
@@ -1018,10 +1009,9 @@ where
 
         let merit = scorer.times(inside, outside);
         self.pending[product.index()] = Some(AgendaItem {
-            edge: EmitEdge {
-                symbol: edge.symbol,
+            edge: PendingEdge {
+                rule_index: u32::try_from(edge.rule_index).expect("too many A* rules"),
                 children: SmallVec::new(),
-                weight: edge.weight,
             },
         });
         match self.heap.update_or_push(product.index(), merit) {
@@ -1067,11 +1057,20 @@ where
 
         self.finalized.set(product.index(), true);
         if self.store_backpointers {
-            self.back[product.index()] = Some(Backpointer {
-                symbol: item.edge.symbol,
+            let rule = &self.left_rules[item.edge.rule_index as usize];
+            let backpointer = Backpointer {
+                symbol: rule.symbol,
                 children: item.edge.children.clone(),
                 weight: inside,
-            });
+            };
+            if let Some(id) = self.backpointer_ids[product.index()] {
+                self.backpointers[id as usize] = backpointer;
+            } else {
+                let id = u32::try_from(self.backpointers.len())
+                    .expect("too many finalized A* backpointers");
+                self.backpointers.push(backpointer);
+                self.backpointer_ids[product.index()] = Some(id);
+            }
         }
         if !self.ever_finalized.contains(product.index()) {
             self.ever_finalized.set(product.index(), true);
@@ -1111,7 +1110,7 @@ where
         H: IntersectionHeuristic<R>,
         S: WeightScorer,
         Source: CandidateSource<R, I>,
-        OnFin: FnMut(&mut Self, StateId, &EmitEdge, f64, f64),
+        OnFin: FnMut(&mut Self, StateId, &PendingEdge, f64, f64),
     {
         source.seed(self, h, scorer);
         while let Some(item) = self.pop_next_finalized() {
@@ -1376,7 +1375,7 @@ where
         R: CondensedTa<State = Span> + DetBottomUpTa<State = Span>,
         H: IntersectionHeuristic<R>,
         S: WeightScorer,
-        OnFin: FnMut(&mut Self, StateId, &EmitEdge, f64, f64),
+        OnFin: FnMut(&mut Self, StateId, &PendingEdge, f64, f64),
     {
         let mut frontier = SpanLazyFrontier::new();
 
@@ -1676,7 +1675,6 @@ where
         options,
         scorer,
         right.inner().len(),
-        string_product_heap_bound(left, right.inner().len()),
         Some(&fallback_rules),
         false,
     )
@@ -1691,7 +1689,6 @@ fn materialize_astar_intersection_with_span_sibling<R, H, S>(
     options: AstarOptions,
     scorer: &S,
     sentence_len: usize,
-    heap_index_bound: usize,
     fallback_rules: Option<&FixedBitSet>,
     lazy: bool,
 ) -> (Explicit, Interner<Span>, AstarStats)
@@ -1718,7 +1715,6 @@ where
         left_index,
         SpanInterner::new(sentence_len),
         true,
-        heap_index_bound,
         scorer,
         use_generic_source,
     );
@@ -1727,21 +1723,24 @@ where
 
     let on_finalize = |ctx: &mut AstarContext<'_, R, SpanInterner>,
                        product: StateId,
-                       edge: &EmitEdge,
+                       edge: &PendingEdge,
                        _inside: f64,
                        merit: f64| {
         let emit = stop_at_first_goal || beam.is_none_or(|threshold| merit >= threshold);
         if emit {
+            let rule = &ctx.left_rules[edge.rule_index as usize];
+            let symbol = rule.symbol;
+            let weight = rule.weight;
             let builder = ctx
                 .builder
                 .as_mut()
                 .expect("chart mode always has a builder");
             ctx.rule_tracker.add_rule(
                 builder,
-                edge.symbol,
+                symbol,
                 edge.children.clone(),
                 product,
-                edge.weight,
+                weight,
             );
             ctx.stats.emitted_rules += 1;
         }
@@ -1813,7 +1812,6 @@ where
         &left_index,
         Interner::new(),
         true,
-        16 * 1024,
         scorer,
         true,
     );
@@ -1830,6 +1828,9 @@ where
             // Emit a rule if in beam mode or one-best mode.
             let emit = stop_at_first_goal || beam.is_none_or(|threshold| merit >= threshold);
             if emit {
+                let rule = &ctx.left_rules[edge.rule_index as usize];
+                let symbol = rule.symbol;
+                let weight = rule.weight;
                 let builder = ctx
                     .builder
                     .as_mut()
@@ -1839,10 +1840,10 @@ where
                 // `_product` itself).
                 ctx.rule_tracker.add_rule(
                     builder,
-                    edge.symbol,
+                    symbol,
                     edge.children.clone(),
                     _product,
-                    edge.weight,
+                    weight,
                 );
                 ctx.stats.emitted_rules += 1;
             }
@@ -1945,7 +1946,6 @@ where
         h,
         scorer,
         right.inner().len(),
-        string_product_heap_bound(left, right.inner().len()),
         Some(&fallback_rules),
         false,
     )
@@ -1959,7 +1959,6 @@ fn astar_one_best_with_stats_and_span_sibling<R, H, S>(
     h: &H,
     scorer: &S,
     sentence_len: usize,
-    heap_index_bound: usize,
     fallback_rules: Option<&FixedBitSet>,
     lazy: bool,
 ) -> (Option<ViterbiTree>, AstarStats)
@@ -1986,7 +1985,6 @@ where
         left_index,
         SpanInterner::new(sentence_len),
         false,
-        heap_index_bound,
         scorer,
         use_generic_source,
     );
@@ -1994,7 +1992,7 @@ where
 
     let on_finalize = |ctx: &mut AstarContext<'_, R, SpanInterner>,
                        product: StateId,
-                       _edge: &EmitEdge,
+                       _edge: &PendingEdge,
                        inside: f64,
                        _merit: f64| {
         if goal_state.is_none() && ctx.is_accepting_product(product) {
@@ -2027,7 +2025,12 @@ where
     ctx.stats.right_indexed_queries = ctx.mat_stats.right_indexed_queries;
 
     let mut arena = TreeArena::new();
-    let Some(root) = build_tree(goal, &ctx.back, &mut arena) else {
+    let Some(root) = build_tree_from_arena(
+        goal,
+        &ctx.backpointer_ids,
+        &ctx.backpointers,
+        &mut arena,
+    ) else {
         return (None, ctx.stats);
     };
     let tree =
@@ -2065,7 +2068,6 @@ where
         &left_index,
         Interner::new(),
         false,
-        16 * 1024,
         scorer,
         true,
     );
@@ -2086,7 +2088,12 @@ where
     ctx.stats.right_indexed_queries = ctx.mat_stats.right_indexed_queries;
 
     let mut arena = TreeArena::new();
-    let Some(root) = build_tree(goal, &ctx.back, &mut arena) else {
+    let Some(root) = build_tree_from_arena(
+        goal,
+        &ctx.backpointer_ids,
+        &ctx.backpointers,
+        &mut arena,
+    ) else {
         return (None, ctx.stats);
     };
     let tree =
@@ -2538,7 +2545,6 @@ mod tests {
         let h = ZeroHeuristic;
         let prepared = PreparedAstarGrammar::new(&grammar);
         let n = right.inner().len();
-        let bound = string_product_heap_bound(&grammar, n);
 
         let (eager, eager_stats) = astar_one_best_with_stats_and_span_sibling(
             &grammar,
@@ -2547,7 +2553,6 @@ mod tests {
             &h,
             &ProbabilityScorer,
             n,
-            bound,
             None,
             false,
         );
@@ -2558,7 +2563,6 @@ mod tests {
             &h,
             &ProbabilityScorer,
             n,
-            bound,
             None,
             true,
         );
@@ -2582,7 +2586,6 @@ mod tests {
         let h = ZeroHeuristic;
         let prepared = PreparedAstarGrammar::new(&grammar);
         let n = right.inner().len();
-        let bound = string_product_heap_bound(&grammar, n);
         let options = || AstarOptions {
             stop_at_first_goal: false,
             beam: None,
@@ -2596,7 +2599,6 @@ mod tests {
             options(),
             &ProbabilityScorer,
             n,
-            bound,
             None,
             false,
         );
@@ -2608,7 +2610,6 @@ mod tests {
             options(),
             &ProbabilityScorer,
             n,
-            bound,
             None,
             true,
         );

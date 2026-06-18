@@ -53,8 +53,8 @@ pub(crate) struct SpanProductSibling {
 /// the sibling slot of the current left rule.
 #[derive(Debug, Default)]
 pub(crate) struct SpanProductSiblingFinder {
-    left_slots_by_end: Vec<Vec<Option<usize>>>,
-    right_slots_by_start: Vec<Vec<Option<usize>>>,
+    left_slots_by_end: FxHashMap<(usize, StateId), usize>,
+    right_slots_by_start: FxHashMap<(usize, StateId), usize>,
     left_lists: Vec<Vec<SpanProductSibling>>,
     right_lists: Vec<Vec<SpanProductSibling>>,
     seen_left: FixedBitSet,
@@ -82,18 +82,14 @@ impl SpanProductSiblingFinder {
                     return false;
                 }
                 self.seen_left.set(product.index(), true);
-                if self.left_slots_by_end.len() <= span.end {
-                    self.left_slots_by_end.resize_with(span.end + 1, Vec::new);
-                }
-                let by_left = &mut self.left_slots_by_end[span.end];
-                if by_left.len() <= left_state.index() {
-                    by_left.resize(left_state.index() + 1, None);
-                }
-                let slot = *by_left[left_state.index()].get_or_insert_with(|| {
-                    let slot = self.left_lists.len();
-                    self.left_lists.push(Vec::new());
-                    slot
-                });
+                let slot = *self
+                    .left_slots_by_end
+                    .entry((span.end, left_state))
+                    .or_insert_with(|| {
+                        let slot = self.left_lists.len();
+                        self.left_lists.push(Vec::new());
+                        slot
+                    });
                 self.left_lists[slot].push(SpanProductSibling {
                     product,
                     right_state,
@@ -108,19 +104,14 @@ impl SpanProductSiblingFinder {
                     return false;
                 }
                 self.seen_right.set(product.index(), true);
-                if self.right_slots_by_start.len() <= span.start {
-                    self.right_slots_by_start
-                        .resize_with(span.start + 1, Vec::new);
-                }
-                let by_left = &mut self.right_slots_by_start[span.start];
-                if by_left.len() <= left_state.index() {
-                    by_left.resize(left_state.index() + 1, None);
-                }
-                let slot = *by_left[left_state.index()].get_or_insert_with(|| {
-                    let slot = self.right_lists.len();
-                    self.right_lists.push(Vec::new());
-                    slot
-                });
+                let slot = *self
+                    .right_slots_by_start
+                    .entry((span.start, left_state))
+                    .or_insert_with(|| {
+                        let slot = self.right_lists.len();
+                        self.right_lists.push(Vec::new());
+                        slot
+                    });
                 self.right_lists[slot].push(SpanProductSibling {
                     product,
                     right_state,
@@ -158,15 +149,13 @@ impl SpanProductSiblingFinder {
         let slot = match position {
             0 => self
                 .right_slots_by_start
-                .get(span.end)
-                .and_then(|by_left| by_left.get(required_left.index()))
-                .and_then(|slot| *slot)
+                .get(&(span.end, required_left))
+                .copied()
                 .and_then(|slot| self.right_lists.get(slot)),
             1 => self
                 .left_slots_by_end
-                .get(span.start)
-                .and_then(|by_left| by_left.get(required_left.index()))
-                .and_then(|slot| *slot)
+                .get(&(span.start, required_left))
+                .copied()
                 .and_then(|slot| self.left_lists.get(slot)),
             _ => None,
         };
@@ -1646,6 +1635,23 @@ mod tests {
                 right_state: StateId(21)
             }]
         );
+    }
+
+    #[test]
+    fn span_product_sibling_finder_allocates_only_populated_slots() {
+        let mut finder = SpanProductSiblingFinder::default();
+        let sparse_left = StateId(1_000_000);
+
+        assert!(finder.activate(
+            StateId(0),
+            sparse_left,
+            StateId(0),
+            Span::new(10_000, 20_000),
+            0,
+        ));
+        assert_eq!(finder.left_slots_by_end.len(), 1);
+        assert_eq!(finder.left_lists.len(), 1);
+        assert!(finder.right_slots_by_start.is_empty());
     }
 
     #[test]

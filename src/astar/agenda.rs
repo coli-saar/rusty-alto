@@ -123,3 +123,45 @@ impl AstarAgenda {
         self.positions.len()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grows_positions_on_demand_and_updates_in_place() {
+        let mut agenda = AstarAgenda::new();
+        assert_eq!(agenda.position_capacity(), 0);
+
+        assert!(matches!(
+            agenda.update_or_push(10_000, 1.0),
+            AgendaUpdate::Pushed
+        ));
+        assert_eq!(agenda.len(), 1);
+        assert_eq!(agenda.position_capacity(), 10_001);
+
+        assert!(matches!(
+            agenda.update_or_push(10_000, 2.0),
+            AgendaUpdate::Updated
+        ));
+        assert_eq!(agenda.len(), 1);
+        assert_eq!(agenda.pop(), Some((10_000, 2.0)));
+    }
+
+    #[test]
+    fn quaternary_heap_preserves_descending_merit() {
+        let mut agenda = AstarAgenda::new();
+        for (index, merit) in [3.0, 8.0, 1.0, 7.0, 9.0, 2.0, 6.0, 5.0, 4.0]
+            .into_iter()
+            .enumerate()
+        {
+            agenda.update_or_push(index, merit);
+        }
+
+        let mut merits = Vec::new();
+        while let Some((_, merit)) = agenda.pop() {
+            merits.push(merit);
+        }
+        assert_eq!(merits, vec![9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0]);
+    }
+}

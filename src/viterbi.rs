@@ -200,6 +200,22 @@ pub(crate) fn build_tree(
     Some(arena.add_node(backpointer.symbol, children))
 }
 
+pub(crate) fn build_tree_from_arena(
+    state: StateId,
+    backpointer_ids: &[Option<u32>],
+    backpointers: &[Backpointer],
+    arena: &mut TreeArena<Symbol>,
+) -> Option<Tree> {
+    let id = backpointer_ids.get(state.index())?.as_ref()?;
+    let backpointer = backpointers.get(*id as usize)?;
+    let children = backpointer
+        .children
+        .iter()
+        .map(|&child| build_tree_from_arena(child, backpointer_ids, backpointers, arena))
+        .collect::<Option<Vec<_>>>()?;
+    Some(arena.add_node(backpointer.symbol, children))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
