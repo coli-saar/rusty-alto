@@ -120,12 +120,11 @@ impl Explicit {
 
         let mut best_final = None::<(StateId, f64)>;
         self.initial_states(&mut |state| {
-            if let Some(backpointer) = best.get(state.index()).and_then(Option::as_ref) {
-                if best_final
+            if let Some(backpointer) = best.get(state.index()).and_then(Option::as_ref)
+                && best_final
                     .is_none_or(|(_, old_weight)| scorer.better(backpointer.weight, old_weight))
-                {
-                    best_final = Some((state, backpointer.weight));
-                }
+            {
+                best_final = Some((state, backpointer.weight));
             }
         });
 

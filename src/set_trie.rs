@@ -117,6 +117,11 @@ pub trait KeySet<K> {
     /// Number of keys in the set.
     fn len(&self) -> usize;
 
+    /// Return whether the set contains no keys.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Return whether the set contains `key`.
     fn contains(&self, key: &K) -> bool;
 

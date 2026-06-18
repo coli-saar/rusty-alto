@@ -402,16 +402,17 @@ V -> r5
             "i".to_string(),
             "de.up.ling.irtg.algebra.StringAlgebra".to_string(),
         )];
-        let mut writer = CorpusWriter::new(&mut buf, &[], "# ", &interps, true).unwrap();
-        writer
-            .write_instance(
-                &irtg,
-                &corpus.interpretation_order,
-                Some((tree.arena(), tree.root())),
-                &corpus.instances[0],
-            )
-            .unwrap();
-        drop(writer);
+        {
+            let mut writer = CorpusWriter::new(&mut buf, &[], "# ", &interps, true).unwrap();
+            writer
+                .write_instance(
+                    &irtg,
+                    &corpus.interpretation_order,
+                    Some((tree.arena(), tree.root())),
+                    &corpus.instances[0],
+                )
+                .unwrap();
+        }
 
         let out = String::from_utf8(buf).unwrap();
         assert!(out.contains("# IRTG annotated corpus file, v1.0"));
@@ -433,11 +434,12 @@ V -> r5
             "i".to_string(),
             "de.up.ling.irtg.algebra.StringAlgebra".to_string(),
         )];
-        let mut writer = CorpusWriter::new(&mut buf, &[], "# ", &interps, true).unwrap();
-        writer
-            .write_instance(&irtg, &corpus.interpretation_order, None, &corpus.instances[0])
-            .unwrap();
-        drop(writer);
+        {
+            let mut writer = CorpusWriter::new(&mut buf, &[], "# ", &interps, true).unwrap();
+            writer
+                .write_instance(&irtg, &corpus.interpretation_order, None, &corpus.instances[0])
+                .unwrap();
+        }
 
         let out = String::from_utf8(buf).unwrap();
         assert!(out.contains("\njohn watches mary\n_null_\n")); // echoed input + null tree

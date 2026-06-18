@@ -320,10 +320,10 @@ impl Explicit {
         let mut mentions: FxHashMap<StateId, Vec<usize>> = FxHashMap::default();
 
         for (idx, rule) in self.rules.iter().enumerate() {
-            if rule.children.is_empty() {
-                if mark_reachable(&mut reachable, &mut worklist, rule.result) {
-                    continue;
-                }
+            if rule.children.is_empty()
+                && mark_reachable(&mut reachable, &mut worklist, rule.result)
+            {
+                continue;
             }
             let mut unique_children: SmallVec<[StateId; 4]> = SmallVec::new();
             for &child in rule.children.iter() {

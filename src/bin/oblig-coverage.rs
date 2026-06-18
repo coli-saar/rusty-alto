@@ -39,6 +39,7 @@ struct FlatRule {
 
 /// Sparse leaf multiset: symbol-id → count.
 type Bag = BTreeMap<u32, u32>;
+type ObligationTables = (Vec<Option<Bag>>, Vec<Option<Bag>>, Vec<Option<Bag>>);
 
 // ---------------------------------------------------------------------------
 // Bag helpers
@@ -140,7 +141,7 @@ fn compute(
     num_states: usize,
     flat_rules: &[FlatRule],
     accepting: &[usize],
-) -> (Vec<Option<Bag>>, Vec<Option<Bag>>, Vec<Option<Bag>>) {
+) -> ObligationTables {
     // Phase B: mic
     let mut mic: Vec<Option<Bag>> = vec![None; num_states];
     loop {
@@ -307,19 +308,19 @@ fn report(
     let req_left_nonempty: Vec<usize> = universe
         .iter()
         .copied()
-        .filter(|&i| req_left[i].as_ref().map_or(false, |b| !b.is_empty()))
+        .filter(|&i| req_left[i].as_ref().is_some_and(|b| !b.is_empty()))
         .collect();
     let req_right_nonempty: Vec<usize> = universe
         .iter()
         .copied()
-        .filter(|&i| req_right[i].as_ref().map_or(false, |b| !b.is_empty()))
+        .filter(|&i| req_right[i].as_ref().is_some_and(|b| !b.is_empty()))
         .collect();
     let req_any_nonempty: Vec<usize> = universe
         .iter()
         .copied()
         .filter(|&i| {
-            req_left[i].as_ref().map_or(false, |b| !b.is_empty())
-                || req_right[i].as_ref().map_or(false, |b| !b.is_empty())
+            req_left[i].as_ref().is_some_and(|b| !b.is_empty())
+                || req_right[i].as_ref().is_some_and(|b| !b.is_empty())
         })
         .collect();
 
@@ -414,7 +415,7 @@ fn report(
             }
         }
         let mut ranked: Vec<(usize, u32)> = term_counts.into_iter().map(|(k, v)| (v, k)).collect();
-        ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        ranked.sort_unstable_by_key(|item| std::cmp::Reverse(item.0));
         println!("Top 15 obligatory terminals (by # states requiring them):");
         for (count, sym) in ranked.iter().take(15) {
             let word = sig.resolve(Symbol(*sym));

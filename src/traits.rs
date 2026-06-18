@@ -113,6 +113,7 @@ pub trait IndexedBottomUpTa: BottomUpTa {
     ///
     /// `children` is borrowed from the implementation and is valid only for
     /// the callback. Implementations must not emit duplicate rules.
+    #[allow(clippy::type_complexity)]
     fn step_partial(
         &self,
         f: Symbol,
@@ -262,6 +263,7 @@ pub trait CondensedTa: BottomUpTa {
     /// The default implementation filters [`CondensedTa::condensed_rules`].
     /// Implementations on hot paths should override this to avoid materializing
     /// or scanning unrelated condensed rules.
+    #[allow(clippy::type_complexity)]
     fn condensed_rules_by_child(
         &self,
         position: usize,

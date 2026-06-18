@@ -1151,6 +1151,7 @@ where
     /// `position`, right state `trigger_right`) with `sibling`, or `None` if no
     /// rule yields a valid right transition. All rules for one sibling share the
     /// same child pair, so they realize together.
+    #[allow(clippy::too_many_arguments)]
     fn lazy_sibling_merit<H: IntersectionHeuristic<R>, S: WeightScorer>(
         &mut self,
         trigger: StateId,

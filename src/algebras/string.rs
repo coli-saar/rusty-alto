@@ -549,10 +549,10 @@ impl YieldTemplate {
     fn children_in_order(&self) -> Vec<usize> {
         let mut seen = Vec::new();
         for &t in &self.tokens {
-            if let YieldToken::Child(i) = t {
-                if !seen.contains(&i) {
-                    seen.push(i);
-                }
+            if let YieldToken::Child(i) = t
+                && !seen.contains(&i)
+            {
+                seen.push(i);
             }
         }
         seen
@@ -591,10 +591,8 @@ impl YieldTemplate {
         for &t in &self.tokens {
             match t {
                 YieldToken::Child(i) if i == p => break,
-                YieldToken::Child(i) => {
-                    if !result.contains(&i) {
-                        result.push(i);
-                    }
+                YieldToken::Child(i) if !result.contains(&i) => {
+                    result.push(i);
                 }
                 _ => {}
             }
@@ -609,10 +607,8 @@ impl YieldTemplate {
         for &t in &self.tokens {
             match t {
                 YieldToken::Child(i) if i == p => after = true,
-                YieldToken::Child(i) if after => {
-                    if !result.contains(&i) {
-                        result.push(i);
-                    }
+                YieldToken::Child(i) if after && !result.contains(&i) => {
+                    result.push(i);
                 }
                 _ => {}
             }
@@ -929,7 +925,7 @@ impl SxHeuristic {
                         child_states.into_iter().map(|s| s.unwrap()).collect();
                     let mins: Vec<usize> =
                         child_states.iter().map(|s| minwidth[s.index()]).collect();
-                    if mins.iter().any(|&m| m == INF) {
+                    if mins.contains(&INF) {
                         continue;
                     }
                     let min_sum: usize = mins.iter().sum();
@@ -1106,12 +1102,17 @@ impl SxHeuristic {
                             } else {
                                 0
                             });
-                            for w1 in mw1..=max_w1 {
+                            let child1_bi = &bi[child1_state.index()];
+                            for (w1, &bi1) in child1_bi
+                                .iter()
+                                .enumerate()
+                                .take(max_w1 + 1)
+                                .skip(mw1)
+                            {
                                 let w0 = remaining_for_children - w1;
                                 if mw0 < INF && w0 < mw0 {
                                     continue;
                                 }
-                                let bi1 = bi[child1_state.index()][w1];
                                 if bi1 == scorer.zero() {
                                     continue;
                                 }
@@ -1143,12 +1144,17 @@ impl SxHeuristic {
                             } else {
                                 0
                             });
-                            for w0 in mw0..=max_w0 {
+                            let child0_bi = &bi[child0_state.index()];
+                            for (w0, &bi0) in child0_bi
+                                .iter()
+                                .enumerate()
+                                .take(max_w0 + 1)
+                                .skip(mw0)
+                            {
                                 let w1 = remaining_for_children - w0;
                                 if mw1 < INF && w1 < mw1 {
                                     continue;
                                 }
-                                let bi0 = bi[child0_state.index()][w0];
                                 if bi0 == scorer.zero() {
                                     continue;
                                 }
@@ -1202,7 +1208,7 @@ impl SxHeuristic {
                                 siblings.iter().map(|(_, s)| *s).collect();
                             let sib_mins: Vec<usize> =
                                 sib_states.iter().map(|s| minwidth[s.index()]).collect();
-                            if sib_mins.iter().any(|&m| m == INF) {
+                            if sib_mins.contains(&INF) {
                                 continue;
                             }
                             let sib_min_sum: usize = sib_mins.iter().sum();
@@ -1412,6 +1418,7 @@ impl IntersectionHeuristic<InvHom<'_, StringDecompositionAutomaton>> for Sentenc
 }
 
 /// Recursively enumerate all width splits for multiple children, accumulating the product of BI values.
+#[allow(clippy::too_many_arguments)]
 fn enumerate_splits(
     child_states: &[StateId],
     mins: &[usize],
@@ -1484,6 +1491,7 @@ fn enumerate_sibling_splits(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn enumerate_sibling_splits_inner(
     sib_states: &[StateId],
     sib_mins: &[usize],

@@ -112,6 +112,12 @@ pub struct Homomorphism {
     root_index: FxHashMap<Symbol, Vec<usize>>,
 }
 
+impl Default for Homomorphism {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Homomorphism {
     /// Create an empty homomorphism.
     pub fn new() -> Self {
@@ -168,14 +174,14 @@ impl Homomorphism {
         src_arity: usize,
         rhs: HomTerm,
     ) -> Result<(), HomomorphismError> {
-        if let Some(&old) = self.arities.get(&src) {
-            if old != src_arity {
-                return Err(HomomorphismError::ArityMismatch {
-                    symbol: src,
-                    first: old,
-                    second: src_arity,
-                });
-            }
+        if let Some(&old) = self.arities.get(&src)
+            && old != src_arity
+        {
+            return Err(HomomorphismError::ArityMismatch {
+                symbol: src,
+                first: old,
+                second: src_arity,
+            });
         }
 
         self.validate_nondeleting(src, src_arity, rhs)?;

@@ -182,6 +182,7 @@ fn direct_linear_term(
     Some(DirectTerm { symbol, variables })
 }
 
+#[allow(clippy::type_complexity)]
 fn match_topdown_term<A>(
     arena: &TreeArena<HomLabel>,
     term: HomTerm,
@@ -230,7 +231,7 @@ fn match_topdown_term<A>(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn match_topdown_children<A>(
     arena: &TreeArena<HomLabel>,
     term_children: &[HomTerm],
@@ -352,10 +353,10 @@ where
                 if rule.children.len() != term_children.len() {
                     continue;
                 }
-                if let Some(q) = expected {
-                    if &rule.result != q {
-                        continue;
-                    }
+                if let Some(q) = expected
+                    && &rule.result != q
+                {
+                    continue;
                 }
 
                 let mut partials = vec![vec![None; arity]];
@@ -505,16 +506,16 @@ where
                 source_symbols.insert(label);
             }
 
-            if let Some(direct) = direct_linear_term(self.hom.arena(), term, arity) {
-                if direct.variables.is_empty() {
-                    self.inner
-                        .condensed_nullary_rules(&mut |inner_symbols, result| {
-                            if inner_symbols.contains(direct.symbol) {
-                                out(&source_symbols, result);
-                            }
-                        });
-                    continue;
-                }
+            if let Some(direct) = direct_linear_term(self.hom.arena(), term, arity)
+                && direct.variables.is_empty()
+            {
+                self.inner
+                    .condensed_nullary_rules(&mut |inner_symbols, result| {
+                        if inner_symbols.contains(direct.symbol) {
+                            out(&source_symbols, result);
+                        }
+                    });
+                continue;
             }
 
             fallback.push((source_symbols, term));

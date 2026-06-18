@@ -617,6 +617,7 @@ where
 /// returned interner. Used by analysis tooling (e.g. the F-heuristic probe) that
 /// needs to recover the `(grammar state, right state)` identity of each fine
 /// product state.
+#[allow(clippy::type_complexity)]
 pub fn materialize_indexed_condensed_intersection_with_pairs<R>(
     left: &Explicit,
     right: &R,
@@ -855,7 +856,7 @@ where
                     symbols: symbols.clone(),
                     result: q,
                 };
-                if rule.children.iter().any(|&child| child == q) {
+                if rule.children.contains(&q) {
                     loop_rules.push(rule);
                 } else {
                     normal_rules.push(rule);

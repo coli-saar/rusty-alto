@@ -883,6 +883,7 @@ fn first_trigger(children: &[StateId], position: usize, product: StateId) -> boo
     children.get(position) == Some(&product) && children[..position].iter().all(|&c| c != product)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn replay_singleton<R>(
     events: &[Event],
     partners: &[PartnerSet],
@@ -1132,6 +1133,7 @@ fn replay_child_narrow<R>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn count_candidates(
     event: &Event,
     position: usize,

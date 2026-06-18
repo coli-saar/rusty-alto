@@ -216,8 +216,8 @@ impl IntersectionMode {
 }
 
 enum Workload {
-    Explicit(TypedWorkload<Explicit>),
-    Implicit(TypedWorkload<StringDecompositionAutomaton>),
+    Explicit(Box<TypedWorkload<Explicit>>),
+    Implicit(Box<TypedWorkload<StringDecompositionAutomaton>>),
 }
 
 struct TypedWorkload<A> {
@@ -244,25 +244,25 @@ impl Workload {
             DecompMode::Explicit => {
                 let decomp = string_decomposition_automaton(len, vocab);
                 let decomp_rules = decomp.rules().count();
-                Workload::Explicit(TypedWorkload {
+                Workload::Explicit(Box::new(TypedWorkload {
                     left,
                     decomp,
                     hom,
                     left_rules,
                     decomp_rules,
-                })
+                }))
             }
             DecompMode::Implicit => {
                 let decomp =
                     StringDecompositionAutomaton::new(CONCAT, sentence_symbols(len, vocab));
                 let decomp_rules = decomp.rule_count();
-                Workload::Implicit(TypedWorkload {
+                Workload::Implicit(Box::new(TypedWorkload {
                     left,
                     decomp,
                     hom,
                     left_rules,
                     decomp_rules,
-                })
+                }))
             }
         })
     }

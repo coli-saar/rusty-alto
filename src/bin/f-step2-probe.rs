@@ -35,6 +35,7 @@ use std::io::{BufRead, BufReader};
 
 /// Sparse leaf multiset: leaf-symbol id -> count (absent key == 0).
 type Bag = BTreeMap<u32, u32>;
+type ObligationTables = (Vec<Option<Bag>>, Vec<Option<Bag>>, Vec<Option<Bag>>);
 
 // ---------------------------------------------------------------------------
 // Obligatory-leaf tables (Statistic A — same logic as the Step 1 probe)
@@ -150,7 +151,7 @@ fn compute_obligatory(
     num_states: usize,
     flat_rules: &[FlatRule],
     accepting: &[usize],
-) -> (Vec<Option<Bag>>, Vec<Option<Bag>>, Vec<Option<Bag>>) {
+) -> ObligationTables {
     // mic: obligatory INSIDE leaves. MEET (per-key min) over a state's rules.
     let mut mic: Vec<Option<Bag>> = vec![None; num_states];
     loop {
@@ -311,15 +312,15 @@ fn f_estimate_log(
     let left_supply = &sentence[..span.start.min(n)];
     let right_supply = &sentence[span.end.min(n)..];
 
-    if let Some(Some(req)) = req_left.get(idx).map(|o| o.as_ref()) {
-        if !supply_covers(req, left_supply) {
-            return f64::NEG_INFINITY;
-        }
+    if let Some(Some(req)) = req_left.get(idx).map(|o| o.as_ref())
+        && !supply_covers(req, left_supply)
+    {
+        return f64::NEG_INFINITY;
     }
-    if let Some(Some(req)) = req_right.get(idx).map(|o| o.as_ref()) {
-        if !supply_covers(req, right_supply) {
-            return f64::NEG_INFINITY;
-        }
+    if let Some(Some(req)) = req_right.get(idx).map(|o| o.as_ref())
+        && !supply_covers(req, right_supply)
+    {
+        return f64::NEG_INFINITY;
     }
     0.0
 }

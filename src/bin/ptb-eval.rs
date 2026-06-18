@@ -343,23 +343,19 @@ fn sx_load_covering(
 
 /// Save a `UniversalSxHeuristic` to disk, creating the cache directory as needed.
 fn sx_save(path: &Path, h: &UniversalSxHeuristic) {
-    if let Some(dir) = path.parent() {
-        if fs::create_dir_all(dir).is_err() {
-            return;
-        }
+    if let Some(dir) = path.parent()
+        && fs::create_dir_all(dir).is_err()
+    {
+        return;
     }
     let _ = fs::write(path, h.to_bytes());
 }
 
 fn render_progress(strategy: Strategy, done: usize, total: usize) {
     const WIDTH: usize = 32;
-    let filled = if total == 0 {
-        WIDTH
-    } else {
-        WIDTH * done / total
-    };
+    let filled = (WIDTH * done).checked_div(total).unwrap_or(WIDTH);
     let empty = WIDTH.saturating_sub(filled);
-    let percent = if total == 0 { 100 } else { 100 * done / total };
+    let percent = (100 * done).checked_div(total).unwrap_or(100);
     eprint!(
         "\r{:<16} [{}{}] {:>3}% ({done}/{total})",
         strategy.name(),
@@ -890,6 +886,7 @@ fn run_chart_strategy(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_astar_strategy(
     irtg: &Irtg,
     interpretation: &rusty_alto::TypedInterpretation<StringAlgebra>,
