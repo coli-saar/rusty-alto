@@ -410,6 +410,7 @@ impl LeftIndex {
 
 /// A matched nullary edge from `for_each_nullary_edge`.
 pub(crate) struct NullaryEdge {
+    pub(crate) rule_index: usize,
     pub(crate) parent_left: StateId,
     pub(crate) parent_right: StateId,
     pub(crate) symbol: Symbol,
@@ -465,6 +466,7 @@ pub(crate) fn for_each_nullary_edge<R, I>(
             for &left_rule_idx in left_rule_indexes {
                 let left_rule = &left_rules[left_rule_idx];
                 on_edge(NullaryEdge {
+                    rule_index: left_rule_idx,
                     parent_left: left_rule.result,
                     parent_right: right_result,
                     symbol,

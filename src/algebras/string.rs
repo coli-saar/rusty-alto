@@ -53,8 +53,10 @@ pub(crate) struct SpanProductSibling {
 /// the sibling slot of the current left rule.
 #[derive(Debug, Default)]
 pub(crate) struct SpanProductSiblingFinder {
-    left_seen_by_end: Vec<Vec<Vec<SpanProductSibling>>>,
-    right_seen_by_start: Vec<Vec<Vec<SpanProductSibling>>>,
+    left_slots_by_end: Vec<Vec<Option<usize>>>,
+    right_slots_by_start: Vec<Vec<Option<usize>>>,
+    left_lists: Vec<Vec<SpanProductSibling>>,
+    right_lists: Vec<Vec<SpanProductSibling>>,
     seen_left: FixedBitSet,
     seen_right: FixedBitSet,
 }
@@ -80,14 +82,19 @@ impl SpanProductSiblingFinder {
                     return false;
                 }
                 self.seen_left.set(product.index(), true);
-                if self.left_seen_by_end.len() <= span.end {
-                    self.left_seen_by_end.resize_with(span.end + 1, Vec::new);
+                if self.left_slots_by_end.len() <= span.end {
+                    self.left_slots_by_end.resize_with(span.end + 1, Vec::new);
                 }
-                let by_left = &mut self.left_seen_by_end[span.end];
+                let by_left = &mut self.left_slots_by_end[span.end];
                 if by_left.len() <= left_state.index() {
-                    by_left.resize_with(left_state.index() + 1, Vec::new);
+                    by_left.resize(left_state.index() + 1, None);
                 }
-                by_left[left_state.index()].push(SpanProductSibling {
+                let slot = *by_left[left_state.index()].get_or_insert_with(|| {
+                    let slot = self.left_lists.len();
+                    self.left_lists.push(Vec::new());
+                    slot
+                });
+                self.left_lists[slot].push(SpanProductSibling {
                     product,
                     right_state,
                 });
@@ -101,15 +108,20 @@ impl SpanProductSiblingFinder {
                     return false;
                 }
                 self.seen_right.set(product.index(), true);
-                if self.right_seen_by_start.len() <= span.start {
-                    self.right_seen_by_start
+                if self.right_slots_by_start.len() <= span.start {
+                    self.right_slots_by_start
                         .resize_with(span.start + 1, Vec::new);
                 }
-                let by_left = &mut self.right_seen_by_start[span.start];
+                let by_left = &mut self.right_slots_by_start[span.start];
                 if by_left.len() <= left_state.index() {
-                    by_left.resize_with(left_state.index() + 1, Vec::new);
+                    by_left.resize(left_state.index() + 1, None);
                 }
-                by_left[left_state.index()].push(SpanProductSibling {
+                let slot = *by_left[left_state.index()].get_or_insert_with(|| {
+                    let slot = self.right_lists.len();
+                    self.right_lists.push(Vec::new());
+                    slot
+                });
+                self.right_lists[slot].push(SpanProductSibling {
                     product,
                     right_state,
                 });
@@ -119,7 +131,7 @@ impl SpanProductSiblingFinder {
         }
     }
 
-    /// Write active sibling products for `span` at `position`.
+    #[cfg(test)]
     pub(crate) fn sibling_products_into(
         &self,
         span: Span,
@@ -145,13 +157,17 @@ impl SpanProductSiblingFinder {
     ) -> &[SpanProductSibling] {
         let slot = match position {
             0 => self
-                .right_seen_by_start
+                .right_slots_by_start
                 .get(span.end)
-                .and_then(|by_left| by_left.get(required_left.index())),
+                .and_then(|by_left| by_left.get(required_left.index()))
+                .and_then(|slot| *slot)
+                .and_then(|slot| self.right_lists.get(slot)),
             1 => self
-                .left_seen_by_end
+                .left_slots_by_end
                 .get(span.start)
-                .and_then(|by_left| by_left.get(required_left.index())),
+                .and_then(|by_left| by_left.get(required_left.index()))
+                .and_then(|slot| *slot)
+                .and_then(|slot| self.left_lists.get(slot)),
             _ => None,
         };
         slot.map_or(&[], Vec::as_slice)

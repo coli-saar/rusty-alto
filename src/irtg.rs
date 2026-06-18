@@ -9,7 +9,8 @@ use crate::{
     alto_ast::{AstHomTerm, AstIrtg, AstState, LexError, Tok, lex},
     alto_grammar,
     astar::{
-        AstarOptions, AstarStats, astar_string_one_best_with_stats,
+        AstarOptions, AstarStats, PreparedAstarGrammar, astar_string_one_best_with_stats,
+        astar_string_one_best_with_stats_prepared,
         materialize_astar_string_intersection_with,
     },
     materialize::{
@@ -265,6 +266,28 @@ impl Irtg {
         strategy: &MaterializationStrategy<'_>,
         scorer: &S,
     ) -> Result<(Option<ViterbiTree>, Option<AstarStats>), IrtgError> {
+        self.best_with_scorer_and_stats_impl(inputs, strategy, scorer, None)
+    }
+
+    /// Like [`Self::best_with_scorer_and_stats`], reusing grammar-only A*
+    /// indexes for the common single-string-interpretation path.
+    pub fn best_with_scorer_and_stats_prepared<'a, S: WeightScorer>(
+        &self,
+        inputs: impl IntoIterator<Item = ParseInput<'a>>,
+        strategy: &MaterializationStrategy<'_>,
+        scorer: &S,
+        prepared: &PreparedAstarGrammar,
+    ) -> Result<(Option<ViterbiTree>, Option<AstarStats>), IrtgError> {
+        self.best_with_scorer_and_stats_impl(inputs, strategy, scorer, Some(prepared))
+    }
+
+    fn best_with_scorer_and_stats_impl<'a, S: WeightScorer>(
+        &self,
+        inputs: impl IntoIterator<Item = ParseInput<'a>>,
+        strategy: &MaterializationStrategy<'_>,
+        scorer: &S,
+        prepared: Option<&PreparedAstarGrammar>,
+    ) -> Result<(Option<ViterbiTree>, Option<AstarStats>), IrtgError> {
         // For A* we can short-circuit and avoid building the chart.
         if let MaterializationStrategy::Astar { heuristic, .. } = strategy {
             // Guard
@@ -283,9 +306,7 @@ impl Irtg {
             // Split: all-but-last via parse_with(TopDownCondensed), then last via astar_one_best.
             let (last, rest) = inputs.split_last().unwrap();
             // Build intermediate chart from all-but-last inputs (if any).
-            let intermediate_chart = if rest.is_empty() {
-                self.grammar.clone()
-            } else {
+            if !rest.is_empty() {
                 // Collect rest as owned inputs — but ParseInput<'a> is not Clone.
                 // We cannot split a Vec<ParseInput<'_>> this way because ParseInput doesn't
                 // implement Clone.  Instead we re-collect from the iterator below.
@@ -298,7 +319,7 @@ impl Irtg {
                 // NOTE: this path is only reached when there are 2+ inputs and the
                 // caller uses Astar.  The typical single-interpretation use case avoids it.
                 return self.best_with_multi(inputs, heuristic, strategy, scorer);
-            };
+            }
 
             // Run astar_one_best for the last (only) input.
             let interpretation = last.interpretation;
@@ -321,10 +342,11 @@ impl Irtg {
                     let decomp = algebra.decompose(value);
                     let invhom = InvHom::new(decomp, &interpretation.homomorphism);
                     let (tree, stats) = self.run_astar_one_best_with_scorer(
-                        &intermediate_chart,
+                        &self.grammar,
                         &invhom,
                         heuristic,
                         scorer,
+                        prepared,
                     );
                     Ok((tree, Some(stats)))
                 }
@@ -429,24 +451,34 @@ impl Irtg {
         invhom: &InvHom<'_, crate::algebras::StringDecompositionAutomaton>,
         heuristic: &AstarHeuristic<'_>,
         scorer: &S,
+        prepared: Option<&PreparedAstarGrammar>,
     ) -> (Option<ViterbiTree>, AstarStats) {
+        macro_rules! run {
+            ($h:expr) => {
+                if let Some(prepared) = prepared {
+                    astar_string_one_best_with_stats_prepared(
+                        chart, prepared, invhom, $h, scorer,
+                    )
+                } else {
+                    astar_string_one_best_with_stats(chart, invhom, $h, scorer)
+                }
+            };
+        }
         match heuristic {
             AstarHeuristic::Zero => {
                 let h = ScoredZeroHeuristic::new(scorer);
-                astar_string_one_best_with_stats(chart, invhom, &h, scorer)
+                run!(&h)
             }
-            AstarHeuristic::Outside(h) => {
-                astar_string_one_best_with_stats(chart, invhom, *h, scorer)
-            }
+            AstarHeuristic::Outside(h) => run!(*h),
             AstarHeuristic::UniversalSx { table, n } => {
                 let h = table.for_sentence(*n);
-                astar_string_one_best_with_stats(chart, invhom, &h, scorer)
+                run!(&h)
             }
             AstarHeuristic::UniversalSxF { table, oblig, n } => {
                 let sx = table.for_sentence(*n);
                 let f = oblig.for_sentence(invhom.inner().sentence(), scorer);
                 let h = MinHeuristic::new(sx, f);
-                astar_string_one_best_with_stats(chart, invhom, &h, scorer)
+                run!(&h)
             }
         }
     }
@@ -485,7 +517,9 @@ impl Irtg {
                     let invhom = InvHom::new(decomp, &interpretation.homomorphism);
                     if is_last {
                         let (tree, stats) =
-                            self.run_astar_one_best_with_scorer(&chart, &invhom, heuristic, scorer);
+                            self.run_astar_one_best_with_scorer(
+                                &chart, &invhom, heuristic, scorer, None,
+                            );
                         return Ok((tree, Some(stats)));
                     } else {
                         let (next, _, _) =

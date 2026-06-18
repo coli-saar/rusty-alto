@@ -1,17 +1,96 @@
 use crate::{
-    FxHashMap, Interner, Span, StateId, Symbol, algebras::SpanProductSiblingFinder,
+    FxHashMap, HomLabel, Homomorphism, Interner, Span, StateId, Symbol,
+    algebras::SpanProductSiblingFinder,
     materialize::OwnedRule,
 };
 use fixedbitset::FixedBitSet;
 
-pub(super) struct SpanBinarySymbolGroup {
-    pub(super) symbol: Symbol,
-    pub(super) rule_indexes: Vec<usize>,
+/// String rule shapes supported by the eager span specialization.
+///
+/// This deliberately stays private: the A* core sees only the resulting
+/// fallback-rule set and never interprets homomorphism terms.
+enum StringYieldTemplate {
+    NullaryOrUnary,
+    ForwardBinaryConcat,
 }
 
-pub(super) struct SpanBinarySiblingGroup {
-    pub(super) sibling_left: StateId,
-    pub(super) symbol_groups: Vec<SpanBinarySymbolGroup>,
+impl StringYieldTemplate {
+    fn classify(
+        rule: &OwnedRule,
+        hom: &Homomorphism,
+        concat: Symbol,
+    ) -> Option<StringYieldTemplate> {
+        match rule.children.len() {
+            0 | 1 => hom.get(rule.symbol).map(|_| Self::NullaryOrUnary),
+            2 => {
+                let term = hom.get(rule.symbol)?;
+                if *hom.arena().get_label(term) != HomLabel::Symbol(concat) {
+                    return None;
+                }
+                let children = hom.arena().get_children(term);
+                (children.len() == 2
+                    && *hom.arena().get_label(children[0]) == HomLabel::Var(0)
+                    && *hom.arena().get_label(children[1]) == HomLabel::Var(1))
+                .then_some(Self::ForwardBinaryConcat)
+            }
+            _ => None,
+        }
+    }
+}
+
+pub(crate) fn string_fallback_rules(
+    left_rules: &[OwnedRule],
+    hom: &Homomorphism,
+    concat: Symbol,
+) -> FixedBitSet {
+    let mut fallback = FixedBitSet::with_capacity(left_rules.len());
+    fallback.grow(left_rules.len());
+    for (rule_index, rule) in left_rules.iter().enumerate() {
+        if StringYieldTemplate::classify(rule, hom, concat).is_none() {
+            fallback.set(rule_index, true);
+        }
+    }
+    fallback
+}
+
+pub(crate) struct SpanBinarySymbolGroup {
+    pub(crate) symbol: Symbol,
+    pub(crate) rule_indexes: Vec<usize>,
+}
+
+pub(crate) struct SpanBinarySiblingGroup {
+    pub(crate) sibling_left: StateId,
+    pub(crate) symbol_groups: Vec<SpanBinarySymbolGroup>,
+}
+
+/// Per-parse state for the eager string A* candidate source.
+///
+/// Rule classification is prepared once in [`SpanAstarLeftIndex`]. This value
+/// owns only the sentence-specific sibling index and borrows the set of rules
+/// that must be delegated to the generic candidate source.
+pub(crate) struct StringAstarSource<'a> {
+    pub(crate) left_index: &'a SpanAstarLeftIndex,
+    pub(crate) sibling_finder: SpanProductSiblingFinder,
+    pub(crate) fallback_rules: Option<&'a FixedBitSet>,
+    pub(crate) stores_generic_partners: bool,
+}
+
+impl<'a> StringAstarSource<'a> {
+    pub(crate) fn new(
+        left_index: &'a SpanAstarLeftIndex,
+        fallback_rules: Option<&'a FixedBitSet>,
+    ) -> Self {
+        let stores_generic_partners = fallback_rules.map_or_else(
+            || left_index.has_any_higher_arity(),
+            |fallback| fallback.ones().next().is_some(),
+        );
+        Self {
+            left_index,
+            sibling_finder: SpanProductSiblingFinder::default(),
+            fallback_rules,
+            stores_generic_partners,
+        }
+    }
 }
 
 /// Left-rule index used by the span-state A* specialization.
@@ -27,7 +106,7 @@ pub(super) struct SpanBinarySiblingGroup {
 /// Rules of arity greater than two are marked here and handled by the generic
 /// expansion path for correctness.
 #[derive(Default)]
-pub(super) struct SpanAstarLeftIndex {
+pub(crate) struct SpanAstarLeftIndex {
     unary_by_left: Vec<Vec<usize>>,
     binary_groups: Vec<[Vec<SpanBinarySiblingGroup>; 2]>,
     binary_positions_by_left: Vec<u8>,
@@ -35,7 +114,7 @@ pub(super) struct SpanAstarLeftIndex {
 }
 
 impl SpanAstarLeftIndex {
-    pub(super) fn build(left_rules: &[OwnedRule]) -> Self {
+    pub(crate) fn build(left_rules: &[OwnedRule]) -> Self {
         let mut index = Self::default();
         let mut binary_rules: FxHashMap<(StateId, usize, StateId), FxHashMap<Symbol, Vec<usize>>> =
             FxHashMap::default();
@@ -111,11 +190,11 @@ impl SpanAstarLeftIndex {
         index
     }
 
-    pub(super) fn unary_rules(&self, left: StateId) -> Option<&[usize]> {
+    pub(crate) fn unary_rules(&self, left: StateId) -> Option<&[usize]> {
         self.unary_by_left.get(left.index()).map(Vec::as_slice)
     }
 
-    pub(super) fn binary_groups(
+    pub(crate) fn binary_groups(
         &self,
         left: StateId,
         position: usize,
@@ -126,15 +205,15 @@ impl SpanAstarLeftIndex {
             .map(Vec::as_slice)
     }
 
-    pub(super) fn has_higher_arity(&self, left: StateId) -> bool {
+    pub(crate) fn has_higher_arity(&self, left: StateId) -> bool {
         left.index() < self.higher_arity_left.len() && self.higher_arity_left.contains(left.index())
     }
 
-    pub(super) fn has_any_higher_arity(&self) -> bool {
+    pub(crate) fn has_any_higher_arity(&self) -> bool {
         self.higher_arity_left.ones().next().is_some()
     }
 
-    pub(super) fn activate_product(
+    pub(crate) fn activate_product(
         &self,
         finder: &mut SpanProductSiblingFinder,
         product: StateId,
@@ -158,13 +237,13 @@ impl SpanAstarLeftIndex {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct SpanInterner {
+pub(crate) struct SpanInterner {
     n: usize,
     spans: Vec<Span>,
 }
 
 impl SpanInterner {
-    pub(super) fn new(n: usize) -> Self {
+    pub(crate) fn new(n: usize) -> Self {
         let mut spans = Vec::with_capacity(n.saturating_mul(n + 1) / 2);
         for start in 0..n {
             for end in (start + 1)..=n {
@@ -175,7 +254,7 @@ impl SpanInterner {
     }
 
     #[inline]
-    pub(super) fn intern(&mut self, span: Span) -> StateId {
+    pub(crate) fn intern(&mut self, span: Span) -> StateId {
         assert!(
             span.start < span.end && span.end <= self.n,
             "invalid string span {:?} for sentence length {}",
@@ -188,13 +267,13 @@ impl SpanInterner {
     }
 
     #[inline]
-    pub(super) fn resolve(&self, id: StateId) -> &Span {
+    pub(crate) fn resolve(&self, id: StateId) -> &Span {
         self.spans
             .get(id.index())
             .expect("span state id not present in interner")
     }
 
-    pub(super) fn into_interner(self) -> Interner<Span> {
+    pub(crate) fn into_interner(self) -> Interner<Span> {
         let mut interner = Interner::new();
         for span in self.spans {
             let id = interner.intern(span);

@@ -10,7 +10,8 @@
 use rusty_alto::{
     AstarHeuristic, AstarOptions, Binarizing, CorpusWriter, EvalbParams, Irtg,
     LogProbabilityScorer, MaterializationStrategy, ObligatoryLeafTables, OutsideHeuristic,
-    ParsevalCounts, ParsevalSkip, Symbol, TreeAlgebra, TreeValue, UniversalSxHeuristic,
+    ParsevalCounts, ParsevalSkip, PreparedAstarGrammar, Symbol, TreeAlgebra, TreeValue,
+    UniversalSxHeuristic,
     compare_trees, count_gold, parse_irtg, read_corpus,
 };
 use rusty_tree::{parser::parse_tree, tree::TreeArena};
@@ -53,6 +54,7 @@ struct Args {
     algorithm: Algorithm,
     heuristic: Heuristic,
     times: Option<String>,
+    astar_stats: Option<String>,
     input: Option<String>,
     parseval: Option<String>,
     parseval_output: Option<String>,
@@ -128,6 +130,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 
     let scorer = LogProbabilityScorer;
+    let prepared_astar = (args.algorithm == Algorithm::Astar)
+        .then(|| PreparedAstarGrammar::new(irtg.grammar()));
 
     // Build heuristic resources once, before the loop.
     let n_max = corpus
@@ -210,6 +214,18 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         None => None,
     };
+    let mut astar_stats = match &args.astar_stats {
+        Some(path) => {
+            let mut f = File::create(path)?;
+            writeln!(
+                f,
+                "sentence_no,length,products,finalized,expanded,reopens,candidates,filtered,dominated,finalized_discards,heap_pushes,heap_updates,max_heap_len,heap_position_capacity,string_sibling_tuples,generic_fallback_expansions,right_step_calls,right_step_evals,right_step_memo_hits"
+            )?;
+            f.flush()?;
+            Some(f)
+        }
+        None => None,
+    };
     let mut parseval_report = match parseval.as_ref() {
         Some(config) => {
             let path = args.parseval_output.as_deref().unwrap_or("parseval.txt");
@@ -280,7 +296,16 @@ fn run() -> Result<(), Box<dyn Error>> {
 
             *current.lock().unwrap() = (sentence_no, Instant::now());
             let parse_start = Instant::now();
-            let best = irtg.best_with_scorer(inputs, &strategy, &scorer)?;
+            let (best, stats) = if let Some(prepared) = prepared_astar.as_ref() {
+                irtg.best_with_scorer_and_stats_prepared(
+                    inputs,
+                    &strategy,
+                    &scorer,
+                    prepared,
+                )?
+            } else {
+                (irtg.best_with_scorer(inputs, &strategy, &scorer)?, None)
+            };
             let parse_ms = millis(parse_start.elapsed());
 
             let derivation = best.as_ref().map(|tree| (tree.arena(), tree.root()));
@@ -354,6 +379,30 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "{sentence_no},{length},{parsed},{},{parse_ms:.4},{output_ms:.4},{:.4}",
                     score.map(|s| s.to_string()).unwrap_or_default(),
                     parse_ms + output_ms,
+                )?;
+                f.flush()?;
+            }
+            if let (Some(f), Some(stats)) = (astar_stats.as_mut(), stats.as_ref()) {
+                writeln!(
+                    f,
+                    "{sentence_no},{length},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                    stats.output_states,
+                    stats.finalized_states,
+                    stats.expanded_states,
+                    stats.reopen_attempts,
+                    stats.candidate_edges,
+                    stats.f_filtered_candidates,
+                    stats.dominated_candidates,
+                    stats.finalized_candidate_discards,
+                    stats.heap_pushes,
+                    stats.heap_updates,
+                    stats.max_heap_len,
+                    stats.max_heap_position_capacity,
+                    stats.sibling_tuples_returned,
+                    stats.sibling_fallback_expansions,
+                    stats.right_step_calls,
+                    stats.right_step_evals,
+                    stats.right_step_memo_hits,
                 )?;
                 f.flush()?;
             }
@@ -725,6 +774,7 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
     let mut algorithm = Algorithm::Exhaustive;
     let mut heuristic = Heuristic::Zero;
     let mut times = None;
+    let mut astar_stats = None;
     let mut input = None;
     let mut parseval = None;
     let mut parseval_output = None;
@@ -757,6 +807,7 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
                 }
             }
             "--times" => times = Some(next()?),
+            "--astar-stats" => astar_stats = Some(next()?),
             "--input" => input = Some(next()?),
             "--parseval" => parseval = Some(next()?),
             "--parseval-output" => parseval_output = Some(next()?),
@@ -784,6 +835,7 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
         algorithm,
         heuristic,
         times,
+        astar_stats,
         input,
         parseval,
         parseval_output,
@@ -801,6 +853,7 @@ fn print_usage() {
          \x20 --algorithm <exhaustive|astar> intersection algorithm (default: exhaustive)\n\
          \x20 --heuristic <zero|outside|sx|sxf> A* heuristic (default: zero)\n\
          \x20 --times <file.csv>             write per-sentence timing as CSV\n\
+         \x20 --astar-stats <file.csv>       write per-sentence A* internal counters\n\
          \x20 --input <interp>               interpretation parameterizing sx/sxf (default: auto)\n\
          \x20 --parseval <interp>            score this constituency-tree interpretation\n\
          \x20 --parseval-output <file>       write Parseval table (default: parseval.txt)\n\

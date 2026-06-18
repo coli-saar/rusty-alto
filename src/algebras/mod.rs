@@ -1,6 +1,7 @@
 //! Algebra interfaces and decomposition automata.
 
 mod string;
+mod string_astar;
 mod tree;
 
 use crate::{BottomUpTa, DetBottomUpTa, Signature, Symbol};
@@ -12,6 +13,10 @@ pub use string::{
 };
 pub use tree::{APPEND_SYMBOL, Binarizing, TreeAlgebra, TreeValue};
 pub(crate) use string::{SpanProductSibling, SpanProductSiblingFinder};
+pub(crate) use string_astar::{
+    SpanAstarLeftIndex, SpanBinarySiblingGroup, SpanInterner, StringAstarSource,
+    string_fallback_rules,
+};
 
 /// Algebra over a domain of values.
 ///

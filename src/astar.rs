@@ -2,19 +2,23 @@
 //!
 //! This module provides two entry points:
 //!
-//! * [`materialize_astar_intersection`] — runs A* and emits a full (or beam-filtered)
-//!   intersection chart as an [`Explicit`] automaton.
+//! * [`materialize_astar_viterbi_forest`] — runs A* and emits a one-rule-per-state
+//!   Viterbi forest as an [`Explicit`] automaton.
 //!
 //! * [`astar_one_best`] — runs A* in one-best mode and returns the highest-weighted
 //!   accepted tree without building a chart.
 
+mod agenda;
+mod generic_source;
 mod lazy_span;
-mod span;
 
 use crate::{
     BottomUpTa, CondensedTa, DetBottomUpTa, Explicit, ExplicitBuilder, FxHashMap, Interner, InvHom,
-    KeySet, ProbabilityScorer, Span, StateId, StringDecompositionAutomaton, Symbol, WeightScorer,
-    algebras::{SpanProductSibling, SpanProductSiblingFinder},
+    ProbabilityScorer, Span, StateId, StringDecompositionAutomaton, Symbol, WeightScorer,
+    algebras::{
+        SpanAstarLeftIndex, SpanBinarySiblingGroup, SpanInterner, SpanProductSibling,
+        SpanProductSiblingFinder, StringAstarSource, string_fallback_rules,
+    },
     heuristic::IntersectionHeuristic,
     materialize::{
         IndexedCondensedIntersectionStats, LeftIndex, NullaryEdge, OwnedCondensedRule, OwnedRule,
@@ -24,15 +28,13 @@ use crate::{
     viterbi::{Backpointer, ViterbiTree, build_tree},
 };
 use fixedbitset::FixedBitSet;
-use orx_priority_queue::{
-    PriorityQueue, PriorityQueueDecKey, QuaternaryHeapOfIndices, ResUpdateKeyOrPush,
-};
 use rusty_tree::tree::TreeArena;
 use smallvec::SmallVec;
 use std::hash::Hash;
 
 use lazy_span::{SiblingEntry, SpanGenerator, SpanLazyFrontier};
-use span::{SpanAstarLeftIndex, SpanInterner};
+use agenda::{AgendaUpdate, AstarAgenda};
+use generic_source::{ChildStateRightRuleIndex, GenericCandidateSource, PartnerSet};
 
 trait RightStateInterner<T> {
     fn intern(&mut self, state: T) -> StateId;
@@ -85,6 +87,7 @@ impl StateInterner<Span> for SpanInterner {
 const RIGHT_UNARY_SENTINEL: StateId = StateId(u32::MAX);
 
 pub struct PreparedAstarGrammar {
+    grammar_addr: usize,
     left_rules: Vec<OwnedRule>,
     left_index: LeftIndex,
     span_left_index: SpanAstarLeftIndex,
@@ -104,149 +107,21 @@ impl PreparedAstarGrammar {
         let left_index = LeftIndex::build(&left_rules);
         let span_left_index = SpanAstarLeftIndex::build(&left_rules);
         Self {
+            grammar_addr: left as *const Explicit as usize,
             left_rules,
             left_index,
             span_left_index,
         }
     }
-}
-#[derive(Default)]
-struct ChildStateRightRuleIndex {
-    cache: FxHashMap<(usize, StateId), Vec<usize>>,
-}
 
-impl ChildStateRightRuleIndex {
-    /// Cache right automaton rules that mention a finalized right child at a
-    /// given child position. This is the generic fallback used for automata
-    /// where we do not have a more precise sibling index.
-    fn rules_by_child<R, I>(
-        &mut self,
-        right: &R,
-        right_interner: &mut I,
-        right_rules: &mut Vec<OwnedCondensedRule<StateId>>,
-        stats: &mut IndexedCondensedIntersectionStats,
-        position: usize,
-        right_state: StateId,
-    ) -> &[usize]
-    where
-        R: CondensedTa,
-        R::State: Clone + Eq + Hash,
-        I: RightStateInterner<R::State>,
-    {
-        let cache_key = (position, right_state);
-        if !self.cache.contains_key(&cache_key) {
-            stats.right_indexed_queries += 1;
-            let raw_state = right_interner.resolve(right_state).clone();
-            let mut collected = Vec::new();
-            right.condensed_rules_by_child(
-                position,
-                &raw_state,
-                &mut |children, symbols, result| {
-                    let rule_id = right_rules.len();
-                    right_rules.push(OwnedCondensedRule {
-                        children: children
-                            .iter()
-                            .cloned()
-                            .map(|child| right_interner.intern(child))
-                            .collect(),
-                        symbols: symbols.clone(),
-                        result: right_interner.intern(result),
-                    });
-                    collected.push(rule_id);
-                },
-            );
-            self.cache.insert(cache_key, collected);
-        }
-        self.cache
-            .get(&cache_key)
-            .expect("cache entry was just inserted")
-            .as_slice()
-    }
-
-    fn rule_ids_for_trigger_into<R, I>(
-        &mut self,
-        right: &R,
-        right_interner: &mut I,
-        right_rules: &mut Vec<OwnedCondensedRule<StateId>>,
-        stats: &mut IndexedCondensedIntersectionStats,
-        position: usize,
-        right_state: StateId,
-        out: &mut Vec<usize>,
-    ) where
-        R: CondensedTa,
-        R::State: Clone + Eq + Hash,
-        I: RightStateInterner<R::State>,
-    {
-        out.clear();
-        let rules = self.rules_by_child(
-            right,
-            right_interner,
-            right_rules,
-            stats,
-            position,
-            right_state,
+    fn assert_matches(&self, left: &Explicit) {
+        assert_eq!(
+            self.grammar_addr,
+            left as *const Explicit as usize,
+            "PreparedAstarGrammar must be used with the Explicit it was built from"
         );
-        out.extend_from_slice(rules);
     }
 }
-
-#[derive(Default)]
-struct PartnerSet {
-    states: Vec<StateId>,
-    bits: FixedBitSet,
-    products_by_left: Vec<Option<StateId>>,
-}
-
-impl PartnerSet {
-    fn insert(&mut self, state: StateId, product: StateId) -> bool {
-        if self.bits.len() <= state.index() {
-            self.bits.grow(state.index() + 1);
-        }
-        if self.products_by_left.len() <= state.index() {
-            self.products_by_left.resize(state.index() + 1, None);
-        }
-        if self.bits.contains(state.index()) {
-            return false;
-        }
-        self.bits.set(state.index(), true);
-        self.products_by_left[state.index()] = Some(product);
-        self.states.push(state);
-        true
-    }
-
-    fn len(&self) -> usize {
-        self.states.len()
-    }
-
-    fn contains(&self, state: &StateId) -> bool {
-        state.index() < self.bits.len() && self.bits.contains(state.index())
-    }
-
-    fn iter(&self) -> impl Iterator<Item = &StateId> {
-        self.states.iter()
-    }
-
-    fn product_for(&self, state: StateId) -> Option<StateId> {
-        self.products_by_left.get(state.index()).and_then(|&p| p)
-    }
-}
-
-impl KeySet<StateId> for PartnerSet {
-    fn len(&self) -> usize {
-        self.len()
-    }
-
-    fn contains(&self, key: &StateId) -> bool {
-        self.contains(key)
-    }
-
-    fn for_each(&self, out: &mut dyn FnMut(&StateId)) {
-        for state in self.iter() {
-            out(state);
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Agenda item
 // ---------------------------------------------------------------------------
@@ -261,7 +136,6 @@ struct EmitEdge {
 /// The payload for a pending item on the A* agenda. The heap itself stores only
 /// the product-state index and the priority key.
 struct AgendaItem {
-    inside: f64,
     edge: EmitEdge,
 }
 
@@ -269,64 +143,43 @@ struct FinalizedItem {
     product: StateId,
     edge: EmitEdge,
     inside: f64,
+    merit: f64,
     left_state: StateId,
     right_state: StateId,
     is_goal: bool,
 }
 
-struct AstarAgenda {
-    heap: QuaternaryHeapOfIndices<usize, f64>,
-    index_bound: usize,
-}
-
-impl Default for AstarAgenda {
-    fn default() -> Self {
-        Self::with_index_bound(16 * 1024)
-    }
-}
-
-impl AstarAgenda {
-    fn with_index_bound(index_bound: usize) -> Self {
-        Self {
-            heap: QuaternaryHeapOfIndices::with_index_bound(index_bound),
-            index_bound,
-        }
-    }
-
-    fn ensure_index(&mut self, index: usize) {
-        if index < self.index_bound {
-            return;
-        }
-        let mut new_bound = self.index_bound.max(1);
-        while index >= new_bound {
-            new_bound *= 4;
-        }
-        let entries: Vec<_> = self.heap.as_slice().to_vec();
-        let mut new_heap = QuaternaryHeapOfIndices::with_index_bound(new_bound);
-        for (node, key) in entries {
-            new_heap.push(node, key);
-        }
-        self.heap = new_heap;
-        self.index_bound = new_bound;
+/// Candidate generation boundary for the eager A* search.
+///
+/// The core owns scoring, filtering, dominance, agenda operations,
+/// finalization, reopening, and backpointers. A source owns sentence/algebra
+/// specific activation state and enumerates candidate rules after a product is
+/// finalized.
+trait CandidateSource<R, I>
+where
+    R: CondensedTa,
+    R::State: Clone + Eq + Hash,
+    I: RightStateInterner<R::State> + StateInterner<R::State>,
+{
+    fn seed<H, S>(&mut self, ctx: &mut AstarContext<'_, R, I>, h: &H, scorer: &S)
+    where
+        H: IntersectionHeuristic<R>,
+        S: WeightScorer,
+    {
+        ctx.seed_nullary_edges(h, scorer);
     }
 
-    fn update_or_push(&mut self, index: usize, merit: f64) -> ResUpdateKeyOrPush {
-        self.ensure_index(index);
-        // `orx` is a min-priority queue. Negating the merit gives max-merit A*
-        // order without changing the scorer abstraction.
-        self.heap.update_key_or_push(&index, -merit)
-    }
+    fn activate(&mut self, ctx: &mut AstarContext<'_, R, I>, item: &FinalizedItem);
 
-    fn pop(&mut self) -> Option<usize> {
-        self.heap.pop().map(|(index, _)| index)
-    }
-
-    /// Merit of the current top entry, or `None` when empty. The stored key is
-    /// `-merit`, so the merit is its negation. Used by the lazy frontier to
-    /// interleave finalization against lazy candidate generation by merit.
-    fn peek_merit(&self) -> Option<f64> {
-        self.heap.peek().map(|(_, neg_merit)| -neg_merit)
-    }
+    fn enumerate<H, S>(
+        &mut self,
+        ctx: &mut AstarContext<'_, R, I>,
+        item: &FinalizedItem,
+        h: &H,
+        scorer: &S,
+    ) where
+        H: IntersectionHeuristic<R>,
+        S: WeightScorer;
 }
 
 // ---------------------------------------------------------------------------
@@ -355,6 +208,10 @@ pub struct AstarStats {
     /// decrease-key updates; they are the entries that a decrease-key heap
     /// would update in place.
     pub heap_updates: usize,
+    /// Maximum number of live product entries in the agenda.
+    pub max_heap_len: usize,
+    /// Maximum size of the agenda's product-position table.
+    pub max_heap_position_capacity: usize,
     /// Number of items popped from the heap (including re-opens that are skipped).
     pub pops: usize,
     /// Number of popped heap items discarded because a better version for the
@@ -362,6 +219,8 @@ pub struct AstarStats {
     pub stale_pops: usize,
     /// Number of distinct product states finalized.
     pub finalized_states: usize,
+    /// Number of product expansions, including re-expansions after reopening.
+    pub expanded_states: usize,
     /// Number of rules emitted into the output chart (chart mode only).
     pub emitted_rules: usize,
     /// Number of product states in the output chart (chart mode only).
@@ -458,18 +317,6 @@ fn string_product_heap_bound(left: &Explicit, n: usize) -> usize {
     (left.num_states() as usize).saturating_mul(spans).max(1024)
 }
 
-/// Whether to use the N10 lazy candidate-generation frontier on the
-/// deterministic span/binary path. Gated by the `RUSTY_ALTO_LAZY_FRONTIER`
-/// environment variable so the eager path remains the default and the A/B
-/// baseline (the benchmarked one-best entry takes no `AstarOptions`). The caller
-/// additionally requires a purely binary grammar (no higher-arity left rules).
-fn lazy_frontier_enabled() -> bool {
-    matches!(
-        std::env::var("RUSTY_ALTO_LAZY_FRONTIER").as_deref(),
-        Ok("1") | Ok("true")
-    )
-}
-
 /// Whether the heuristic's sound `admits` filter is consulted at
 /// candidate-construction time to skip building hopeless edges (the F
 /// obligatory-leaf filter). Defaults to **on**; set `RUSTY_ALTO_F_FILTER=0`
@@ -497,6 +344,7 @@ where
     left: &'a Explicit,
     right: &'a R,
     left_rules: &'a [OwnedRule],
+    rule_scores: Vec<f64>,
     left_index: &'a LeftIndex,
     right_rule_index: ChildStateRightRuleIndex,
     right_interner: I,
@@ -508,17 +356,17 @@ where
     mat_stats: IndexedCondensedIntersectionStats,
     // A* specific state
     finalized: FixedBitSet,
+    ever_finalized: FixedBitSet,
     finalized_partners: Vec<PartnerSet>,
-    best_inside: Vec<f64>,
-    /// Best inside score discovered so far for each product state.
-    best_seen_inside: Vec<f64>,
+    /// Best discovered inside score for each product state. For closed products
+    /// this is also the finalized inside score.
+    best_score: Vec<f64>,
     back: Vec<Option<Backpointer>>,
     store_backpointers: bool,
     heap: AstarAgenda,
     pending: Vec<Option<AgendaItem>>,
     matches_scratch: Vec<usize>,
     right_rule_ids_scratch: Vec<usize>,
-    span_product_siblings_scratch: Vec<SpanProductSibling>,
     /// Whether to consult the heuristic's sound `admits` filter when generating
     /// candidate edges (see [`candidate_filter_enabled`]).
     candidate_filter: bool,
@@ -538,6 +386,7 @@ where
     R::State: Clone + Eq + Hash,
     I: RightStateInterner<R::State> + StateInterner<R::State>,
 {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         left: &'a Explicit,
         right: &'a R,
@@ -545,13 +394,18 @@ where
         left_index: &'a LeftIndex,
         right_interner: I,
         with_builder: bool,
-        heap_index_bound: usize,
+        _heap_index_bound: usize,
+        scorer: &impl WeightScorer,
     ) -> Self {
         let store_backpointers = !with_builder;
         Self {
             left,
             right,
             left_rules,
+            rule_scores: left_rules
+                .iter()
+                .map(|rule| scorer.rule_score(rule.weight))
+                .collect(),
             left_index,
             right_rule_index: ChildStateRightRuleIndex::default(),
             right_interner,
@@ -566,16 +420,15 @@ where
             right_rules: Vec::new(),
             mat_stats: IndexedCondensedIntersectionStats::default(),
             finalized: FixedBitSet::new(),
+            ever_finalized: FixedBitSet::new(),
             finalized_partners: Vec::new(),
-            best_inside: Vec::new(),
-            best_seen_inside: Vec::new(),
+            best_score: Vec::new(),
             back: Vec::new(),
             store_backpointers,
-            heap: AstarAgenda::with_index_bound(heap_index_bound.max(1024)),
+            heap: AstarAgenda::new(),
             pending: Vec::new(),
             matches_scratch: Vec::new(),
             right_rule_ids_scratch: Vec::new(),
-            span_product_siblings_scratch: Vec::new(),
             candidate_filter: candidate_filter_enabled(),
             right_step_memo: FxHashMap::default(),
             stats: AstarStats::default(),
@@ -588,16 +441,14 @@ where
         if self.finalized.len() < idx {
             self.finalized.grow(idx);
         }
-        if self.best_inside.len() < idx {
-            self.best_inside.resize(idx, 0.0);
+        if self.ever_finalized.len() < idx {
+            self.ever_finalized.grow(idx);
         }
-        if self.best_seen_inside.len() < idx {
-            self.best_seen_inside.resize(idx, zero);
+        if self.best_score.len() < idx {
+            self.best_score.resize(idx, zero);
         }
-        if self.back.len() < idx {
-            if self.store_backpointers {
-                self.back.resize(idx, None);
-            }
+        if self.back.len() < idx && self.store_backpointers {
+            self.back.resize(idx, None);
         }
         if self.pending.len() < idx {
             self.pending.resize_with(idx, || None);
@@ -677,23 +528,21 @@ where
 
     fn push_candidate<H: IntersectionHeuristic<R>, S: WeightScorer>(
         &mut self,
+        rule_index: usize,
         parent_left: StateId,
         parent_right: StateId,
-        symbol: Symbol,
-        weight: f64,
         children: SmallVec<[StateId; 2]>,
         scorer: &S,
         h: &H,
     ) {
         let mut child_score = scorer.one();
         for &child in &children {
-            child_score = scorer.times(child_score, self.best_inside[child.index()]);
+            child_score = scorer.times(child_score, self.best_score[child.index()]);
         }
         self.push_candidate_with_child_score(
+            rule_index,
             parent_left,
             parent_right,
-            symbol,
-            weight,
             children.as_slice(),
             child_score,
             scorer,
@@ -704,16 +553,16 @@ where
     #[allow(clippy::too_many_arguments)]
     fn push_candidate_with_child_score<H: IntersectionHeuristic<R>, S: WeightScorer>(
         &mut self,
+        rule_index: usize,
         parent_left: StateId,
         parent_right: StateId,
-        symbol: Symbol,
-        weight: f64,
         children: &[StateId],
         child_score: f64,
         scorer: &S,
         h: &H,
     ) {
-        let inside = scorer.times(scorer.rule_score(weight), child_score);
+        let inside = scorer.times(self.rule_scores[rule_index], child_score);
+        let rule = &self.left_rules[rule_index];
 
         // Sound construction-time filter: if the heuristic proves this parent
         // product hopeless (zero outside weight), never build the edge — skip
@@ -736,35 +585,40 @@ where
         };
         self.grow_to(parent, scorer.zero());
 
-        if self.finalized.contains(parent.index()) {
-            self.stats.finalized_candidate_discards += 1;
-            return;
-        }
-
-        let old_inside = self.best_seen_inside[parent.index()];
+        let old_inside = self.best_score[parent.index()];
         if !scorer.better(inside, old_inside) {
-            self.stats.dominated_candidates += 1;
+            if self.finalized.contains(parent.index()) {
+                self.stats.finalized_candidate_discards += 1;
+            } else {
+                self.stats.dominated_candidates += 1;
+            }
             return;
         }
-        self.best_seen_inside[parent.index()] = inside;
+        if self.finalized.contains(parent.index()) {
+            self.finalized.set(parent.index(), false);
+            self.stats.reopen_attempts += 1;
+        }
+        self.best_score[parent.index()] = inside;
 
         let right_raw = self.right_interner.resolve(parent_right);
         let h_val = h.outside_estimate(parent_left, right_raw);
         let merit = scorer.times(inside, h_val);
         self.pending[parent.index()] = Some(AgendaItem {
-            inside,
             edge: EmitEdge {
-                symbol,
+                symbol: rule.symbol,
                 children: children.iter().copied().collect(),
-                weight,
+                weight: rule.weight,
             },
         });
         match self.heap.update_or_push(parent.index(), merit) {
-            ResUpdateKeyOrPush::Pushed => self.stats.heap_pushes += 1,
-            ResUpdateKeyOrPush::Decreased | ResUpdateKeyOrPush::Increased => {
-                self.stats.heap_updates += 1;
-            }
+            AgendaUpdate::Pushed => self.stats.heap_pushes += 1,
+            AgendaUpdate::Updated => self.stats.heap_updates += 1,
         }
+        self.stats.max_heap_len = self.stats.max_heap_len.max(self.heap.len());
+        self.stats.max_heap_position_capacity = self
+            .stats
+            .max_heap_position_capacity
+            .max(self.heap.position_capacity());
     }
 
     fn expand_from_finalized<H: IntersectionHeuristic<R>, S: WeightScorer>(
@@ -774,6 +628,7 @@ where
         trigger_product: StateId,
         h: &H,
         scorer: &S,
+        rule_filter: Option<&FixedBitSet>,
     ) {
         let Some(left_occurrences) = self.left_index.by_state.get(&trigger_left) else {
             return;
@@ -833,7 +688,10 @@ where
                 self.stats.left_rule_matches += matches.len();
 
                 for &rule_idx in &matches {
-                    let Some((parent_left, symbol, weight, children)) = ({
+                    if rule_filter.is_some_and(|filter| !filter.contains(rule_idx)) {
+                        continue;
+                    }
+                    let Some((parent_left, children)) = ({
                         let left_rule = &self.left_rules[rule_idx];
                         let right_rule = &self.right_rules[right_rule_id];
                         let mut children = SmallVec::<[StateId; 2]>::new();
@@ -862,8 +720,6 @@ where
                         }
                         (ok && first_trigger(&children, position, trigger_product)).then_some((
                             left_rule.result,
-                            left_rule.symbol,
-                            left_rule.weight,
                             children,
                         ))
                     }) else {
@@ -871,10 +727,9 @@ where
                     };
                     self.stats.candidate_edges += 1;
                     self.push_candidate(
+                        rule_idx,
                         parent_left,
                         parent_right,
-                        symbol,
-                        weight,
                         children,
                         scorer,
                         h,
@@ -948,6 +803,7 @@ where
         interned
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn expand_from_finalized_with_span_product_siblings<
         H: IntersectionHeuristic<R>,
         S: WeightScorer,
@@ -958,18 +814,38 @@ where
         trigger_product: StateId,
         span_left_index: &SpanAstarLeftIndex,
         sibling_finder: &SpanProductSiblingFinder,
+        fallback_rules: Option<&FixedBitSet>,
         h: &H,
         scorer: &S,
     ) where
         R: CondensedTa<State = Span> + DetBottomUpTa<State = Span>,
     {
-        if span_left_index.has_higher_arity(trigger_left) {
+        let needs_fallback = fallback_rules.map_or_else(
+            || span_left_index.has_higher_arity(trigger_left),
+            |fallback| {
+                self.left_index
+                    .by_state
+                    .get(&trigger_left)
+                    .is_some_and(|occurrences| {
+                        occurrences
+                            .iter()
+                            .any(|&(_, _, rule_index)| fallback.contains(rule_index))
+                    })
+            },
+        );
+        if needs_fallback {
             // The product-aware span sibling finder is a binary-rule
             // optimization. If this left state also appears in a larger rule,
             // run the generic expansion so those candidates are still found.
             self.stats.sibling_fallback_expansions += 1;
-            self.expand_from_finalized(trigger_left, trigger_right, trigger_product, h, scorer);
-            return;
+            self.expand_from_finalized(
+                trigger_left,
+                trigger_right,
+                trigger_product,
+                h,
+                scorer,
+                fallback_rules,
+            );
         }
 
         let raw_trigger = *self.right_interner.resolve(trigger_right);
@@ -979,9 +855,12 @@ where
         // avoids the allocation-heavy generic inverse-homomorphism step.
         if let Some(unary_rules) = span_left_index.unary_rules(trigger_left) {
             for &rule_idx in unary_rules {
-                let (parent_left, symbol, weight) = {
+                if fallback_rules.is_some_and(|fallback| fallback.contains(rule_idx)) {
+                    continue;
+                }
+                let (parent_left, symbol) = {
                     let left_rule = &self.left_rules[rule_idx];
-                    (left_rule.result, left_rule.symbol, left_rule.weight)
+                    (left_rule.result, left_rule.symbol)
                 };
 
                 // A unary projection keeps the child span, so the parent span is
@@ -1001,12 +880,11 @@ where
                 };
                 self.stats.candidate_edges += 1;
                 self.push_candidate_with_child_score(
+                    rule_idx,
                     parent_left,
                     parent_right,
-                    symbol,
-                    weight,
                     &children,
-                    self.best_inside[trigger_product.index()],
+                    self.best_score[trigger_product.index()],
                     scorer,
                     h,
                 );
@@ -1022,17 +900,12 @@ where
                 // Query by span boundary and required sibling left state. Every
                 // returned item is already a finalized product that can fill
                 // the sibling slot for this group of left rules.
-                let mut sibling_products = std::mem::take(&mut self.span_product_siblings_scratch);
                 self.stats.sibling_tuple_queries += 1;
-                sibling_finder.sibling_products_into(
-                    raw_trigger,
-                    position,
-                    group.sibling_left,
-                    &mut sibling_products,
-                );
+                let sibling_products =
+                    sibling_finder.siblings_slice(raw_trigger, position, group.sibling_left);
                 self.stats.sibling_tuples_returned += sibling_products.len();
 
-                for &sibling in &sibling_products {
+                for &sibling in sibling_products {
                     if position == 1 && sibling.product == trigger_product {
                         continue;
                     }
@@ -1065,8 +938,8 @@ where
                     };
 
                     let child_score = scorer.times(
-                        self.best_inside[children[0].index()],
-                        self.best_inside[children[1].index()],
+                        self.best_score[children[0].index()],
+                        self.best_score[children[1].index()],
                     );
                     for symbol_group in &group.symbol_groups {
                         let symbol = symbol_group.symbol;
@@ -1078,9 +951,11 @@ where
                         // never pays for the right transition.
                         let mut parent_right: Option<StateId> = None;
                         for &rule_idx in &symbol_group.rule_indexes {
+                            if fallback_rules.is_some_and(|fallback| fallback.contains(rule_idx)) {
+                                continue;
+                            }
                             let left_rule = &self.left_rules[rule_idx];
                             let result = left_rule.result;
-                            let weight = left_rule.weight;
                             debug_assert_eq!(left_rule.symbol, symbol);
                             debug_assert_eq!(left_rule.children[position], trigger_left);
                             debug_assert_eq!(left_rule.children[1 - position], group.sibling_left);
@@ -1107,10 +982,9 @@ where
 
                             self.stats.candidate_edges += 1;
                             self.push_candidate_with_child_score(
+                                rule_idx,
                                 result,
                                 pr,
-                                symbol,
-                                weight,
                                 &children,
                                 child_score,
                                 scorer,
@@ -1120,7 +994,6 @@ where
                     }
                 }
 
-                self.span_product_siblings_scratch = sibling_products;
             }
         }
     }
@@ -1132,6 +1005,14 @@ where
         h: &H,
         scorer: &S,
     ) {
+        if self.candidate_filter {
+            let right_raw = self.right_interner.resolve(edge.parent_right);
+            if !h.admits(edge.parent_left, right_raw) {
+                self.stats.f_filtered_candidates += 1;
+                return;
+            }
+        }
+
         let (product, _) = if self.builder.is_some() {
             self.get_or_create_product_id(edge.parent_left, edge.parent_right)
         } else {
@@ -1139,19 +1020,18 @@ where
         };
         self.grow_to(product, scorer.zero());
 
-        let inside = scorer.rule_score(edge.weight);
-        let old_inside = self.best_seen_inside[product.index()];
+        let inside = self.rule_scores[edge.rule_index];
+        let old_inside = self.best_score[product.index()];
         if !scorer.better(inside, old_inside) {
             self.stats.dominated_candidates += 1;
             return;
         }
-        self.best_seen_inside[product.index()] = inside;
+        self.best_score[product.index()] = inside;
 
         let right_raw = self.right_interner.resolve(edge.parent_right);
         let h_val = h.outside_estimate(edge.parent_left, right_raw);
         let merit = scorer.times(inside, h_val);
         self.pending[product.index()] = Some(AgendaItem {
-            inside,
             edge: EmitEdge {
                 symbol: edge.symbol,
                 children: SmallVec::new(),
@@ -1159,11 +1039,14 @@ where
             },
         });
         match self.heap.update_or_push(product.index(), merit) {
-            ResUpdateKeyOrPush::Pushed => self.stats.heap_pushes += 1,
-            ResUpdateKeyOrPush::Decreased | ResUpdateKeyOrPush::Increased => {
-                self.stats.heap_updates += 1;
-            }
+            AgendaUpdate::Pushed => self.stats.heap_pushes += 1,
+            AgendaUpdate::Updated => self.stats.heap_updates += 1,
         }
+        self.stats.max_heap_len = self.stats.max_heap_len.max(self.heap.len());
+        self.stats.max_heap_position_capacity = self
+            .stats
+            .max_heap_position_capacity
+            .max(self.heap.position_capacity());
     }
 
     fn seed_nullary_edges<H: IntersectionHeuristic<R>, S: WeightScorer>(
@@ -1185,122 +1068,75 @@ where
         }
     }
 
-    fn pop_next_finalized<S: WeightScorer>(
-        &mut self,
-        scorer: &S,
-        store_finalized_partners: bool,
-    ) -> Option<FinalizedItem> {
-        while let Some(product_index) = self.heap.pop() {
-            self.stats.pops += 1;
-            let product = StateId(product_index as u32);
-            let Some(item) = self.pending[product_index].take() else {
-                self.stats.stale_pops += 1;
-                continue;
-            };
+    fn pop_next_finalized(&mut self) -> Option<FinalizedItem> {
+        let (product_index, merit) = self.heap.pop()?;
+        self.stats.pops += 1;
+        let product = StateId(product_index as u32);
+        let item = self.pending[product_index]
+            .take()
+            .expect("agenda product must have a pending item");
+        let inside = self.best_score[product.index()];
 
-            if self.finalized.contains(product.index()) {
-                if scorer.better(item.inside, self.best_inside[product.index()]) {
-                    self.stats.reopen_attempts += 1;
-                }
-                continue;
-            }
+        debug_assert!(!self.finalized.contains(product.index()));
 
-            self.finalized.set(product.index(), true);
-            self.best_inside[product.index()] = item.inside;
-            self.best_seen_inside[product.index()] = item.inside;
-            if self.store_backpointers {
-                self.back[product.index()] = Some(Backpointer {
-                    symbol: item.edge.symbol,
-                    children: item.edge.children.clone(),
-                    weight: item.inside,
-                });
-            }
-            self.stats.finalized_states += 1;
-
-            let is_goal = self.is_accepting_product(product);
-            let (left_state, right_state) = self.product_pairs[product.index()];
-            if store_finalized_partners {
-                self.ensure_right_state(right_state);
-                self.finalized_partners[right_state.index()].insert(left_state, product);
-            }
-
-            return Some(FinalizedItem {
-                product,
-                edge: item.edge,
-                inside: item.inside,
-                left_state,
-                right_state,
-                is_goal,
+        self.finalized.set(product.index(), true);
+        if self.store_backpointers {
+            self.back[product.index()] = Some(Backpointer {
+                symbol: item.edge.symbol,
+                children: item.edge.children.clone(),
+                weight: inside,
             });
         }
-
-        None
-    }
-
-    /// Run the core A* loop until the heap is exhausted or `stop` returns true.
-    fn run<H, S, OnFin>(
-        &mut self,
-        h: &H,
-        scorer: &S,
-        stop_at_first_goal: bool,
-        mut on_finalize: OnFin,
-    ) where
-        H: IntersectionHeuristic<R>,
-        S: WeightScorer,
-        OnFin: FnMut(&mut Self, StateId, &EmitEdge, f64),
-    {
-        while let Some(item) = self.pop_next_finalized(scorer, true) {
-            on_finalize(self, item.product, &item.edge, item.inside);
-
-            if item.is_goal && stop_at_first_goal {
-                break;
-            }
-
-            self.expand_from_finalized(item.left_state, item.right_state, item.product, h, scorer);
+        if !self.ever_finalized.contains(product.index()) {
+            self.ever_finalized.set(product.index(), true);
+            self.stats.finalized_states += 1;
         }
+        self.stats.expanded_states += 1;
+
+        let is_goal = self.is_accepting_product(product);
+        let (left_state, right_state) = self.product_pairs[product.index()];
+
+        Some(FinalizedItem {
+            product,
+            edge: item.edge,
+            inside,
+            left_state,
+            right_state,
+            is_goal,
+            merit,
+        })
     }
 
-    fn run_with_span_product_sibling_finder<H, S, OnFin>(
+    fn activate_generic_product(&mut self, item: &FinalizedItem) {
+        self.ensure_right_state(item.right_state);
+        self.finalized_partners[item.right_state.index()]
+            .insert(item.left_state, item.product);
+    }
+
+    /// Run the eager core with an interchangeable candidate source.
+    fn run_with_source<H, S, Source, OnFin>(
         &mut self,
+        source: &mut Source,
         h: &H,
         scorer: &S,
-        span_left_index: &SpanAstarLeftIndex,
         stop_at_first_goal: bool,
         mut on_finalize: OnFin,
     ) where
-        R: CondensedTa<State = Span> + DetBottomUpTa<State = Span>,
         H: IntersectionHeuristic<R>,
         S: WeightScorer,
-        OnFin: FnMut(&mut Self, StateId, &EmitEdge, f64),
+        Source: CandidateSource<R, I>,
+        OnFin: FnMut(&mut Self, StateId, &EmitEdge, f64, f64),
     {
-        let mut sibling_finder = SpanProductSiblingFinder::default();
-        let store_finalized_partners = span_left_index.has_any_higher_arity();
-
-        while let Some(item) = self.pop_next_finalized(scorer, store_finalized_partners) {
-            let raw_right = *self.right_interner.resolve(item.right_state);
-            span_left_index.activate_product(
-                &mut sibling_finder,
-                item.product,
-                item.left_state,
-                item.right_state,
-                raw_right,
-            );
-
-            on_finalize(self, item.product, &item.edge, item.inside);
+        source.seed(self, h, scorer);
+        while let Some(item) = self.pop_next_finalized() {
+            source.activate(self, &item);
+            on_finalize(self, item.product, &item.edge, item.inside, item.merit);
 
             if item.is_goal && stop_at_first_goal {
                 break;
             }
 
-            self.expand_from_finalized_with_span_product_siblings(
-                item.left_state,
-                item.right_state,
-                item.product,
-                span_left_index,
-                &sibling_finder,
-                h,
-                scorer,
-            );
+            source.enumerate(self, &item, h, scorer);
         }
     }
 
@@ -1313,14 +1149,14 @@ where
     /// frontier without resolving (or creating) the parent product id.
     fn candidate_merit<H: IntersectionHeuristic<R>, S: WeightScorer>(
         &self,
+        rule_index: usize,
         parent_left: StateId,
         parent_right: StateId,
-        weight: f64,
         child_score: f64,
         scorer: &S,
         h: &H,
     ) -> f64 {
-        let inside = scorer.times(scorer.rule_score(weight), child_score);
+        let inside = scorer.times(self.rule_scores[rule_index], child_score);
         let right_raw = self.right_interner.resolve(parent_right);
         let h_val = h.outside_estimate(parent_left, right_raw);
         scorer.times(inside, h_val)
@@ -1336,7 +1172,7 @@ where
         trigger_right: StateId,
         position: u8,
         sibling: SpanProductSibling,
-        group: &span::SpanBinarySiblingGroup,
+        group: &SpanBinarySiblingGroup,
         scorer: &S,
         h: &H,
     ) -> Option<f64>
@@ -1351,8 +1187,8 @@ where
             _ => [sibling.right_state, trigger_right],
         };
         let child_score = scorer.times(
-            self.best_inside[trigger.index()],
-            self.best_inside[sibling.product.index()],
+            self.best_score[trigger.index()],
+            self.best_score[sibling.product.index()],
         );
         let mut best: Option<f64> = None;
         for symbol_group in &group.symbol_groups {
@@ -1362,12 +1198,18 @@ where
                 continue;
             };
             for &rule_idx in &symbol_group.rule_indexes {
-                let (parent_left, weight) = {
+                let parent_left = {
                     let rule = &self.left_rules[rule_idx];
-                    (rule.result, rule.weight)
+                    rule.result
                 };
-                let merit =
-                    self.candidate_merit(parent_left, parent_right, weight, child_score, scorer, h);
+                let merit = self.candidate_merit(
+                    rule_idx,
+                    parent_left,
+                    parent_right,
+                    child_score,
+                    scorer,
+                    h,
+                );
                 best = Some(best.map_or(merit, |b| b.max(merit)));
             }
         }
@@ -1410,8 +1252,8 @@ where
             ),
         };
         let child_score = scorer.times(
-            self.best_inside[children[0].index()],
-            self.best_inside[children[1].index()],
+            self.best_score[children[0].index()],
+            self.best_score[children[1].index()],
         );
         let mut realized = false;
         for symbol_group in &group.symbol_groups {
@@ -1421,17 +1263,16 @@ where
                 continue;
             };
             for &rule_idx in &symbol_group.rule_indexes {
-                let (parent_left, symbol, weight) = {
+                let parent_left = {
                     let rule = &self.left_rules[rule_idx];
-                    (rule.result, rule.symbol, rule.weight)
+                    rule.result
                 };
                 self.stats.candidate_edges += 1;
                 self.stats.candidates_realized += 1;
                 self.push_candidate_with_child_score(
+                    rule_idx,
                     parent_left,
                     parent_right,
-                    symbol,
-                    weight,
                     &children,
                     child_score,
                     scorer,
@@ -1549,7 +1390,7 @@ where
         R: CondensedTa<State = Span> + DetBottomUpTa<State = Span>,
         H: IntersectionHeuristic<R>,
         S: WeightScorer,
-        OnFin: FnMut(&mut Self, StateId, &EmitEdge, f64),
+        OnFin: FnMut(&mut Self, StateId, &EmitEdge, f64, f64),
     {
         let mut frontier = SpanLazyFrontier::new();
 
@@ -1564,7 +1405,7 @@ where
             };
 
             if take_parent {
-                let Some(item) = self.pop_next_finalized(scorer, false) else {
+                let Some(item) = self.pop_next_finalized() else {
                     continue;
                 };
                 let span = *self.right_interner.resolve(item.right_state);
@@ -1578,7 +1419,7 @@ where
                     span,
                 );
 
-                on_finalize(self, item.product, &item.edge, item.inside);
+                on_finalize(self, item.product, &item.edge, item.inside, item.merit);
                 if item.is_goal && stop_at_first_goal {
                     break;
                 }
@@ -1602,7 +1443,7 @@ where
                     h,
                 );
             } else {
-                let Some(id) = frontier.frontier.pop() else {
+                let Some((id, _)) = frontier.frontier.pop() else {
                     continue;
                 };
                 self.stats.frontier_pops += 1;
@@ -1634,21 +1475,20 @@ where
             return;
         };
         for &rule_idx in unary_rules {
-            let (parent_left, symbol, weight) = {
+            let (parent_left, symbol) = {
                 let rule = &self.left_rules[rule_idx];
-                (rule.result, rule.symbol, rule.weight)
+                (rule.result, rule.symbol)
             };
             let Some(parent_right) = self.right_parent_memoized(symbol, &[right_state]) else {
                 continue;
             };
             self.stats.candidate_edges += 1;
             self.push_candidate_with_child_score(
+                rule_idx,
                 parent_left,
                 parent_right,
-                symbol,
-                weight,
                 &[product],
-                self.best_inside[product.index()],
+                self.best_score[product.index()],
                 scorer,
                 h,
             );
@@ -1656,21 +1496,97 @@ where
     }
 }
 
+impl<R, I> CandidateSource<R, I> for GenericCandidateSource
+where
+    R: CondensedTa,
+    R::State: Clone + Eq + Hash,
+    I: RightStateInterner<R::State> + StateInterner<R::State>,
+{
+    fn activate(&mut self, ctx: &mut AstarContext<'_, R, I>, item: &FinalizedItem) {
+        ctx.activate_generic_product(item);
+    }
+
+    fn enumerate<H, S>(
+        &mut self,
+        ctx: &mut AstarContext<'_, R, I>,
+        item: &FinalizedItem,
+        h: &H,
+        scorer: &S,
+    ) where
+        H: IntersectionHeuristic<R>,
+        S: WeightScorer,
+    {
+        ctx.expand_from_finalized(
+            item.left_state,
+            item.right_state,
+            item.product,
+            h,
+            scorer,
+            None,
+        );
+    }
+}
+
+impl<'source, R> CandidateSource<R, SpanInterner> for StringAstarSource<'source>
+where
+    R: CondensedTa<State = Span> + DetBottomUpTa<State = Span>,
+{
+    fn activate(
+        &mut self,
+        ctx: &mut AstarContext<'_, R, SpanInterner>,
+        item: &FinalizedItem,
+    ) {
+        let span = *ctx.right_interner.resolve(item.right_state);
+        self.left_index.activate_product(
+            &mut self.sibling_finder,
+            item.product,
+            item.left_state,
+            item.right_state,
+            span,
+        );
+        if self.stores_generic_partners {
+            ctx.activate_generic_product(item);
+        }
+    }
+
+    fn enumerate<H, S>(
+        &mut self,
+        ctx: &mut AstarContext<'_, R, SpanInterner>,
+        item: &FinalizedItem,
+        h: &H,
+        scorer: &S,
+    ) where
+        H: IntersectionHeuristic<R>,
+        S: WeightScorer,
+    {
+        ctx.expand_from_finalized_with_span_product_siblings(
+            item.left_state,
+            item.right_state,
+            item.product,
+            self.left_index,
+            &self.sibling_finder,
+            self.fallback_rules,
+            h,
+            scorer,
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Entry point 1: chart materializer
 // ---------------------------------------------------------------------------
 
-/// Materialize the intersection of an explicit grammar automaton with a
-/// condensed right automaton using A*.
+/// Materialize the Viterbi forest explored by A*.
 ///
-/// The returned [`Explicit`] automaton contains the subset of the intersection
-/// explored and finalized by A*.  When `options.stop_at_first_goal` is `true`
-/// the chart contains exactly the rules needed to derive the single best tree.
+/// The returned [`Explicit`] contains at most one winning incoming rule per
+/// finalized product state. It is therefore not a complete intersection chart.
+/// When `options.stop_at_first_goal` is `true`, it contains the rules needed to
+/// derive the single best tree.
 /// When `options.beam` is set (and `stop_at_first_goal` is `false`) only items
 /// with `merit >= beam` are emitted.
 ///
 /// Returns the chart, the right-state interner, and statistics.
-pub fn materialize_astar_intersection<R, H>(
+pub fn materialize_astar_viterbi_forest<R, H>(
     left: &Explicit,
     right: &R,
     h: &H,
@@ -1681,11 +1597,11 @@ where
     R::State: Clone + Eq + Hash,
     H: IntersectionHeuristic<R>,
 {
-    materialize_astar_intersection_with(left, right, h, options, &ProbabilityScorer)
+    materialize_astar_viterbi_forest_with(left, right, h, options, &ProbabilityScorer)
 }
 
-/// Materialize the intersection using A* and `scorer`.
-pub fn materialize_astar_intersection_with<R, H, S>(
+/// Materialize the A* Viterbi forest using `scorer`.
+pub fn materialize_astar_viterbi_forest_with<R, H, S>(
     left: &Explicit,
     right: &R,
     h: &H,
@@ -1699,6 +1615,38 @@ where
     S: WeightScorer,
 {
     materialize_astar_intersection_with_index(left, right, h, options, scorer)
+}
+
+/// Compatibility alias for [`materialize_astar_viterbi_forest`].
+pub fn materialize_astar_intersection<R, H>(
+    left: &Explicit,
+    right: &R,
+    h: &H,
+    options: AstarOptions,
+) -> (Explicit, Interner<R::State>, AstarStats)
+where
+    R: CondensedTa,
+    R::State: Clone + Eq + Hash,
+    H: IntersectionHeuristic<R>,
+{
+    materialize_astar_viterbi_forest(left, right, h, options)
+}
+
+/// Compatibility alias for [`materialize_astar_viterbi_forest_with`].
+pub fn materialize_astar_intersection_with<R, H, S>(
+    left: &Explicit,
+    right: &R,
+    h: &H,
+    options: AstarOptions,
+    scorer: &S,
+) -> (Explicit, Interner<R::State>, AstarStats)
+where
+    R: CondensedTa,
+    R::State: Clone + Eq + Hash,
+    H: IntersectionHeuristic<R>,
+    S: WeightScorer,
+{
+    materialize_astar_viterbi_forest_with(left, right, h, options, scorer)
 }
 
 pub(crate) fn materialize_astar_string_intersection_with<'h, H, S>(
@@ -1728,6 +1676,12 @@ where
     H: IntersectionHeuristic<InvHom<'h, StringDecompositionAutomaton>>,
     S: WeightScorer,
 {
+    prepared.assert_matches(left);
+    let fallback_rules = string_fallback_rules(
+        &prepared.left_rules,
+        right.homomorphism(),
+        right.inner().concat_symbol(),
+    );
     materialize_astar_intersection_with_span_sibling(
         left,
         prepared,
@@ -1737,7 +1691,8 @@ where
         scorer,
         right.inner().len(),
         string_product_heap_bound(left, right.inner().len()),
-        lazy_frontier_enabled(),
+        Some(&fallback_rules),
+        false,
     )
 }
 
@@ -1751,6 +1706,7 @@ fn materialize_astar_intersection_with_span_sibling<R, H, S>(
     scorer: &S,
     sentence_len: usize,
     heap_index_bound: usize,
+    fallback_rules: Option<&FixedBitSet>,
     lazy: bool,
 ) -> (Explicit, Interner<Span>, AstarStats)
 where
@@ -1766,17 +1722,17 @@ where
         SpanInterner::new(sentence_len),
         true,
         heap_index_bound,
+        scorer,
     );
-    ctx.seed_nullary_edges(h, scorer);
-
     let stop_at_first_goal = options.stop_at_first_goal;
     let beam = options.beam;
 
     let on_finalize = |ctx: &mut AstarContext<'_, R, SpanInterner>,
                        product: StateId,
                        edge: &EmitEdge,
-                       inside: f64| {
-        let emit = stop_at_first_goal || beam.is_none_or(|threshold| inside >= threshold);
+                       _inside: f64,
+                       merit: f64| {
+        let emit = stop_at_first_goal || beam.is_none_or(|threshold| merit >= threshold);
         if emit {
             let builder = ctx
                 .builder
@@ -1793,9 +1749,11 @@ where
         }
     };
 
-    let use_lazy =
-        lazy && !prepared.span_left_index.has_any_higher_arity();
+    let use_lazy = lazy
+        && fallback_rules.is_none_or(|fallback| fallback.ones().next().is_none())
+        && !prepared.span_left_index.has_any_higher_arity();
     if use_lazy {
+        ctx.seed_nullary_edges(h, scorer);
         ctx.run_with_lazy_span_frontier(
             h,
             scorer,
@@ -1804,10 +1762,11 @@ where
             on_finalize,
         );
     } else {
-        ctx.run_with_span_product_sibling_finder(
+        let mut source = StringAstarSource::new(&prepared.span_left_index, fallback_rules);
+        ctx.run_with_source(
+            &mut source,
             h,
             scorer,
-            &prepared.span_left_index,
             stop_at_first_goal,
             on_finalize,
         );
@@ -1857,19 +1816,20 @@ where
         Interner::new(),
         true,
         16 * 1024,
+        scorer,
     );
-    ctx.seed_nullary_edges(h, scorer);
-
     let stop_at_first_goal = options.stop_at_first_goal;
     let beam = options.beam;
 
-    ctx.run(
+    let mut source = GenericCandidateSource;
+    ctx.run_with_source(
+        &mut source,
         h,
         scorer,
         stop_at_first_goal,
-        |ctx, _product, edge, inside| {
+        |ctx, _product, edge, _inside, merit| {
             // Emit a rule if in beam mode or one-best mode.
-            let emit = stop_at_first_goal || beam.is_none_or(|threshold| inside >= threshold);
+            let emit = stop_at_first_goal || beam.is_none_or(|threshold| merit >= threshold);
             if emit {
                 let builder = ctx
                     .builder
@@ -1973,6 +1933,12 @@ where
     H: IntersectionHeuristic<InvHom<'h, StringDecompositionAutomaton>>,
     S: WeightScorer,
 {
+    prepared.assert_matches(left);
+    let fallback_rules = string_fallback_rules(
+        &prepared.left_rules,
+        right.homomorphism(),
+        right.inner().concat_symbol(),
+    );
     astar_one_best_with_stats_and_span_sibling(
         left,
         prepared,
@@ -1981,7 +1947,8 @@ where
         scorer,
         right.inner().len(),
         string_product_heap_bound(left, right.inner().len()),
-        lazy_frontier_enabled(),
+        Some(&fallback_rules),
+        false,
     )
 }
 
@@ -1994,6 +1961,7 @@ fn astar_one_best_with_stats_and_span_sibling<R, H, S>(
     scorer: &S,
     sentence_len: usize,
     heap_index_bound: usize,
+    fallback_rules: Option<&FixedBitSet>,
     lazy: bool,
 ) -> (Option<ViterbiTree>, AstarStats)
 where
@@ -2009,33 +1977,37 @@ where
         SpanInterner::new(sentence_len),
         false,
         heap_index_bound,
+        scorer,
     );
-    ctx.seed_nullary_edges(h, scorer);
-
     let mut goal_state: Option<(StateId, f64)> = None;
 
     let on_finalize = |ctx: &mut AstarContext<'_, R, SpanInterner>,
                        product: StateId,
                        _edge: &EmitEdge,
-                       inside: f64| {
+                       inside: f64,
+                       _merit: f64| {
         if goal_state.is_none() && ctx.is_accepting_product(product) {
             goal_state = Some((product, inside));
         }
     };
 
-    let use_lazy =
-        lazy && !prepared.span_left_index.has_any_higher_arity();
+    let use_lazy = lazy
+        && fallback_rules.is_none_or(|fallback| fallback.ones().next().is_none())
+        && !prepared.span_left_index.has_any_higher_arity();
     if use_lazy {
+        ctx.seed_nullary_edges(h, scorer);
         ctx.run_with_lazy_span_frontier(h, scorer, &prepared.span_left_index, true, on_finalize);
     } else {
-        ctx.run_with_span_product_sibling_finder(
+        let mut source = StringAstarSource::new(&prepared.span_left_index, fallback_rules);
+        ctx.run_with_source(
+            &mut source,
             h,
             scorer,
-            &prepared.span_left_index,
             true,
             on_finalize,
         );
     }
+    ctx.stats.output_states = ctx.product_pairs.len();
 
     let Some((goal, best_score)) = goal_state else {
         ctx.stats.right_indexed_queries = ctx.mat_stats.right_indexed_queries;
@@ -2083,16 +2055,17 @@ where
         Interner::new(),
         false,
         16 * 1024,
+        scorer,
     );
-    ctx.seed_nullary_edges(h, scorer);
-
     let mut goal_state: Option<(StateId, f64)> = None;
 
-    ctx.run(h, scorer, true, |ctx, product, _edge, inside| {
+    let mut source = GenericCandidateSource;
+    ctx.run_with_source(&mut source, h, scorer, true, |ctx, product, _edge, inside, _merit| {
         if goal_state.is_none() && ctx.is_accepting_product(product) {
             goal_state = Some((product, inside));
         }
     });
+    ctx.stats.output_states = ctx.product_pairs.len();
 
     let Some((goal, best_score)) = goal_state else {
         ctx.stats.right_indexed_queries = ctx.mat_stats.right_indexed_queries;
@@ -2194,6 +2167,31 @@ mod tests {
         hom.add(source, 3, term).unwrap();
     }
 
+    fn add_reversed_binary_concat_hom(
+        hom: &mut Homomorphism,
+        source: Symbol,
+        concat: Symbol,
+    ) {
+        let right = hom.add_var(1);
+        let left = hom.add_var(0);
+        let term = hom.add_symbol(concat, vec![right, left]);
+        hom.add(source, 2, term).unwrap();
+    }
+
+    fn add_binary_concat_with_middle_word_hom(
+        hom: &mut Homomorphism,
+        source: Symbol,
+        concat: Symbol,
+        word: Symbol,
+    ) {
+        let left = hom.add_var(0);
+        let middle = hom.add_symbol(word, Vec::new());
+        let right = hom.add_var(1);
+        let tail = hom.add_symbol(concat, vec![middle, right]);
+        let term = hom.add_symbol(concat, vec![left, tail]);
+        hom.add(source, 2, term).unwrap();
+    }
+
     #[test]
     fn string_sibling_astar_matches_old_index_and_topdown_for_binary_unary_rules() {
         let concat = Symbol(0);
@@ -2251,7 +2249,7 @@ mod tests {
 
     #[test]
     fn span_interner_round_trips_dense_span_ids() {
-        let mut interner = span::SpanInterner::new(4);
+        let mut interner = SpanInterner::new(4);
         let expected = [
             Span::new(0, 1),
             Span::new(0, 2),
@@ -2318,6 +2316,115 @@ mod tests {
         assert!(new_stats.sibling_fallback_expansions > 0);
     }
 
+    #[test]
+    fn string_sibling_astar_falls_back_for_noncanonical_binary_yields() {
+        let concat = Symbol(0);
+        let word_a = Symbol(1);
+        let word_b = Symbol(2);
+        let word_x = Symbol(3);
+        let g_a = Symbol(10);
+        let g_b = Symbol(11);
+        let g_rev = Symbol(12);
+        let g_gap = Symbol(13);
+
+        let mut hom = Homomorphism::new();
+        add_word_hom(&mut hom, g_a, word_a);
+        add_word_hom(&mut hom, g_b, word_b);
+        add_reversed_binary_concat_hom(&mut hom, g_rev, concat);
+        add_binary_concat_with_middle_word_hom(&mut hom, g_gap, concat, word_x);
+
+        let mut builder = ExplicitBuilder::new();
+        let qa = builder.new_state();
+        let qb = builder.new_state();
+        let reverse_root = builder.new_state();
+        let gap_root = builder.new_state();
+        builder.add_weighted_rule(g_a, vec![], qa, 0.9);
+        builder.add_weighted_rule(g_b, vec![], qb, 0.8);
+        builder.add_weighted_rule(g_rev, vec![qa, qb], reverse_root, 0.7);
+        builder.add_weighted_rule(g_gap, vec![qa, qb], gap_root, 0.6);
+        builder.add_accepting(reverse_root);
+        builder.add_accepting(gap_root);
+        let grammar = builder.build();
+
+        for sentence in [
+            vec![word_b, word_a],
+            vec![word_a, word_x, word_b],
+        ] {
+            let right = InvHom::new(
+                StringDecompositionAutomaton::new(concat, sentence),
+                &hom,
+            );
+            let prepared = PreparedAstarGrammar::new(&grammar);
+            let (fast, stats) = astar_string_one_best_with_stats_prepared(
+                &grammar,
+                &prepared,
+                &right,
+                &ZeroHeuristic,
+                &ProbabilityScorer,
+            );
+            let (generic, _) =
+                astar_one_best_with_stats_and_index(&grammar, &right, &ZeroHeuristic, &ProbabilityScorer);
+            assert_eq!(
+                fast.as_ref().map(ViterbiTree::weight),
+                generic.as_ref().map(ViterbiTree::weight)
+            );
+            assert!(fast.is_some());
+            assert!(stats.sibling_fallback_expansions > 0);
+        }
+    }
+
+    struct InconsistentAdmissibleHeuristic {
+        x: StateId,
+        y: StateId,
+    }
+
+    impl IntersectionHeuristic<Explicit> for InconsistentAdmissibleHeuristic {
+        fn outside_estimate(&self, left: StateId, _right: &StateId) -> f64 {
+            if left == self.x {
+                1.0
+            } else if left == self.y {
+                0.09
+            } else {
+                1.0
+            }
+        }
+    }
+
+    #[test]
+    fn admissible_inconsistent_heuristic_reopens_improved_product() {
+        let a = Symbol(0);
+        let y_leaf = Symbol(1);
+        let improve_x = Symbol(2);
+        let goal_from_x = Symbol(3);
+        let direct_goal = Symbol(4);
+        let mut builder = ExplicitBuilder::new();
+        let x = builder.new_state();
+        let y = builder.new_state();
+        let goal = builder.new_state();
+        builder.add_weighted_rule(a, vec![], x, 0.5);
+        builder.add_weighted_rule(y_leaf, vec![], y, 1.0);
+        builder.add_weighted_rule(improve_x, vec![y], x, 0.9);
+        builder.add_weighted_rule(goal_from_x, vec![x], goal, 0.1);
+        builder.add_weighted_rule(direct_goal, vec![], goal, 0.08);
+        builder.add_accepting(goal);
+        let grammar = builder.build();
+
+        let h = InconsistentAdmissibleHeuristic { x, y };
+        let (chart, _, stats) = materialize_astar_intersection(
+            &grammar,
+            &grammar,
+            &h,
+            AstarOptions {
+                stop_at_first_goal: false,
+                beam: None,
+            },
+        );
+        let best = chart.viterbi().expect("reopened search should find a tree");
+        assert!((best.weight() - 0.09).abs() < 1e-12, "got {}", best.weight());
+        assert!(stats.reopen_attempts > 0);
+        assert!(stats.expanded_states > stats.finalized_states);
+    }
+
     /// Ambiguous purely-binary grammar over three tokens with two root
     /// derivations (`((ab)c)` vs `(a(bc))`) and several binary groups, so the
     /// lazy frontier actually interleaves generation against finalization.
@@ -2374,6 +2481,7 @@ mod tests {
             &ProbabilityScorer,
             n,
             bound,
+            None,
             false,
         );
         let (lazy, lazy_stats) = astar_one_best_with_stats_and_span_sibling(
@@ -2384,6 +2492,7 @@ mod tests {
             &ProbabilityScorer,
             n,
             bound,
+            None,
             true,
         );
 
@@ -2421,6 +2530,7 @@ mod tests {
             &ProbabilityScorer,
             n,
             bound,
+            None,
             false,
         );
         let (lazy_chart, _, lazy_stats) = materialize_astar_intersection_with_span_sibling(
@@ -2432,6 +2542,7 @@ mod tests {
             &ProbabilityScorer,
             n,
             bound,
+            None,
             true,
         );
 
