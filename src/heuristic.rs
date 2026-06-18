@@ -82,6 +82,26 @@ pub trait IntersectionHeuristic<R: BottomUpTa> {
         self.admits(left, right)
             .then(|| self.outside_estimate(left, right))
     }
+
+    /// Whether A* should memoize the admission decision by product pair.
+    ///
+    /// The default is `false`: simple table lookups such as zero, outside, and
+    /// SX are cheaper than maintaining a cache. Heuristics whose sound filter
+    /// performs non-trivial repeated work should opt in.
+    #[inline]
+    fn memoize_admission(&self) -> bool {
+        false
+    }
+
+    /// Return the outside estimate when admission for this pair is already
+    /// known to succeed.
+    ///
+    /// Filtering heuristics that opt into admission memoization should override
+    /// this when their ordinary outside estimate repeats the filter work.
+    #[inline]
+    fn estimate_after_admission(&self, left: StateId, right: &R::State) -> f64 {
+        self.outside_estimate(left, right)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -133,6 +153,18 @@ where
         let a = self.a.estimate_if_admitted(left, right)?;
         let b = self.b.estimate_if_admitted(left, right)?;
         Some(a.min(b))
+    }
+
+    #[inline]
+    fn memoize_admission(&self) -> bool {
+        self.a.memoize_admission() || self.b.memoize_admission()
+    }
+
+    #[inline]
+    fn estimate_after_admission(&self, left: StateId, right: &R::State) -> f64 {
+        self.a
+            .estimate_after_admission(left, right)
+            .min(self.b.estimate_after_admission(left, right))
     }
 }
 

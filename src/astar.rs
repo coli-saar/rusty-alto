@@ -229,6 +229,12 @@ pub struct AstarStats {
     /// span path the skip happens *before* the deterministic right transition,
     /// so it also avoids the `right_step_calls` work for those edges.
     pub f_filtered_candidates: usize,
+    /// Number of parent-pair admission decisions served from the per-parse
+    /// cache. Only heuristics that opt into admission memoization use it.
+    pub heuristic_cache_hits: usize,
+    /// Number of parent-pair admission decisions computed and inserted into
+    /// the per-parse cache. This is also the final number of cached pairs.
+    pub heuristic_cache_misses: usize,
     /// Number of product-aware span sibling queries issued.
     pub sibling_tuple_queries: usize,
     /// Number of exact sibling products returned by the span sibling finder.
@@ -306,6 +312,16 @@ fn candidate_filter_enabled() -> bool {
     )
 }
 
+/// Whether heuristics that request admission memoization receive a per-parse
+/// cache. Defaults to on; the environment switch exists for same-binary A/B
+/// benchmarking.
+fn heuristic_cache_enabled() -> bool {
+    !matches!(
+        std::env::var("RUSTY_ALTO_HEURISTIC_CACHE").as_deref(),
+        Ok("0") | Ok("false")
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Core A* loop (shared between the two entry points)
 // ---------------------------------------------------------------------------
@@ -348,6 +364,11 @@ where
     /// Whether to consult the heuristic's sound `admits` filter when generating
     /// candidate edges (see [`candidate_filter_enabled`]).
     candidate_filter: bool,
+    heuristic_cache_enabled: bool,
+    /// Right-major bitsets recording which product pairs have had their sound
+    /// admission filter checked and which of those pairs were admitted.
+    heuristic_checked: Vec<FixedBitSet>,
+    heuristic_admitted: Vec<FixedBitSet>,
     /// Lazy memo of the right (invhom) transition, keyed by
     /// `(det_group(symbol), child0, child1)` with a sentinel second child for
     /// unary rules. Because the condensed right automaton's transition depends
@@ -409,9 +430,68 @@ where
             matches_scratch: Vec::new(),
             right_rule_ids_scratch: Vec::new(),
             candidate_filter: candidate_filter_enabled(),
+            heuristic_cache_enabled: heuristic_cache_enabled(),
+            heuristic_checked: Vec::new(),
+            heuristic_admitted: Vec::new(),
             right_step_memo: FxHashMap::default(),
             stats: AstarStats::default(),
         }
+    }
+
+    fn heuristic_estimate<H: IntersectionHeuristic<R>>(
+        &mut self,
+        left: StateId,
+        right: StateId,
+        h: &H,
+    ) -> Option<f64> {
+        if !self.heuristic_cache_enabled || !h.memoize_admission() {
+            let right_raw = self.right_interner.resolve(right);
+            return if self.candidate_filter {
+                h.estimate_if_admitted(left, right_raw)
+            } else {
+                Some(h.outside_estimate(left, right_raw))
+            };
+        }
+
+        if self
+            .heuristic_checked
+            .get(right.index())
+            .is_some_and(|checked| {
+                left.index() < checked.len() && checked.contains(left.index())
+            })
+        {
+            self.stats.heuristic_cache_hits += 1;
+            if self.heuristic_admitted[right.index()].contains(left.index()) {
+                let right_raw = self.right_interner.resolve(right);
+                return Some(h.estimate_after_admission(left, right_raw));
+            }
+            return None;
+        }
+
+        let estimate = {
+            let right_raw = self.right_interner.resolve(right);
+            if self.candidate_filter {
+                h.estimate_if_admitted(left, right_raw)
+            } else {
+                Some(h.outside_estimate(left, right_raw))
+            }
+        };
+        if self.heuristic_checked.len() <= right.index() {
+            self.heuristic_checked
+                .resize_with(right.index() + 1, FixedBitSet::new);
+            self.heuristic_admitted
+                .resize_with(right.index() + 1, FixedBitSet::new);
+        }
+        if self.heuristic_checked[right.index()].len() <= left.index() {
+            self.heuristic_checked[right.index()].grow(left.index() + 1);
+            self.heuristic_admitted[right.index()].grow(left.index() + 1);
+        }
+        self.heuristic_checked[right.index()].set(left.index(), true);
+        if estimate.is_some() {
+            self.heuristic_admitted[right.index()].set(left.index(), true);
+        }
+        self.stats.heuristic_cache_misses += 1;
+        estimate
     }
 
     /// Ensure per-state arrays are large enough for `product`.
@@ -551,18 +631,12 @@ where
         // before product-id creation and the heap push. Uses the true resolved
         // parent span, so it is exact. Covers every expansion path (generic,
         // higher-arity fallback, unary, and binary).
-        let outside = if self.candidate_filter {
-            let right_raw = self.right_interner.resolve(parent_right);
-            match h.estimate_if_admitted(parent_left, right_raw) {
-                Some(outside) => outside,
-                None => {
-                    self.stats.f_filtered_candidates += 1;
-                    return;
-                }
+        let outside = match self.heuristic_estimate(parent_left, parent_right, h) {
+            Some(outside) => outside,
+            None => {
+                self.stats.f_filtered_candidates += 1;
+                return;
             }
-        } else {
-            let right_raw = self.right_interner.resolve(parent_right);
-            h.outside_estimate(parent_left, right_raw)
         };
 
         let (parent, _) = if self.builder.is_some() {
@@ -962,18 +1036,12 @@ where
         h: &H,
         scorer: &S,
     ) {
-        let outside = if self.candidate_filter {
-            let right_raw = self.right_interner.resolve(edge.parent_right);
-            match h.estimate_if_admitted(edge.parent_left, right_raw) {
-                Some(outside) => outside,
-                None => {
-                    self.stats.f_filtered_candidates += 1;
-                    return;
-                }
+        let outside = match self.heuristic_estimate(edge.parent_left, edge.parent_right, h) {
+            Some(outside) => outside,
+            None => {
+                self.stats.f_filtered_candidates += 1;
+                return;
             }
-        } else {
-            let right_raw = self.right_interner.resolve(edge.parent_right);
-            h.outside_estimate(edge.parent_left, right_raw)
         };
 
         let (product, _) = if self.builder.is_some() {
@@ -2153,6 +2221,38 @@ mod tests {
             materialize_indexed_condensed_intersection, materialize_topdown_condensed_intersection,
         },
     };
+    use std::cell::Cell;
+
+    struct CountingMemoizedHeuristic {
+        calls: Cell<usize>,
+    }
+
+    impl CountingMemoizedHeuristic {
+        fn new() -> Self {
+            Self {
+                calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl<R: BottomUpTa> IntersectionHeuristic<R> for CountingMemoizedHeuristic {
+        fn outside_estimate(&self, _left: StateId, _right: &R::State) -> f64 {
+            1.0
+        }
+
+        fn estimate_if_admitted(&self, _left: StateId, _right: &R::State) -> Option<f64> {
+            self.calls.set(self.calls.get() + 1);
+            Some(1.0)
+        }
+
+        fn memoize_admission(&self) -> bool {
+            true
+        }
+
+        fn estimate_after_admission(&self, _left: StateId, _right: &R::State) -> f64 {
+            1.0
+        }
+    }
 
     /// Build a small grammar/automaton suitable for self-intersection tests.
     ///
@@ -2609,6 +2709,34 @@ mod tests {
         assert!(lazy_stats.generators_created > 0);
         assert!(lazy_stats.frontier_pops > 0);
         assert!(lazy_stats.candidates_realized > 0);
+    }
+
+    #[test]
+    fn memoized_heuristic_is_evaluated_once_per_parent_pair() {
+        let (grammar, hom, sentence) = build_ambiguous_binary_string_grammar();
+        let right = InvHom::new(
+            StringDecompositionAutomaton::new(Symbol(0), sentence),
+            &hom,
+        );
+        let prepared = PreparedAstarGrammar::new(&grammar);
+        let h = CountingMemoizedHeuristic::new();
+
+        let (chart, _, stats) = materialize_astar_string_intersection_with_prepared(
+            &grammar,
+            &prepared,
+            &right,
+            &h,
+            AstarOptions {
+                stop_at_first_goal: false,
+                beam: None,
+            },
+            &ProbabilityScorer,
+        );
+
+        assert!(chart.viterbi().is_some());
+        assert!(stats.heuristic_cache_hits > 0);
+        assert!(stats.heuristic_cache_misses > 0);
+        assert_eq!(h.calls.get(), stats.heuristic_cache_misses);
     }
 
     #[test]

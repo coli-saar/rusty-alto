@@ -82,6 +82,8 @@ struct Record {
     dominated_candidates: usize,
     finalized_candidate_discards: usize,
     f_filtered_candidates: usize,
+    heuristic_cache_hits: usize,
+    heuristic_cache_misses: usize,
     sibling_tuple_queries: usize,
     sibling_tuples_returned: usize,
     right_step_calls: usize,
@@ -99,7 +101,7 @@ struct ParsedSentence {
 impl Record {
     fn print_csv(&self) {
         println!(
-            "{},{},{},{:.4},{:.4},{:.4},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{:.4},{:.4},{:.4},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             self.sentence_no,
             self.strategy.name(),
             if self.weight.is_nan() {
@@ -124,6 +126,8 @@ impl Record {
             self.dominated_candidates,
             self.finalized_candidate_discards,
             self.f_filtered_candidates,
+            self.heuristic_cache_hits,
+            self.heuristic_cache_misses,
             self.sibling_tuple_queries,
             self.sibling_tuples_returned,
             self.right_step_calls,
@@ -436,7 +440,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     // --- CSV header ---
     println!(
-        "sentence_no,strategy,score,parse_ms,top_ms,total_ms,finalized_states,output_rules,heap_pushes,heap_updates,pops,reopen_attempts,right_indexed_queries,right_rules_scanned,rotated_left_join_queries,left_rule_matches,candidate_edges,dominated_candidates,finalized_candidate_discards,f_filtered_candidates,sibling_tuple_queries,sibling_tuples_returned,right_step_calls,right_step_results,sibling_fallback_expansions"
+        "sentence_no,strategy,score,parse_ms,top_ms,total_ms,finalized_states,output_rules,heap_pushes,heap_updates,pops,reopen_attempts,right_indexed_queries,right_rules_scanned,rotated_left_join_queries,left_rule_matches,candidate_edges,dominated_candidates,finalized_candidate_discards,f_filtered_candidates,heuristic_cache_hits,heuristic_cache_misses,sibling_tuple_queries,sibling_tuples_returned,right_step_calls,right_step_results,sibling_fallback_expansions"
     );
 
     let mut accums: HashMap<Strategy, StrategyAccum> = HashMap::new();
@@ -820,6 +824,8 @@ fn run_chart_strategy(
                 dominated_candidates: 0,
                 finalized_candidate_discards: 0,
                 f_filtered_candidates: 0,
+                heuristic_cache_hits: 0,
+                heuristic_cache_misses: 0,
                 sibling_tuple_queries: 0,
                 sibling_tuples_returned: 0,
                 right_step_calls: 0,
@@ -868,6 +874,8 @@ fn run_chart_strategy(
         dominated_candidates: 0,
         finalized_candidate_discards: 0,
         f_filtered_candidates: 0,
+        heuristic_cache_hits: 0,
+        heuristic_cache_misses: 0,
         sibling_tuple_queries: 0,
         sibling_tuples_returned: 0,
         right_step_calls: 0,
@@ -966,6 +974,8 @@ fn run_astar_strategy(
         dominated_candidates: stats.dominated_candidates,
         finalized_candidate_discards: stats.finalized_candidate_discards,
         f_filtered_candidates: stats.f_filtered_candidates,
+        heuristic_cache_hits: stats.heuristic_cache_hits,
+        heuristic_cache_misses: stats.heuristic_cache_misses,
         sibling_tuple_queries: stats.sibling_tuple_queries,
         sibling_tuples_returned: stats.sibling_tuples_returned,
         right_step_calls: stats.right_step_calls,

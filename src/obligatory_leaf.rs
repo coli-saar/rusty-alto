@@ -334,6 +334,16 @@ impl IntersectionHeuristic<StringDecompositionAutomaton> for ObligatoryLeafHeuri
     fn estimate_if_admitted(&self, left: StateId, span: &Span) -> Option<f64> {
         (!self.prunes(left, span)).then_some(self.pass)
     }
+
+    #[inline]
+    fn memoize_admission(&self) -> bool {
+        true
+    }
+
+    #[inline]
+    fn estimate_after_admission(&self, _left: StateId, _span: &Span) -> f64 {
+        self.pass
+    }
 }
 
 impl IntersectionHeuristic<InvHom<'_, StringDecompositionAutomaton>>
@@ -353,6 +363,16 @@ impl IntersectionHeuristic<InvHom<'_, StringDecompositionAutomaton>>
     #[inline]
     fn estimate_if_admitted(&self, left: StateId, span: &Span) -> Option<f64> {
         (!self.prunes(left, span)).then_some(self.pass)
+    }
+
+    #[inline]
+    fn memoize_admission(&self) -> bool {
+        true
+    }
+
+    #[inline]
+    fn estimate_after_admission(&self, _left: StateId, _span: &Span) -> f64 {
+        self.pass
     }
 }
 

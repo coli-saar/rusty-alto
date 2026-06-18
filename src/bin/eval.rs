@@ -219,7 +219,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             let mut f = File::create(path)?;
             writeln!(
                 f,
-                "sentence_no,length,products,finalized,expanded,reopens,candidates,filtered,dominated,finalized_discards,heap_pushes,heap_updates,max_heap_len,heap_position_capacity,string_sibling_tuples,generic_fallback_expansions,right_step_calls,right_step_evals,right_step_memo_hits"
+                "sentence_no,length,products,finalized,expanded,reopens,candidates,filtered,heuristic_cache_hits,heuristic_cache_misses,dominated,finalized_discards,heap_pushes,heap_updates,max_heap_len,heap_position_capacity,string_sibling_tuples,generic_fallback_expansions,right_step_calls,right_step_evals,right_step_memo_hits"
             )?;
             f.flush()?;
             Some(f)
@@ -385,13 +385,15 @@ fn run() -> Result<(), Box<dyn Error>> {
             if let (Some(f), Some(stats)) = (astar_stats.as_mut(), stats.as_ref()) {
                 writeln!(
                     f,
-                    "{sentence_no},{length},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                    "{sentence_no},{length},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                     stats.output_states,
                     stats.finalized_states,
                     stats.expanded_states,
                     stats.reopen_attempts,
                     stats.candidate_edges,
                     stats.f_filtered_candidates,
+                    stats.heuristic_cache_hits,
+                    stats.heuristic_cache_misses,
                     stats.dominated_candidates,
                     stats.finalized_candidate_discards,
                     stats.heap_pushes,
