@@ -278,8 +278,18 @@ pub(crate) struct LeftIndex {
 
 impl LeftIndex {
     pub(crate) fn build(rules: &[OwnedRule]) -> Self {
+        Self::build_filtered(rules, |_, _| true)
+    }
+
+    pub(crate) fn build_filtered(
+        rules: &[OwnedRule],
+        mut include: impl FnMut(usize, &OwnedRule) -> bool,
+    ) -> Self {
         let mut index = Self::default();
         for (rule_idx, rule) in rules.iter().enumerate() {
+            if !include(rule_idx, rule) {
+                continue;
+            }
             index
                 .by_children
                 .get_or_insert_with(&rule.children, FxHashMap::default)

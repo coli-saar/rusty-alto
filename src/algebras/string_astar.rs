@@ -10,7 +10,8 @@ use fixedbitset::FixedBitSet;
 /// This deliberately stays private: the A* core sees only the resulting
 /// fallback-rule set and never interprets homomorphism terms.
 enum StringYieldTemplate {
-    NullaryOrUnary,
+    Nullary,
+    UnaryIdentity,
     ForwardBinaryConcat,
 }
 
@@ -21,7 +22,12 @@ impl StringYieldTemplate {
         concat: Symbol,
     ) -> Option<StringYieldTemplate> {
         match rule.children.len() {
-            0 | 1 => hom.get(rule.symbol).map(|_| Self::NullaryOrUnary),
+            0 => hom.get(rule.symbol).map(|_| Self::Nullary),
+            1 => {
+                let term = hom.get(rule.symbol)?;
+                (*hom.arena().get_label(term) == HomLabel::Var(0))
+                    .then_some(Self::UnaryIdentity)
+            }
             2 => {
                 let term = hom.get(rule.symbol)?;
                 if *hom.arena().get_label(term) != HomLabel::Symbol(concat) {

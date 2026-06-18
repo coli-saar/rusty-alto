@@ -71,6 +71,17 @@ pub trait IntersectionHeuristic<R: BottomUpTa> {
     fn admits(&self, _left: StateId, _right: &R::State) -> bool {
         true
     }
+
+    /// Return the outside estimate when the product is admitted, and `None`
+    /// when it is provably unable to occur in an accepting derivation.
+    ///
+    /// Heuristics whose filtering and estimate share work should override this
+    /// method. The A* hot path uses it to avoid evaluating the heuristic twice.
+    #[inline]
+    fn estimate_if_admitted(&self, left: StateId, right: &R::State) -> Option<f64> {
+        self.admits(left, right)
+            .then(|| self.outside_estimate(left, right))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +126,13 @@ where
     #[inline]
     fn admits(&self, left: StateId, right: &R::State) -> bool {
         self.a.admits(left, right) && self.b.admits(left, right)
+    }
+
+    #[inline]
+    fn estimate_if_admitted(&self, left: StateId, right: &R::State) -> Option<f64> {
+        let a = self.a.estimate_if_admitted(left, right)?;
+        let b = self.b.estimate_if_admitted(left, right)?;
+        Some(a.min(b))
     }
 }
 

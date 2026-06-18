@@ -89,7 +89,7 @@ const RIGHT_UNARY_SENTINEL: StateId = StateId(u32::MAX);
 pub struct PreparedAstarGrammar {
     grammar_addr: usize,
     left_rules: Vec<OwnedRule>,
-    left_index: LeftIndex,
+    nullary_left_index: LeftIndex,
     span_left_index: SpanAstarLeftIndex,
 }
 
@@ -104,12 +104,13 @@ impl PreparedAstarGrammar {
                 weight: rule.weight,
             })
             .collect();
-        let left_index = LeftIndex::build(&left_rules);
+        let nullary_left_index =
+            LeftIndex::build_filtered(&left_rules, |_, rule| rule.children.is_empty());
         let span_left_index = SpanAstarLeftIndex::build(&left_rules);
         Self {
             grammar_addr: left as *const Explicit as usize,
             left_rules,
-            left_index,
+            nullary_left_index,
             span_left_index,
         }
     }
@@ -346,7 +347,7 @@ where
     left_rules: &'a [OwnedRule],
     rule_scores: Vec<f64>,
     left_index: &'a LeftIndex,
-    right_rule_index: ChildStateRightRuleIndex,
+    right_rule_index: Option<ChildStateRightRuleIndex>,
     right_interner: I,
     product_ids: ProductStateMap,
     product_pairs: Vec<(StateId, StateId)>,
@@ -396,6 +397,7 @@ where
         with_builder: bool,
         _heap_index_bound: usize,
         scorer: &impl WeightScorer,
+        use_generic_source: bool,
     ) -> Self {
         let store_backpointers = !with_builder;
         Self {
@@ -407,7 +409,7 @@ where
                 .map(|rule| scorer.rule_score(rule.weight))
                 .collect(),
             left_index,
-            right_rule_index: ChildStateRightRuleIndex::default(),
+            right_rule_index: use_generic_source.then(ChildStateRightRuleIndex::default),
             right_interner,
             product_ids: ProductStateMap::default(),
             product_pairs: Vec::new(),
@@ -514,7 +516,10 @@ where
 
     fn rule_ids_for_trigger(&mut self, position: usize, trigger_right: StateId) -> Vec<usize> {
         let mut out = std::mem::take(&mut self.right_rule_ids_scratch);
-        self.right_rule_index.rule_ids_for_trigger_into(
+        self.right_rule_index
+            .as_mut()
+            .expect("generic right-rule index was not requested")
+            .rule_ids_for_trigger_into(
             self.right,
             &mut self.right_interner,
             &mut self.right_rules,
@@ -564,19 +569,25 @@ where
         let inside = scorer.times(self.rule_scores[rule_index], child_score);
         let rule = &self.left_rules[rule_index];
 
-        // Sound construction-time filter: if the heuristic proves this parent
+        // Sound construction-time filter and outside estimate. Keeping these
+        // together lets composite heuristics share their lookup work.
         // product hopeless (zero outside weight), never build the edge — skip
         // before product-id creation and the heap push. Uses the true resolved
         // parent span, so it is exact. Covers every expansion path (generic,
-        // higher-arity fallback, unary, binary); the span path additionally
-        // filters earlier, before the deterministic right transition.
-        if self.candidate_filter {
+        // higher-arity fallback, unary, and binary).
+        let outside = if self.candidate_filter {
             let right_raw = self.right_interner.resolve(parent_right);
-            if !h.admits(parent_left, right_raw) {
-                self.stats.f_filtered_candidates += 1;
-                return;
+            match h.estimate_if_admitted(parent_left, right_raw) {
+                Some(outside) => outside,
+                None => {
+                    self.stats.f_filtered_candidates += 1;
+                    return;
+                }
             }
-        }
+        } else {
+            let right_raw = self.right_interner.resolve(parent_right);
+            h.outside_estimate(parent_left, right_raw)
+        };
 
         let (parent, _) = if self.builder.is_some() {
             self.get_or_create_product_id(parent_left, parent_right)
@@ -600,9 +611,7 @@ where
         }
         self.best_score[parent.index()] = inside;
 
-        let right_raw = self.right_interner.resolve(parent_right);
-        let h_val = h.outside_estimate(parent_left, right_raw);
-        let merit = scorer.times(inside, h_val);
+        let merit = scorer.times(inside, outside);
         self.pending[parent.index()] = Some(AgendaItem {
             edge: EmitEdge {
                 symbol: rule.symbol,
@@ -858,26 +867,16 @@ where
                 if fallback_rules.is_some_and(|fallback| fallback.contains(rule_idx)) {
                     continue;
                 }
-                let (parent_left, symbol) = {
+                let parent_left = {
                     let left_rule = &self.left_rules[rule_idx];
-                    (left_rule.result, left_rule.symbol)
+                    left_rule.result
                 };
-
-                // A unary projection keeps the child span, so the parent span is
-                // `raw_trigger` (any edge terminals only widen it, which can only
-                // make the filter admit more — still sound). Filter before the
-                // deterministic right transition to skip its work for hopeless
-                // parents.
-                if self.candidate_filter && !h.admits(parent_left, &raw_trigger) {
-                    self.stats.f_filtered_candidates += 1;
-                    continue;
-                }
 
                 let children = [trigger_product];
 
-                let Some(parent_right) = self.right_parent_memoized(symbol, &[trigger_right]) else {
-                    continue;
-                };
+                // The only specialized unary template is the identity variable,
+                // so its exact parent span is the child span.
+                let parent_right = trigger_right;
                 self.stats.candidate_edges += 1;
                 self.push_candidate_with_child_score(
                     rule_idx,
@@ -910,29 +909,16 @@ where
                         continue;
                     }
 
-                    let (children, right_children) = match position {
-                        0 => (
-                            [trigger_product, sibling.product],
-                            [trigger_right, sibling.right_state],
-                        ),
-                        1 => (
-                            [sibling.product, trigger_product],
-                            [sibling.right_state, trigger_right],
-                        ),
+                    let children = match position {
+                        0 => [trigger_product, sibling.product],
+                        1 => [sibling.product, trigger_product],
                         _ => unreachable!(),
                     };
 
-                    // Predicted parent span = the concatenation of the child
-                    // spans (pos 0: [trigger.start, sibling.end]; pos 1:
-                    // [sibling.start, trigger.end]). For any monotone string
-                    // homomorphism the true span from `step_det` can only widen
-                    // this (edge terminals), and supply_left/supply_right are
-                    // monotone in the span boundary, so a predicted-span F prune
-                    // implies a true-span prune: the filter under-prunes and is
-                    // sound. Testing F here lets us skip the deterministic right
-                    // transition for hopeless parents.
+                    // The specialized template is exactly concat(?0, ?1), so
+                    // this is the true parent span rather than a prediction.
                     let raw_sibling = *self.right_interner.resolve(sibling.right_state);
-                    let predicted = match position {
+                    let parent_span = match position {
                         0 => Span::new(raw_trigger.start, raw_sibling.end),
                         _ => Span::new(raw_sibling.start, raw_trigger.end),
                     };
@@ -960,24 +946,20 @@ where
                             debug_assert_eq!(left_rule.children[position], trigger_left);
                             debug_assert_eq!(left_rule.children[1 - position], group.sibling_left);
 
-                            if self.candidate_filter && !h.admits(result, &predicted) {
-                                self.stats.f_filtered_candidates += 1;
-                                continue;
-                            }
-
                             let pr = match parent_right {
                                 Some(pr) => pr,
-                                None => match self.binary_right_parent_det(symbol, right_children) {
-                                    Some(pr) => {
-                                        parent_right = Some(pr);
-                                        pr
-                                    }
-                                    // No parent right-state for these spans (a
-                                    // non-concat homomorphism rejecting them);
-                                    // matches the old `step_det`-failure skip of
-                                    // the whole symbol group.
-                                    None => break,
-                                },
+                                None => {
+                                    // Supported binary rules are exactly
+                                    // concat(?0, ?1), and the sibling finder
+                                    // already guarantees adjacent child spans.
+                                    // Construct the exact parent directly.
+                                    let pr = RightStateInterner::intern(
+                                        &mut self.right_interner,
+                                        parent_span,
+                                    );
+                                    parent_right = Some(pr);
+                                    pr
+                                }
                             };
 
                             self.stats.candidate_edges += 1;
@@ -1005,13 +987,19 @@ where
         h: &H,
         scorer: &S,
     ) {
-        if self.candidate_filter {
+        let outside = if self.candidate_filter {
             let right_raw = self.right_interner.resolve(edge.parent_right);
-            if !h.admits(edge.parent_left, right_raw) {
-                self.stats.f_filtered_candidates += 1;
-                return;
+            match h.estimate_if_admitted(edge.parent_left, right_raw) {
+                Some(outside) => outside,
+                None => {
+                    self.stats.f_filtered_candidates += 1;
+                    return;
+                }
             }
-        }
+        } else {
+            let right_raw = self.right_interner.resolve(edge.parent_right);
+            h.outside_estimate(edge.parent_left, right_raw)
+        };
 
         let (product, _) = if self.builder.is_some() {
             self.get_or_create_product_id(edge.parent_left, edge.parent_right)
@@ -1028,9 +1016,7 @@ where
         }
         self.best_score[product.index()] = inside;
 
-        let right_raw = self.right_interner.resolve(edge.parent_right);
-        let h_val = h.outside_estimate(edge.parent_left, right_raw);
-        let merit = scorer.times(inside, h_val);
+        let merit = scorer.times(inside, outside);
         self.pending[product.index()] = Some(AgendaItem {
             edge: EmitEdge {
                 symbol: edge.symbol,
@@ -1544,7 +1530,7 @@ where
             item.right_state,
             span,
         );
-        if self.stores_generic_partners {
+        if self.stores_generic_partners && ctx.left_index.by_state.contains_key(&item.left_state) {
             ctx.activate_generic_product(item);
         }
     }
@@ -1714,15 +1700,27 @@ where
     H: IntersectionHeuristic<R>,
     S: WeightScorer,
 {
+    let use_generic_source =
+        fallback_rules.is_some_and(|fallback| fallback.ones().next().is_some());
+    let fallback_left_index = use_generic_source.then(|| {
+        LeftIndex::build_filtered(&prepared.left_rules, |rule_index, rule| {
+            rule.children.is_empty()
+                || fallback_rules.is_some_and(|fallback| fallback.contains(rule_index))
+        })
+    });
+    let left_index = fallback_left_index
+        .as_ref()
+        .unwrap_or(&prepared.nullary_left_index);
     let mut ctx = AstarContext::new(
         left,
         right,
         &prepared.left_rules,
-        &prepared.left_index,
+        left_index,
         SpanInterner::new(sentence_len),
         true,
         heap_index_bound,
         scorer,
+        use_generic_source,
     );
     let stop_at_first_goal = options.stop_at_first_goal;
     let beam = options.beam;
@@ -1817,6 +1815,7 @@ where
         true,
         16 * 1024,
         scorer,
+        true,
     );
     let stop_at_first_goal = options.stop_at_first_goal;
     let beam = options.beam;
@@ -1969,15 +1968,27 @@ where
     H: IntersectionHeuristic<R>,
     S: WeightScorer,
 {
+    let use_generic_source =
+        fallback_rules.is_some_and(|fallback| fallback.ones().next().is_some());
+    let fallback_left_index = use_generic_source.then(|| {
+        LeftIndex::build_filtered(&prepared.left_rules, |rule_index, rule| {
+            rule.children.is_empty()
+                || fallback_rules.is_some_and(|fallback| fallback.contains(rule_index))
+        })
+    });
+    let left_index = fallback_left_index
+        .as_ref()
+        .unwrap_or(&prepared.nullary_left_index);
     let mut ctx = AstarContext::new(
         left,
         right,
         &prepared.left_rules,
-        &prepared.left_index,
+        left_index,
         SpanInterner::new(sentence_len),
         false,
         heap_index_bound,
         scorer,
+        use_generic_source,
     );
     let mut goal_state: Option<(StateId, f64)> = None;
 
@@ -2056,6 +2067,7 @@ where
         false,
         16 * 1024,
         scorer,
+        true,
     );
     let mut goal_state: Option<(StateId, f64)> = None;
 
@@ -2151,6 +2163,18 @@ mod tests {
         hom.add(source, 1, child).unwrap();
     }
 
+    fn add_unary_suffix_hom(
+        hom: &mut Homomorphism,
+        source: Symbol,
+        concat: Symbol,
+        word: Symbol,
+    ) {
+        let child = hom.add_var(0);
+        let suffix = hom.add_symbol(word, Vec::new());
+        let term = hom.add_symbol(concat, vec![child, suffix]);
+        hom.add(source, 1, term).unwrap();
+    }
+
     fn add_binary_concat_hom(hom: &mut Homomorphism, source: Symbol, concat: Symbol) {
         let left = hom.add_var(0);
         let right = hom.add_var(1);
@@ -2242,9 +2266,52 @@ mod tests {
         assert!((new_best.weight() - topdown_best.weight()).abs() < 1e-10);
         assert!(new_stats.sibling_tuple_queries > 0);
         assert!(new_stats.sibling_tuples_returned > 0);
-        assert!(new_stats.right_step_calls > 0);
-        assert!(new_stats.right_step_results > 0);
+        assert_eq!(new_stats.right_step_calls, 0);
+        assert_eq!(new_stats.right_step_results, 0);
         assert_eq!(new_stats.sibling_fallback_expansions, 0);
+    }
+
+    #[test]
+    fn string_sibling_astar_falls_back_for_nonidentity_unary_yields() {
+        let concat = Symbol(0);
+        let word_a = Symbol(1);
+        let word_x = Symbol(2);
+        let g_a = Symbol(10);
+        let g_suffix = Symbol(11);
+
+        let mut hom = Homomorphism::new();
+        add_word_hom(&mut hom, g_a, word_a);
+        add_unary_suffix_hom(&mut hom, g_suffix, concat, word_x);
+
+        let mut builder = ExplicitBuilder::new();
+        let child = builder.new_state();
+        let root = builder.new_state();
+        builder.add_weighted_rule(g_a, vec![], child, 0.9);
+        builder.add_weighted_rule(g_suffix, vec![child], root, 0.8);
+        builder.add_accepting(root);
+        let grammar = builder.build();
+
+        let right = InvHom::new(
+            StringDecompositionAutomaton::new(concat, vec![word_a, word_x]),
+            &hom,
+        );
+        let prepared = PreparedAstarGrammar::new(&grammar);
+        let (fast, stats) = astar_string_one_best_with_stats_prepared(
+            &grammar,
+            &prepared,
+            &right,
+            &ZeroHeuristic,
+            &ProbabilityScorer,
+        );
+        let (generic, _) =
+            astar_one_best_with_stats_and_index(&grammar, &right, &ZeroHeuristic, &ProbabilityScorer);
+
+        assert_eq!(
+            fast.as_ref().map(ViterbiTree::weight),
+            generic.as_ref().map(ViterbiTree::weight)
+        );
+        assert!(fast.is_some());
+        assert!(stats.sibling_fallback_expansions > 0);
     }
 
     #[test]
