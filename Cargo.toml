@@ -23,6 +23,7 @@ lalrpop = "0.23"
 [features]
 default = []
 stats = []
+viterbi-benchmark = []
 
 [[bin]]
 name = "ptb-eval"

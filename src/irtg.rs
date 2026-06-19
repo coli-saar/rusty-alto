@@ -19,7 +19,7 @@ use crate::{
 };
 use lalrpop_util::ParseError;
 use rusty_tree::tree::{Tree, TreeArena};
-use std::{any::Any, cell::RefCell, fmt, io::Read, marker::PhantomData};
+use std::{any::Any, fmt, io::Read, marker::PhantomData, sync::Mutex};
 use thiserror::Error;
 
 const STRING_ALGEBRA: &str = "de.up.ling.irtg.algebra.StringAlgebra";
@@ -133,7 +133,7 @@ impl Irtg {
             .interpretations
             .get(name)
             .ok_or_else(|| IrtgError::UnknownInterpretation(name.to_owned()))?;
-        if interpretation.algebra.borrow().as_ref().is::<A>() {
+        if interpretation.algebra.lock().unwrap().as_ref().is::<A>() {
             Ok(TypedInterpretation {
                 interpretation,
                 _algebra: PhantomData,
@@ -184,14 +184,7 @@ impl Irtg {
                             interpretation: interpretation.name.clone(),
                         }
                     })?;
-                    let algebra = interpretation.algebra.borrow();
-                    let algebra = algebra
-                        .as_ref()
-                        .downcast_ref::<StringAlgebra>()
-                        .ok_or_else(|| IrtgError::WrongInputType {
-                            interpretation: interpretation.name.clone(),
-                        })?;
-                    let decomp = algebra.decompose(value);
+                    let decomp = interpretation.decompose_string(value)?;
                     let invhom = InvHom::new(decomp, &interpretation.homomorphism);
                     let next_chart = match strategy {
                         MaterializationStrategy::TopDownCondensed => {
@@ -332,14 +325,7 @@ impl Irtg {
                             interpretation: interpretation.name.clone(),
                         })?
                         .clone();
-                    let algebra = interpretation.algebra.borrow();
-                    let algebra = algebra
-                        .as_ref()
-                        .downcast_ref::<StringAlgebra>()
-                        .ok_or_else(|| IrtgError::WrongInputType {
-                            interpretation: interpretation.name.clone(),
-                        })?;
-                    let decomp = algebra.decompose(value);
+                    let decomp = interpretation.decompose_string(value)?;
                     let invhom = InvHom::new(decomp, &interpretation.homomorphism);
                     let (tree, stats) = self.run_astar_one_best_with_scorer(
                         &self.grammar,
@@ -506,14 +492,7 @@ impl Irtg {
                             interpretation: interpretation.name.clone(),
                         }
                     })?;
-                    let algebra = interpretation.algebra.borrow();
-                    let algebra = algebra
-                        .as_ref()
-                        .downcast_ref::<StringAlgebra>()
-                        .ok_or_else(|| IrtgError::WrongInputType {
-                            interpretation: interpretation.name.clone(),
-                        })?;
-                    let decomp = algebra.decompose(value);
+                    let decomp = interpretation.decompose_string(value)?;
                     let invhom = InvHom::new(decomp, &interpretation.homomorphism);
                     if is_last {
                         let (tree, stats) =
@@ -544,7 +523,7 @@ impl Irtg {
 ///
 /// One concrete `Box<dyn DerivationRenderer>` is bound per algebra when the IRTG is built,
 /// so [`Interpretation`] can render values without the caller knowing concrete algebra types.
-trait DerivationRenderer: fmt::Debug {
+trait DerivationRenderer: fmt::Debug + Send + Sync {
     fn render(
         &self,
         algebra: &dyn Any,
@@ -582,7 +561,8 @@ impl<A, C: fmt::Debug> fmt::Debug for TypedDerivationCodec<A, C> {
 impl<A, C> DerivationRenderer for TypedDerivationCodec<A, C>
 where
     A: Algebra + 'static,
-    C: OutputCodec<A::Value> + fmt::Debug,
+    A: Send,
+    C: OutputCodec<A::Value> + fmt::Debug + Send + Sync,
 {
     fn render(
         &self,
@@ -617,13 +597,27 @@ pub struct Interpretation {
     name: String,
     class_name: String,
     kind: InterpretationKind,
-    algebra: RefCell<Box<dyn Any>>,
+    algebra: Mutex<Box<dyn Any + Send>>,
     algebra_signature: Signature,
     homomorphism: Homomorphism,
     renderer: Box<dyn DerivationRenderer>,
 }
 
 impl Interpretation {
+    fn decompose_string(
+        &self,
+        value: Vec<Symbol>,
+    ) -> Result<crate::StringDecompositionAutomaton, IrtgError> {
+        let algebra = self.algebra.lock().unwrap();
+        let algebra = algebra
+            .as_ref()
+            .downcast_ref::<StringAlgebra>()
+            .ok_or_else(|| IrtgError::WrongInputType {
+                interpretation: self.name.clone(),
+            })?;
+        Ok(algebra.decompose(value))
+    }
+
     /// Return the interpretation name.
     pub fn name(&self) -> &str {
         &self.name
@@ -652,10 +646,10 @@ impl Interpretation {
 
     /// Parse a textual object with this interpretation's algebra, returning a type-erased
     /// value suitable for [`input_erased`](Self::input_erased).
-    pub fn parse_object_erased(&self, input: &str) -> Result<Box<dyn Any>, IrtgError> {
+    pub fn parse_object_erased(&self, input: &str) -> Result<Box<dyn Any + Send>, IrtgError> {
         match self.kind {
             InterpretationKind::String => {
-                let mut algebra = self.algebra.borrow_mut();
+                let mut algebra = self.algebra.lock().unwrap();
                 let algebra = algebra
                     .as_mut()
                     .downcast_mut::<StringAlgebra>()
@@ -681,7 +675,7 @@ impl Interpretation {
 
     /// Package a type-erased value (from [`parse_object_erased`](Self::parse_object_erased))
     /// as a [`ParseInput`] for [`Irtg::parse`].
-    pub fn input_erased(&self, value: Box<dyn Any>) -> ParseInput<'_> {
+    pub fn input_erased(&self, value: Box<dyn Any + Send>) -> ParseInput<'_> {
         ParseInput {
             interpretation: self,
             value,
@@ -695,7 +689,7 @@ impl Interpretation {
         arena: &TreeArena<Symbol>,
         root: Tree,
     ) -> Result<String, IrtgError> {
-        let algebra = self.algebra.borrow();
+        let algebra = self.algebra.lock().unwrap();
         self.renderer
             .render(&**algebra, &self.homomorphism, arena, root, &self.name)
     }
@@ -719,7 +713,7 @@ pub struct TypedInterpretation<'i, A> {
 impl<'i, A> TypedInterpretation<'i, A>
 where
     A: Algebra + 'static,
-    A::InternalValue: 'static,
+    A::InternalValue: Send + 'static,
     A::ParseError: fmt::Display,
 {
     /// Return the interpretation name.
@@ -739,7 +733,7 @@ where
 
     /// Parse a textual object using the interpretation's algebra (to its internal value).
     pub fn parse_object(&self, input: &str) -> Result<A::InternalValue, IrtgError> {
-        let mut algebra = self.interpretation.algebra.borrow_mut();
+        let mut algebra = self.interpretation.algebra.lock().unwrap();
         let algebra =
             algebra
                 .as_mut()
@@ -769,7 +763,7 @@ where
         arena: &TreeArena<Symbol>,
         root: Tree,
     ) -> Result<A::Value, IrtgError> {
-        let algebra = self.interpretation.algebra.borrow();
+        let algebra = self.interpretation.algebra.lock().unwrap();
         let algebra =
             algebra
                 .as_ref()
@@ -794,7 +788,7 @@ where
 /// Type-erased parse input created by a typed interpretation handle.
 pub struct ParseInput<'i> {
     interpretation: &'i Interpretation,
-    value: Box<dyn Any>,
+    value: Box<dyn Any + Send>,
 }
 
 /// The parse chart returned by [`Irtg::parse`].
@@ -941,7 +935,7 @@ fn build_irtg(ast: AstIrtg) -> Result<Irtg, IrtgError> {
     for decl in ast.interpretations {
         let (kind, algebra, algebra_signature, renderer): (
             InterpretationKind,
-            Box<dyn Any>,
+            Box<dyn Any + Send>,
             Signature,
             Box<dyn DerivationRenderer>,
         ) = if decl.algebra == STRING_ALGEBRA {
@@ -994,7 +988,7 @@ fn build_irtg(ast: AstIrtg) -> Result<Irtg, IrtgError> {
                 name: decl.name,
                 class_name: decl.algebra,
                 kind,
-                algebra: RefCell::new(algebra),
+                algebra: Mutex::new(algebra),
                 algebra_signature,
                 homomorphism,
                 renderer,

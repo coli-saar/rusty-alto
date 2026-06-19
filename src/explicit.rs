@@ -4,8 +4,8 @@ use crate::{
 };
 use fixedbitset::FixedBitSet;
 use smallvec::SmallVec;
-use std::cell::OnceCell;
 use std::hash::{BuildHasher, Hash, Hasher};
+use std::sync::OnceLock;
 use thiserror::Error;
 
 type Results = SmallVec<[StateId; 2]>;
@@ -24,11 +24,11 @@ pub struct Explicit {
     num_states: u32,
     accepting: FixedBitSet,
     rules: Vec<StoredRule>,
-    bottom_up_indexes: OnceCell<BottomUpIndexes>,
-    reachable_cache: OnceCell<FixedBitSet>,
-    result_index: OnceCell<Vec<Vec<usize>>>,
-    indexes: OnceCell<Indexes>,
-    condensed_cache: OnceCell<Vec<CondensedRule>>,
+    bottom_up_indexes: OnceLock<BottomUpIndexes>,
+    reachable_cache: OnceLock<FixedBitSet>,
+    result_index: OnceLock<Vec<Vec<usize>>>,
+    indexes: OnceLock<Indexes>,
+    condensed_cache: OnceLock<Vec<CondensedRule>>,
 }
 
 #[derive(Clone, Debug, Eq)]
@@ -262,11 +262,11 @@ impl ExplicitBuilder {
             num_states: self.next_state,
             accepting,
             rules: stored,
-            bottom_up_indexes: OnceCell::new(),
-            reachable_cache: OnceCell::new(),
-            result_index: OnceCell::new(),
-            indexes: OnceCell::new(),
-            condensed_cache: OnceCell::new(),
+            bottom_up_indexes: OnceLock::new(),
+            reachable_cache: OnceLock::new(),
+            result_index: OnceLock::new(),
+            indexes: OnceLock::new(),
+            condensed_cache: OnceLock::new(),
         })
     }
 

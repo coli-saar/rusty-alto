@@ -96,6 +96,71 @@ fn parseval(c: &mut Criterion) {
     group.finish();
 }
 
+fn viterbi_performance(c: &mut Criterion) {
+    #[cfg(feature = "viterbi-benchmark")]
+    {
+        fn shared_dag(width: usize) -> Explicit {
+            let mut builder = ExplicitBuilder::new();
+            let leaf = builder.new_state();
+            builder.add_weighted_rule(A, vec![], leaf, 0.99);
+            let mut previous = leaf;
+            for i in 0..width {
+                let state = builder.new_state();
+                builder.add_weighted_rule(U, vec![previous], state, 0.99 - (i % 7) as f64 * 0.001);
+                builder.add_weighted_rule(F, vec![previous, leaf], state, 0.97);
+                previous = state;
+            }
+            builder.add_accepting(previous);
+            builder.build()
+        }
+
+        fn balanced_automaton(depth: usize) -> Explicit {
+            fn build(builder: &mut ExplicitBuilder, depth: usize) -> StateId {
+                if depth == 0 {
+                    let state = builder.new_state();
+                    builder.add_weighted_rule(A, vec![], state, 0.99);
+                    state
+                } else {
+                    let left = build(builder, depth - 1);
+                    let right = build(builder, depth - 1);
+                    let state = builder.new_state();
+                    builder.add_weighted_rule(F, vec![left, right], state, 0.99);
+                    state
+                }
+            }
+
+            let mut builder = ExplicitBuilder::new();
+            let root = build(&mut builder, depth);
+            builder.add_accepting(root);
+            builder.build()
+        }
+
+        let mut shapes = c.benchmark_group("viterbi_shapes");
+        for depth in [8, 10, 12] {
+            let automaton = balanced_automaton(depth);
+            shapes.throughput(Throughput::Elements(automaton.num_states() as u64));
+            shapes.bench_with_input(
+                BenchmarkId::new("old_balanced", depth),
+                &automaton,
+                |b, automaton| b.iter(|| black_box(automaton.viterbi_old_benchmark())),
+            );
+            shapes.bench_with_input(
+                BenchmarkId::new("new_balanced", depth),
+                &automaton,
+                |b, automaton| b.iter(|| black_box(automaton.viterbi())),
+            );
+        }
+        let shared = shared_dag(8_192);
+        shapes.bench_function("new_shared_dag_8192", |b| {
+            b.iter(|| black_box(shared.viterbi()))
+        });
+        shapes.finish();
+    }
+
+    #[cfg(not(feature = "viterbi-benchmark"))]
+    let _ = c;
+}
+
 fn hash_set_parseval(
     predicted: &TreeArena<String>,
     predicted_root: Tree,
@@ -507,6 +572,7 @@ criterion_group!(
     reachability,
     string_decomposition,
     irtg_condensed_parsing,
-    parseval
+    parseval,
+    viterbi_performance
 );
 criterion_main!(benches);

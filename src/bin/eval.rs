@@ -4,15 +4,14 @@
 //! Usage:
 //!   eval <grammar.irtg> <corpus|-> [-o out.corpus] [--limit N]
 //!        [--algorithm exhaustive|astar] [--heuristic zero|outside|sx|sxf]
-//!        [--times times.csv] [--input INTERP]
+//!        [--jobs N] [--times times.csv] [--input INTERP]
 //!        [--parseval INTERP] [--parseval-output FILE] [--evalb-param FILE]
 
 use rusty_alto::{
-    AstarHeuristic, AstarOptions, Binarizing, CorpusWriter, EvalbParams, Irtg,
-    LogProbabilityScorer, MaterializationStrategy, ObligatoryLeafTables, OutsideHeuristic,
+    AstarHeuristic, AstarOptions, AstarStats, Binarizing, CorpusWriter, EvalbParams, Instance,
+    Irtg, LogProbabilityScorer, MaterializationStrategy, ObligatoryLeafTables, OutsideHeuristic,
     ParsevalCounts, ParsevalSkip, PreparedAstarGrammar, Symbol, TreeAlgebra, TreeValue,
-    UniversalSxHeuristic,
-    compare_trees, count_gold, parse_irtg, read_corpus,
+    UniversalSxHeuristic, ViterbiTree, compare_trees, count_gold, parse_irtg, read_corpus,
 };
 use rusty_tree::{parser::parse_tree, tree::TreeArena};
 use std::{
@@ -22,10 +21,7 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     process,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Mutex, mpsc},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -59,12 +55,22 @@ struct Args {
     parseval: Option<String>,
     parseval_output: Option<String>,
     evalb_param: Option<String>,
+    jobs: usize,
 }
 
 #[derive(Clone, Copy)]
 enum TreeInterpretationKind {
     Plain,
     Binarizing,
+}
+
+struct ParsedInstance {
+    sentence_no: usize,
+    length: usize,
+    instance: Instance,
+    best: Option<ViterbiTree>,
+    stats: Option<AstarStats>,
+    parse_ms: f64,
 }
 
 fn main() {
@@ -130,8 +136,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 
     let scorer = LogProbabilityScorer;
-    let prepared_astar = (args.algorithm == Algorithm::Astar)
-        .then(|| PreparedAstarGrammar::new(irtg.grammar()));
+    let prepared_astar =
+        (args.algorithm == Algorithm::Astar).then(|| PreparedAstarGrammar::new(irtg.grammar()));
 
     // Build heuristic resources once, before the loop.
     let n_max = corpus
@@ -236,28 +242,14 @@ fn run() -> Result<(), Box<dyn Error>> {
         None => None,
     };
 
-    // Progress bar with a live per-sentence timer driven by a monitor thread.
+    // Parse progress; output and reports are written later in corpus order.
     let total = corpus.instances.len() as u64;
     let pb = ProgressBar::new(total);
     pb.set_style(
-        ProgressStyle::with_template("{spinner} [{pos}/{len}] {wide_bar} {msg}")
+        ProgressStyle::with_template("{spinner} [{pos}/{len}] {wide_bar} {elapsed_precise} {msg}")
             .unwrap()
             .tick_chars("|/-\\ "),
     );
-    let current = Arc::new(Mutex::new((0usize, Instant::now())));
-    let done = Arc::new(AtomicBool::new(false));
-    let monitor = {
-        let pb = pb.clone();
-        let current = Arc::clone(&current);
-        let done = Arc::clone(&done);
-        thread::spawn(move || {
-            while !done.load(Ordering::Relaxed) {
-                let (idx, start) = *current.lock().unwrap();
-                pb.set_message(format!("#{idx} {:.2}s", start.elapsed().as_secs_f64()));
-                thread::sleep(Duration::from_millis(100));
-            }
-        })
-    };
 
     let run_start = Instant::now();
     let mut parsed_count = 0usize;
@@ -266,47 +258,32 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut parseval_skipped = 0usize;
 
     let interp_order = corpus.interpretation_order.clone();
+    let parsed_instances = parse_instances(
+        std::mem::take(&mut corpus.instances),
+        &irtg,
+        args.algorithm,
+        args.heuristic,
+        outside.as_ref(),
+        sx_table.as_ref(),
+        oblig.as_ref(),
+        prepared_astar.as_ref(),
+        &scorer,
+        &primary,
+        args.jobs,
+        &pb,
+    )?;
+    pb.finish_and_clear();
+
     let result: Result<(), Box<dyn Error>> = (|| {
-        for (i, instance) in corpus.instances.iter_mut().enumerate() {
-            let sentence_no = i + 1;
-            let length = word_count(instance.text(&primary));
-
-            // Per-sentence strategy.
-            let strategy = build_strategy(
-                args.algorithm,
-                args.heuristic,
-                outside.as_ref(),
-                sx_table.as_ref(),
-                oblig.as_ref(),
+        for parsed in parsed_instances {
+            let ParsedInstance {
+                sentence_no,
                 length,
-            );
-
-            // Inputs: intersect all inputable interpretations (consume their parsed values).
-            // Output-only interpretations have no value and are skipped here.
-            let mut inputs = Vec::new();
-            for obj in &mut instance.objects {
-                if let Some(value) = obj.value.take() {
-                    inputs.push(
-                        irtg.interpretation_ref(&obj.name)
-                            .expect("present")
-                            .input_erased(value),
-                    );
-                }
-            }
-
-            *current.lock().unwrap() = (sentence_no, Instant::now());
-            let parse_start = Instant::now();
-            let (best, stats) = if let Some(prepared) = prepared_astar.as_ref() {
-                irtg.best_with_scorer_and_stats_prepared(
-                    inputs,
-                    &strategy,
-                    &scorer,
-                    prepared,
-                )?
-            } else {
-                (irtg.best_with_scorer(inputs, &strategy, &scorer)?, None)
-            };
-            let parse_ms = millis(parse_start.elapsed());
+                instance,
+                best,
+                stats,
+                parse_ms,
+            } = parsed;
 
             let derivation = best.as_ref().map(|tree| (tree.arena(), tree.root()));
             if derivation.is_some() {
@@ -368,7 +345,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
 
             let output_start = Instant::now();
-            writer.write_instance(&irtg, &interp_order, derivation, instance)?;
+            writer.write_instance(&irtg, &interp_order, derivation, &instance)?;
             let output_ms = millis(output_start.elapsed());
 
             if let Some(f) = times.as_mut() {
@@ -408,15 +385,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                 )?;
                 f.flush()?;
             }
-
-            pb.inc(1);
         }
         Ok(())
     })();
-
-    done.store(true, Ordering::Relaxed);
-    let _ = monitor.join();
-    pb.finish_and_clear();
 
     result?;
 
@@ -430,6 +401,109 @@ fn run() -> Result<(), Box<dyn Error>> {
         write_parseval_summary(report, parseval_total, parseval_scored, parseval_skipped)?;
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_instances(
+    instances: Vec<Instance>,
+    irtg: &Irtg,
+    algorithm: Algorithm,
+    heuristic: Heuristic,
+    outside: Option<&OutsideHeuristic>,
+    sx_table: Option<&UniversalSxHeuristic>,
+    oblig: Option<&ObligatoryLeafTables>,
+    prepared_astar: Option<&PreparedAstarGrammar>,
+    scorer: &LogProbabilityScorer,
+    primary: &str,
+    jobs: usize,
+    pb: &ProgressBar,
+) -> Result<Vec<ParsedInstance>, Box<dyn Error>> {
+    let count = instances.len();
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let jobs = jobs.min(count);
+    pb.set_message(format!("{jobs} worker{}", if jobs == 1 { "" } else { "s" }));
+
+    let tasks = Mutex::new(instances.into_iter().enumerate());
+    let (tx, rx) = mpsc::channel::<Result<ParsedInstance, String>>();
+    let mut ordered: Vec<Option<ParsedInstance>> =
+        std::iter::repeat_with(|| None).take(count).collect();
+    let mut first_error = None;
+
+    thread::scope(|scope| {
+        for _ in 0..jobs {
+            let tx = tx.clone();
+            let tasks = &tasks;
+            scope.spawn(move || {
+                loop {
+                    let Some((i, mut instance)) = tasks.lock().unwrap().next() else {
+                        break;
+                    };
+                    let sentence_no = i + 1;
+                    let result = (|| {
+                        let length = word_count(instance.text(primary));
+                        let strategy =
+                            build_strategy(algorithm, heuristic, outside, sx_table, oblig, length);
+                        let mut inputs = Vec::new();
+                        for obj in &mut instance.objects {
+                            if let Some(value) = obj.value.take() {
+                                inputs.push(
+                                    irtg.interpretation_ref(&obj.name)
+                                        .expect("present")
+                                        .input_erased(value),
+                                );
+                            }
+                        }
+
+                        let parse_start = Instant::now();
+                        let (best, stats) = if let Some(prepared) = prepared_astar {
+                            irtg.best_with_scorer_and_stats_prepared(
+                                inputs, &strategy, scorer, prepared,
+                            )
+                        } else {
+                            irtg.best_with_scorer_and_stats(inputs, &strategy, scorer)
+                        }
+                        .map_err(|err| format!("instance {sentence_no}: {err}"))?;
+
+                        Ok(ParsedInstance {
+                            sentence_no,
+                            length,
+                            instance,
+                            best,
+                            stats,
+                            parse_ms: millis(parse_start.elapsed()),
+                        })
+                    })();
+                    if tx.send(result).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(tx);
+
+        for result in rx {
+            match result {
+                Ok(parsed) => {
+                    let i = parsed.sentence_no - 1;
+                    ordered[i] = Some(parsed);
+                }
+                Err(err) if first_error.is_none() => first_error = Some(err),
+                Err(_) => {}
+            }
+            pb.inc(1);
+        }
+    });
+
+    if let Some(err) = first_error {
+        return Err(err.into());
+    }
+    Ok(ordered
+        .into_iter()
+        .map(|parsed| parsed.expect("every parse worker returned a result"))
+        .collect())
 }
 
 struct ParsevalConfig {
@@ -704,6 +778,7 @@ fn header_comments(args: &Args, primary: &str) -> Vec<String> {
         lines.push(format!("heuristic = {}", heuristic_label(args.heuristic)));
         lines.push(format!("input interpretation = {primary}"));
     }
+    lines.push(format!("jobs = {}", args.jobs));
     lines
 }
 
@@ -781,6 +856,7 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
     let mut parseval = None;
     let mut parseval_output = None;
     let mut evalb_param = None;
+    let mut jobs = thread::available_parallelism().map_or(1, usize::from);
 
     let mut it = env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -810,6 +886,12 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
             }
             "--times" => times = Some(next()?),
             "--astar-stats" => astar_stats = Some(next()?),
+            "--jobs" => {
+                jobs = next()?.parse()?;
+                if jobs == 0 {
+                    return Err("--jobs must be at least 1".into());
+                }
+            }
             "--input" => input = Some(next()?),
             "--parseval" => parseval = Some(next()?),
             "--parseval-output" => parseval_output = Some(next()?),
@@ -842,6 +924,7 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
         parseval,
         parseval_output,
         evalb_param,
+        jobs,
     })
 }
 
@@ -854,6 +937,7 @@ fn print_usage() {
          \x20 --limit <n>                    parse only the first n instances\n\
          \x20 --algorithm <exhaustive|astar> intersection algorithm (default: exhaustive)\n\
          \x20 --heuristic <zero|outside|sx|sxf> A* heuristic (default: zero)\n\
+         \x20 --jobs <n>                     parse up to n sentences concurrently (default: CPUs)\n\
          \x20 --times <file.csv>             write per-sentence timing as CSV\n\
          \x20 --astar-stats <file.csv>       write per-sentence A* internal counters\n\
          \x20 --input <interp>               interpretation parameterizing sx/sxf (default: auto)\n\

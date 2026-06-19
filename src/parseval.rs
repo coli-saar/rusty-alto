@@ -352,7 +352,16 @@ impl<'a> Iterator for ConstituentIter<'a> {
                         .delete_labels
                         .contains(self.arena.get_label(parent.node).as_str())
                 });
-                if !parent_deletes_terminal && !self.params.delete_words.contains(label) {
+                // Ordinary PTB trees represent terminals as words below a POS preterminal, so
+                // DELETE_LABEL applies to the parent. Alto's TreeWithArities PTB corpora omit
+                // words and use the POS tag itself as the leaf, so the same directive must also
+                // apply to the leaf label. Supporting both shapes keeps normalization invariant
+                // under omission of the word layer.
+                let leaf_label_deletes_terminal = self.params.delete_labels.contains(label);
+                if !parent_deletes_terminal
+                    && !leaf_label_deletes_terminal
+                    && !self.params.delete_words.contains(label)
+                {
                     self.words += 1;
                 }
             } else if !is_preterminal(self.arena, frame.node)
@@ -555,6 +564,22 @@ mod tests {
         let params = EvalbParams::parse("DELETE_LABEL PUNC\n").unwrap();
         let (pred, pr) = tree("S(NP(NN(a)), PUNC(','), VP(VB(b)))");
         let (gold, gr) = tree("S(NP(NN(a)), VP(VB(b)))");
+        assert_eq!(
+            compare_trees(&pred, pr, &gold, gr, &params).unwrap(),
+            ParsevalCounts {
+                predicted: 3,
+                gold: 3,
+                matched_labeled: 3,
+                matched_unlabeled: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn deleted_pos_leaf_is_removed_in_alto_tree_shape() {
+        let params = EvalbParams::collins_ptb();
+        let (pred, pr) = tree("S(NP(DT, NN), '.', VP(VB, RB))");
+        let (gold, gr) = tree("S(NP(DT, NN), VP(VB, RB))");
         assert_eq!(
             compare_trees(&pred, pr, &gold, gr, &params).unwrap(),
             ParsevalCounts {

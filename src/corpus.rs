@@ -26,7 +26,7 @@ pub struct InterpObject {
     /// The raw line as it appeared in the corpus.
     pub text: String,
     /// The parsed algebra value, or `None` once it has been consumed for parsing.
-    pub value: Option<Box<dyn Any>>,
+    pub value: Option<Box<dyn Any + Send>>,
 }
 
 /// A single corpus instance.

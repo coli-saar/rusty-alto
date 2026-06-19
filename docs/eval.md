@@ -25,6 +25,7 @@ eval <grammar.irtg> <corpus|-> [options]
   --limit <n>                       parse only the first n instances
   --algorithm <exhaustive|astar>    intersection algorithm (default: exhaustive)
   --heuristic <zero|outside|sx|sxf> A* heuristic, only with --algorithm astar (default: zero)
+  --jobs <n>                        parse up to n sentences concurrently (default: CPU count)
   --times <file.csv>                write per-sentence timing as CSV
   --input <interp>                  interpretation that parameterizes the sx/sxf heuristic
                                     (default: chosen automatically)
@@ -45,9 +46,11 @@ eval <grammar.irtg> <corpus|-> [options]
    - **output-only** interpretations (tree algebras) are kept as raw text — they are *evaluated
      into* for output, never parsed *from*.
 3. For each instance, intersects the inputable interpretations through the IRTG and extracts the
-   best (Viterbi) derivation tree.
+   best (Viterbi) derivation tree. Sentence parses run concurrently when `--jobs` is greater than
+   one.
 4. Writes an annotated output corpus: for every interpretation, the value obtained by interpreting
-   the best derivation tree, followed by the derivation tree itself.
+   the best derivation tree, followed by the derivation tree itself. Output, timing rows, A*
+   statistics, and Parseval rows retain the original corpus order.
 
 Instances that do not parse are written with `_null_` in place of the derivation tree (their input
 lines are echoed unchanged), so the output stays 1:1 with the input.
@@ -172,6 +175,12 @@ timing CSV:
 ./target/release/eval ../alto/ptb/out.irtg ../alto/ptb/out.txt \
     --limit 100 --algorithm astar --heuristic sx \
     -o predicted.corpus --times times.csv
+```
+
+Limit parsing to four concurrent sentences (useful when each parse has a large memory footprint):
+
+```sh
+./target/release/eval grammar.irtg corpus.txt --jobs 4 -o predicted.corpus
 ```
 
 Read a corpus from stdin:

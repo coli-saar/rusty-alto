@@ -66,123 +66,173 @@ impl Explicit {
     ///
     /// This is a direct one-best dynamic program for acyclic parse charts. It
     /// deliberately avoids the k-best sorted-language machinery when callers
-    /// only need the best derivation. Self-loop rules are skipped, matching
-    /// Alto's Viterbi convention for productive weighted charts.
+    /// only need the best derivation. Cyclic dependencies on the active DFS
+    /// path are ignored: for PCFG-style rule weights below one, traversing a
+    /// cycle cannot improve a finite derivation. Direct self-loops are skipped
+    /// for the same reason, matching Alto's convention.
     pub fn viterbi(&self) -> Option<ViterbiTree> {
         self.viterbi_with(&ProbabilityScorer)
     }
 
     /// Compute the highest-scoring accepted tree under `scorer`.
     pub fn viterbi_with<S: WeightScorer>(&self, scorer: &S) -> Option<ViterbiTree> {
+        let mut marks = vec![0u8; self.num_states() as usize];
+        let mut best = vec![None::<Backpointer>; self.num_states() as usize];
+        let mut stack = Vec::new();
+        self.initial_states(&mut |state| {
+            visit_and_score(self, state, scorer, &mut marks, &mut best, &mut stack);
+        });
+        finish_best(self, scorer, &best)
+    }
+
+    /// Previous Viterbi implementation, retained only for performance comparisons.
+    #[cfg(feature = "viterbi-benchmark")]
+    #[doc(hidden)]
+    pub fn viterbi_old_benchmark(&self) -> Option<ViterbiTree> {
+        let scorer = ProbabilityScorer;
         let mut order = Vec::new();
         let mut marks = vec![0u8; self.num_states() as usize];
-
-        self.initial_states(&mut |state| {
-            visit_state(self, state, &mut marks, &mut order);
-        });
+        self.initial_states(&mut |state| visit_state_fast(self, state, &mut marks, &mut order));
 
         let mut best = vec![None::<Backpointer>; self.num_states() as usize];
         for state in order {
-            let mut best_here = None::<Backpointer>;
-
-            for rule in self.rules_topdown(state) {
-                if rule.children.contains(&state) {
-                    continue;
-                }
-
-                let mut weight = scorer.rule_score(rule.weight);
-                let mut all_children_available = true;
-                for &child in rule.children {
-                    let Some(child_best) = best.get(child.index()).and_then(Option::as_ref) else {
-                        all_children_available = false;
-                        break;
-                    };
-                    weight = scorer.times(weight, child_best.weight);
-                }
-                if !all_children_available {
-                    continue;
-                }
-
-                if best_here
-                    .as_ref()
-                    .is_none_or(|old| scorer.better(weight, old.weight))
-                {
-                    best_here = Some(Backpointer {
-                        symbol: rule.symbol,
-                        children: rule.children.iter().copied().collect(),
-                        weight,
-                    });
-                }
-            }
-
-            best[state.index()] = best_here;
+            best[state.index()] = score_state(self, state, &scorer, &best);
         }
-
-        let mut best_final = None::<(StateId, f64)>;
-        self.initial_states(&mut |state| {
-            if let Some(backpointer) = best.get(state.index()).and_then(Option::as_ref)
-                && best_final
-                    .is_none_or(|(_, old_weight)| scorer.better(backpointer.weight, old_weight))
-            {
-                best_final = Some((state, backpointer.weight));
-            }
-        });
-
-        let (state, score) = best_final?;
-        let mut arena = TreeArena::new();
-        let root = build_tree(state, &best, &mut arena)?;
-        Some(ViterbiTree::new_with_score(
-            arena,
-            root,
-            score,
-            scorer.score_to_weight(score),
-        ))
+        finish_best(self, &scorer, &best)
     }
 }
 
-fn visit_state(auto: &Explicit, start: StateId, marks: &mut [u8], order: &mut Vec<StateId>) {
+fn visit_and_score<S: WeightScorer>(
+    auto: &Explicit,
+    start: StateId,
+    scorer: &S,
+    marks: &mut [u8],
+    best: &mut [Option<Backpointer>],
+    stack: &mut Vec<usize>,
+) {
     if start.is_stuck() || start.index() >= marks.len() || marks[start.index()] != 0 {
         return;
     }
 
-    let mut stack = Vec::new();
-    stack.push(DfsFrame::Enter(start));
-    marks[start.index()] = 1;
+    stack.clear();
+    stack.push(start.index() << 1);
 
     while let Some(frame) = stack.pop() {
-        match frame {
-            DfsFrame::Enter(state) => {
-                stack.push(DfsFrame::Exit(state));
+        let state = StateId((frame >> 1) as u32);
+        if frame & 1 != 0 {
+            best[state.index()] = score_state(auto, state, scorer, best);
+            marks[state.index()] = 2;
+            continue;
+        }
+        if marks[state.index()] != 0 {
+            continue;
+        }
 
-                for &rule_idx in auto.rule_indexes_topdown(state).iter().rev() {
-                    let rule = auto.rule(rule_idx);
-                    if rule.children.contains(&state) {
-                        continue;
-                    }
-
-                    for &child in rule.children.iter().rev() {
-                        if child.is_stuck() || child.index() >= marks.len() {
-                            continue;
-                        }
-                        if marks[child.index()] == 0 {
-                            marks[child.index()] = 1;
-                            stack.push(DfsFrame::Enter(child));
-                        }
-                    }
-                }
+        marks[state.index()] = 1;
+        stack.push((state.index() << 1) | 1);
+        for &rule_idx in auto.rule_indexes_topdown(state).iter().rev() {
+            let rule = auto.rule(rule_idx);
+            if rule.children.contains(&state) {
+                continue;
             }
-            DfsFrame::Exit(state) => {
-                marks[state.index()] = 2;
-                order.push(state);
+            for &child in rule.children.iter().rev() {
+                if !child.is_stuck() && child.index() < marks.len() && marks[child.index()] == 0 {
+                    stack.push(child.index() << 1);
+                }
             }
         }
     }
 }
 
-#[derive(Clone, Copy)]
-enum DfsFrame {
-    Enter(StateId),
-    Exit(StateId),
+#[cfg(feature = "viterbi-benchmark")]
+fn visit_state_fast(auto: &Explicit, start: StateId, marks: &mut [u8], order: &mut Vec<StateId>) {
+    if start.is_stuck() || start.index() >= marks.len() || marks[start.index()] != 0 {
+        return;
+    }
+    let mut stack = vec![(start, false)];
+    marks[start.index()] = 1;
+    while let Some((state, exiting)) = stack.pop() {
+        if exiting {
+            marks[state.index()] = 2;
+            order.push(state);
+            continue;
+        }
+        stack.push((state, true));
+        for &rule_idx in auto.rule_indexes_topdown(state).iter().rev() {
+            let rule = auto.rule(rule_idx);
+            if rule.children.contains(&state) {
+                continue;
+            }
+            for &child in rule.children.iter().rev() {
+                if !child.is_stuck() && child.index() < marks.len() && marks[child.index()] == 0 {
+                    marks[child.index()] = 1;
+                    stack.push((child, false));
+                }
+            }
+        }
+    }
+}
+
+fn score_state<S: WeightScorer>(
+    auto: &Explicit,
+    state: StateId,
+    scorer: &S,
+    best: &[Option<Backpointer>],
+) -> Option<Backpointer> {
+    let mut best_here = None::<Backpointer>;
+    for rule in auto.rules_topdown(state) {
+        if rule.children.contains(&state) {
+            continue;
+        }
+
+        let mut weight = scorer.rule_score(rule.weight);
+        let mut all_children_available = true;
+        for &child in rule.children {
+            let Some(child_best) = best.get(child.index()).and_then(Option::as_ref) else {
+                all_children_available = false;
+                break;
+            };
+            weight = scorer.times(weight, child_best.weight);
+        }
+        if all_children_available
+            && best_here
+                .as_ref()
+                .is_none_or(|old| scorer.better(weight, old.weight))
+        {
+            best_here = Some(Backpointer {
+                symbol: rule.symbol,
+                children: rule.children.iter().copied().collect(),
+                weight,
+            });
+        }
+    }
+    best_here
+}
+
+fn finish_best<S: WeightScorer>(
+    auto: &Explicit,
+    scorer: &S,
+    best: &[Option<Backpointer>],
+) -> Option<ViterbiTree> {
+    let mut best_final = None::<(StateId, f64)>;
+    auto.initial_states(&mut |state| {
+        if let Some(backpointer) = best.get(state.index()).and_then(Option::as_ref)
+            && best_final
+                .is_none_or(|(_, old_weight)| scorer.better(backpointer.weight, old_weight))
+        {
+            best_final = Some((state, backpointer.weight));
+        }
+    });
+
+    let (state, score) = best_final?;
+    let mut arena = TreeArena::new();
+    let root = build_tree(state, best, &mut arena)?;
+    Some(ViterbiTree::new_with_score(
+        arena,
+        root,
+        score,
+        scorer.score_to_weight(score),
+    ))
 }
 
 pub(crate) fn build_tree(
@@ -297,6 +347,95 @@ mod tests {
         assert_eq!(*best.arena().get_label(best.root()), f);
         let child = best.arena().get_children(best.root())[0];
         assert_eq!(*best.arena().get_label(child), a);
+    }
+
+    #[test]
+    fn shared_dependency_is_scored_before_all_parents() {
+        let leaf_symbol = Symbol(0);
+        let unary_symbol = Symbol(1);
+        let root_symbol = Symbol(2);
+
+        let mut builder = ExplicitBuilder::new();
+        let shared = builder.new_state();
+        let left = builder.new_state();
+        let root = builder.new_state();
+        builder.add_weighted_rule(leaf_symbol, vec![], shared, 0.8);
+        builder.add_weighted_rule(unary_symbol, vec![shared], left, 0.7);
+        builder.add_weighted_rule(root_symbol, vec![left, shared], root, 0.6);
+        builder.add_accepting(root);
+        let automaton = builder.build();
+
+        let best = automaton.viterbi().expect("shared DAG has a derivation");
+        assert!((best.weight() - 0.8 * 0.7 * 0.8 * 0.6).abs() < 1e-12);
+    }
+
+    #[test]
+    fn unproductive_nontrivial_cycles_have_no_derivation() {
+        let f = Symbol(0);
+        let g = Symbol(1);
+        let mut builder = ExplicitBuilder::new();
+        let q0 = builder.new_state();
+        let q1 = builder.new_state();
+        builder.add_weighted_rule(f, vec![q1], q0, 0.5);
+        builder.add_weighted_rule(g, vec![q0], q1, 0.5);
+        builder.add_accepting(q0);
+        let automaton = builder.build();
+
+        assert!(automaton.viterbi().is_none());
+    }
+
+    #[test]
+    fn productive_nontrivial_cycle_uses_acyclic_exit() {
+        let leaf_symbol = Symbol(0);
+        let forward = Symbol(1);
+        let backward = Symbol(2);
+        let mut builder = ExplicitBuilder::new();
+        let q0 = builder.new_state();
+        let q1 = builder.new_state();
+        builder.add_weighted_rule(leaf_symbol, vec![], q1, 0.7);
+        builder.add_weighted_rule(forward, vec![q1], q0, 0.8);
+        builder.add_weighted_rule(backward, vec![q0], q1, 0.9);
+        builder.add_accepting(q0);
+        let automaton = builder.build();
+
+        let best = automaton.viterbi().expect("cycle has a productive exit");
+        assert!((best.weight() - 0.56).abs() < 1e-12);
+        assert_eq!(*best.arena().get_label(best.root()), forward);
+    }
+
+    #[test]
+    fn matches_sorted_language_on_shared_acyclic_automata() {
+        for width in 2..8 {
+            let mut builder = ExplicitBuilder::new();
+            let mut states = Vec::new();
+            for _ in 0..width {
+                states.push(builder.new_state());
+            }
+            builder.add_weighted_rule(Symbol(0), vec![], states[0], 0.91);
+            for i in 1..width {
+                builder.add_weighted_rule(
+                    Symbol((2 * i) as u32),
+                    vec![states[i - 1]],
+                    states[i],
+                    0.8 - i as f64 * 0.01,
+                );
+                builder.add_weighted_rule(
+                    Symbol((2 * i + 1) as u32),
+                    vec![states[i - 1], states[0]],
+                    states[i],
+                    0.7 - i as f64 * 0.01,
+                );
+            }
+            builder.add_accepting(states[width - 1]);
+            if width > 3 {
+                builder.add_accepting(states[width - 2]);
+            }
+            let automaton = builder.build();
+
+            let viterbi = automaton.viterbi().unwrap();
+            let sorted = automaton.sorted_language().next().unwrap();
+            assert!((viterbi.weight() - sorted.weight()).abs() < 1e-12);
+        }
     }
 
     #[test]
