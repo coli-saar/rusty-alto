@@ -289,6 +289,11 @@ impl Explicit {
         self.num_states
     }
 
+    /// Return the number of transition rules in this automaton.
+    pub fn num_rules(&self) -> usize {
+        self.rules.len()
+    }
+
     /// Return true if no tree can be accepted by this automaton.
     ///
     /// This computes reachable states from nullary rules and checks whether any
@@ -374,7 +379,13 @@ impl Explicit {
             .map(|&rule_idx| self.rule(rule_idx))
     }
 
-    pub(crate) fn rule(&self, rule_idx: usize) -> Rule<'_> {
+    /// Return the transition rule at the given index.
+    ///
+    /// Provides O(1) indexed access to a borrowed view of a rule; the children
+    /// slice is not copied. The index must be less than [`Self::num_rules`];
+    /// passing an out-of-bounds index panics. Rule order matches the order
+    /// produced by [`Self::rules`].
+    pub fn rule(&self, rule_idx: usize) -> Rule<'_> {
         let rule = &self.rules[rule_idx];
         Rule {
             symbol: rule.symbol,
@@ -893,6 +904,23 @@ mod tests {
         e.step(Symbol(0), &[], &mut |q| leaves.push(q));
         assert_eq!(leaves, vec![leaf]);
         assert!(e.bottom_up_indexes.get().is_some());
+    }
+
+    // Indexed access and iteration must yield identical Rule values in the same order.
+    #[test]
+    fn indexed_rule_access_matches_iteration() {
+        let mut b = ExplicitBuilder::new();
+        let q = b.new_state();
+        let r = b.new_state();
+        b.add_rule(Symbol(0), vec![], q);
+        b.add_rule(Symbol(1), vec![q], r);
+        b.add_accepting(r);
+        let a = b.build();
+
+        assert_eq!(a.num_rules(), 2);
+        for (i, rule) in a.rules().enumerate() {
+            assert_eq!(a.rule(i), rule);
+        }
     }
 
     #[test]

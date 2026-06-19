@@ -43,6 +43,7 @@
 //! ```
 
 pub mod algebras;
+pub mod application;
 pub mod alto;
 pub mod alto_ast;
 pub mod astar;
@@ -74,6 +75,10 @@ pub mod viterbi;
 pub use algebras::{
     APPEND_SYMBOL, Algebra, Binarizing, EvaluatingDecompositionAutomaton, SentenceSxHeuristic, Span,
     StringAlgebra, StringDecompositionAutomaton, TreeAlgebra, TreeValue, UniversalSxHeuristic,
+};
+pub use application::{
+    AutomatonSummary, InterpretationInfo, ParseStrategy, RenderedInterpretation, RenderedValue,
+    ResolvedRule,
 };
 pub use alto::{AltoParseError, ParsedTreeAutomaton, parse_alto, parse_alto_with_signature};
 pub use astar::{
