@@ -1383,7 +1383,7 @@ impl UniversalSxHeuristic {
         SentenceSxHeuristic { table: self, n }
     }
 
-    /// Serialize to bytes (same format as [`SxHeuristic::to_bytes`]).
+    /// Serialize to bytes using the SX heuristic cache format.
     pub fn to_bytes(&self) -> Vec<u8> {
         self.inner.to_bytes()
     }

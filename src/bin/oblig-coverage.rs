@@ -4,9 +4,9 @@
 //!
 //! Reads an IRTG grammar (same file passed to ptb-eval), extracts the first
 //! string interpretation, and computes three per-state tables:
-//!   mic[X]       – multiset of leaves every derivation of X must contain
-//!   req_left[X]  – leaves every *completion* of X emits strictly to X's left
-//!   req_right[X] – leaves every *completion* of X emits strictly to X's right
+//!   `mic[X]`       – multiset of leaves every derivation of X must contain
+//!   `req_left[X]`  – leaves every *completion* of X emits strictly to X's left
+//!   `req_right[X]` – leaves every *completion* of X emits strictly to X's right
 //!
 //! Then reports coverage statistics so we can judge whether an F-style
 //! obligatory-leaf filter would prune any A* items.

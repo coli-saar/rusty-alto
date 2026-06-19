@@ -230,7 +230,7 @@ impl Irtg {
     /// Return the single best parse tree (Viterbi tree) for the given inputs
     /// and strategy.
     ///
-    /// For [`MaterializationStrategy::Astar`] this calls [`astar_one_best`]
+    /// For [`MaterializationStrategy::Astar`] this calls [`crate::astar_one_best`]
     /// directly without building a full chart.  For chart-based strategies it
     /// falls back to [`Irtg::parse_with`] and calls `.automaton.viterbi()`.
     pub fn best_with<'a>(

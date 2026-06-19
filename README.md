@@ -1,155 +1,169 @@
 # rusty-alto
 
-A fast Rust library for bottom-up tree automata, with support for interpreted regular tree grammars (IRTGs) in the [Alto](https://github.com/coli-saar/alto) format.
+`rusty-alto` is a fast Rust library and command-line toolkit for weighted
+bottom-up tree automata and interpreted regular tree grammars (IRTGs). It reads
+grammars, automata, and corpora in formats compatible with
+[Alto](https://github.com/coli-saar/alto), with the long-term goal of providing
+a clean Rust API while outperforming Alto on parsing workloads.
 
-## What this is
+The project is under active development. The main end-user program today is
+`eval`, which parses an Alto corpus with an IRTG, extracts the best derivation,
+evaluates all declared interpretations, and can report timing and Parseval
+scores.
 
-**Tree automata** generalize finite-state automata from strings to trees. A bottom-up tree automaton reads a tree from its leaves upward: each leaf receives a state, and each internal node receives a state based on its symbol and the states of its children. If the root ends up in an accepting state, the tree is accepted.
+## Highlights
 
-This library treats every automaton — whether its rules are stored in a table or computed on demand — as an oracle: given a symbol and child states, tell me the possible parent states. Explicit automata are just a materialized cache of this oracle. That insight unifies explicit and implicit automata behind one trait and lets the library compose them freely.
+- Alto-compatible readers for `.auto` tree automata, `.irtg` grammars, and
+  corpus files.
+- A small oracle-style automaton API that supports both stored and
+  on-demand transitions.
+- Weighted explicit automata with lazy, arity-specialized indexes.
+- Automaton combinators for products, inverse homomorphisms, symbol mappings,
+  and determinization.
+- Efficient condensed intersection for IRTG parsing.
+- Exact one-best A* parsing with zero, outside, SX, and SXF heuristics.
+- Viterbi extraction, sorted language enumeration, corpus output, and
+  EVALB-style Parseval scoring.
+- Trees represented with
+  [`rusty-tree`](https://github.com/alexanderkoller/rusty-tree).
 
-**Alto** is a Java toolkit for IRTGs developed at Saarland University. `rusty-alto` takes significant inspiration from Alto's design and algorithms — the oracle-trait model, the condensed inverse-homomorphism construction, the sibling-finder-style indexed join, and the sorted language iterator all trace their lineage directly to Alto. The library also reads Alto's `.auto` and `.irtg` file formats so that grammars produced by Alto tooling can be used without conversion.
+The [project wiki](https://github.com/coli-saar/rusty-alto/wiki) explains the
+architecture and the main design decisions. The
+[Rust API documentation](https://coli-saar.github.io/rusty-alto/rusty_alto/)
+is rebuilt from `main`.
 
-## Connection to Alto
+## Building
 
-Alto represents grammars as interpreted regular tree grammars. An IRTG consists of a core tree automaton (the grammar) and one or more *interpretations*, each mapping grammar derivation trees into objects from some algebra — strings, dependency graphs, logical formulas, and so on.
+The project currently uses a sibling checkout of `rusty-tree`. Clone both
+repositories into the same directory:
 
-`rusty-alto` reads Alto's IRTG format directly and uses the same parsing strategy:
-
+```sh
+mkdir rusty-alto-workspace
+cd rusty-alto-workspace
+git clone https://github.com/alexanderkoller/rusty-tree.git
+git clone https://github.com/coli-saar/rusty-alto.git
+cd rusty-alto
 ```
-interpretation english: de.up.ling.irtg.algebra.StringAlgebra
 
-S! -> r(NP, VP) [1.0]
-  [english] *(?1, ?2)
+Install a current stable Rust toolchain, then build and test:
 
-NP -> john_rule
-  [english] john
-
-VP -> watches_rule
-  [english] watches
+```sh
+rustup toolchain install stable
+cargo build
+cargo test
 ```
 
-Given an IRTG and an observed string, the library performs parsing by intersecting the grammar with a decomposition automaton for the input, using an efficient condensed inverse-homomorphism construction. The result is a parse chart — an explicit automaton whose derivations are exactly the analyses of the input.
+Use a release build for real grammars:
+
+```sh
+cargo build --release --bin eval
+```
+
+You can also build the API documentation locally:
+
+```sh
+cargo doc --no-deps --all-features --open
+```
+
+## Running `eval`
+
+```text
+eval <grammar.irtg> <corpus|-> [options]
+```
+
+Run it through Cargo:
+
+```sh
+cargo run --release --bin eval -- grammar.irtg corpus.txt \
+  --algorithm astar --heuristic sx \
+  --output predicted.corpus
+```
+
+Or run the compiled binary directly:
+
+```sh
+./target/release/eval grammar.irtg corpus.txt \
+  --algorithm exhaustive \
+  --output predicted.corpus
+```
+
+Useful options include:
+
+| Option | Purpose |
+| --- | --- |
+| `-o, --output FILE` | Write the annotated output corpus to `FILE`; the default is stdout. |
+| `--limit N` | Parse only the first `N` corpus instances. |
+| `--algorithm exhaustive\|astar` | Select full chart construction or exact one-best A*. |
+| `--heuristic zero\|outside\|sx\|sxf` | Select the A* heuristic. |
+| `--jobs N` | Parse up to `N` sentences concurrently. |
+| `--times FILE.csv` | Write per-sentence timing data. |
+| `--astar-stats FILE.csv` | Write detailed A* counters. |
+| `--parseval INTERPRETATION` | Score a constituency-tree interpretation. |
+
+Run `cargo run --release --bin eval -- --help` for the complete interface.
+See [`docs/eval.md`](docs/eval.md) for corpus formats, algorithms, heuristics,
+Parseval configuration, and extended examples.
+
+### Interactive parser
+
+The default `rusty-alto` binary is a small interactive frontend for a grammar
+with a string interpretation:
+
+```sh
+cargo run --release -- grammar.irtg
+```
+
+Enter one sentence per line; press Ctrl-D to stop. When stdin is redirected,
+the binary processes one sentence per input line.
+
+## Library sketch
 
 ```rust
-use rusty_alto::*;
+use rusty_alto::{StringAlgebra, parse_irtg};
 
 let irtg = parse_irtg(std::fs::File::open("grammar.irtg")?)?;
 let english = irtg.interpretation::<StringAlgebra>("english")?;
-let value = english.parse_object("john watches")?;
-let chart = irtg.parse([english.input(value)])?;
+let sentence = english.parse_object("john watches")?;
+let chart = irtg.parse([english.input(sentence)])?;
 
-if chart.automaton.is_empty() {
-    println!("no parse");
-    return;
-}
-println!("accepted — {} rules in chart", chart.automaton.rules().count());
-
-// Extract the top-1 derivation tree.
 if let Some(best) = chart.automaton.viterbi() {
-    println!("top-1 weight: {:.6}", best.weight());
-
-    // Map Symbol labels to strings, then display using the arena's built-in formatter.
-    let sig = irtg.grammar_signature();
-    let (named, named_root) = sig.resolve_tree(best.arena(), best.root());
-    println!("{}", named_root.display(&named));
-    // e.g. "r(john_rule, watches_rule)"
+    println!("best weight: {}", best.weight());
 }
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-## Core concepts
+The central abstraction is `BottomUpTa`: an automaton answers a transition
+query for a symbol and a tuple of child states. Explicit automata, algebra
+decomposition automata, and composed automata share this interface. Optional
+refinement traits expose indexed, condensed, deterministic, and top-down views
+when an algorithm can use them efficiently.
 
-### `BottomUpTa` — the oracle trait
+## Alto compatibility and performance
 
-Every automaton in the library implements `BottomUpTa`. The single hot-path method:
+The implementation is heavily inspired by Alto, including its IRTG model,
+condensed inverse-homomorphism construction, indexed intersection techniques,
+and language enumeration algorithms. Rust-specific data layouts, dense IDs,
+lazy indexes, and specialized fast paths are used where they improve common
+tree-automata and parsing workloads without narrowing the public abstraction.
 
-```rust
-fn step(&self, f: Symbol, children: &[Self::State], out: &mut dyn FnMut(Self::State));
-```
-
-Explicit automata answer this query with a hash-map lookup. Implicit automata compute the answer on demand. Combinators delegate to their components.
-
-### `Explicit` — the materialized form
-
-`Explicit` stores rules canonically and builds lookup indexes lazily. Bottom-up queries use arity-specialized hash maps for arity 0, 1, and 2, covering the common cases without per-query allocation. Higher arities are supported via a borrowed-key lookup that also avoids allocation. Top-down, indexed, condensed, and bottom-up indexes are independent caches, so large parse charts only pay for the access patterns they actually use.
-
-Build one with `ExplicitBuilder`:
-
-```rust
-let mut sig = Signature::new();
-let a = sig.intern("a".to_owned(), 0).unwrap();
-let f = sig.intern("f".to_owned(), 2).unwrap();
-
-let mut builder = ExplicitBuilder::new();
-let leaf = builder.new_state();
-let root = builder.new_state();
-builder.add_rule(a, vec![], leaf);
-builder.add_rule(f, vec![leaf, leaf], root);
-builder.add_accepting(root);
-let automaton = builder.build();
-```
-
-### Running an automaton
-
-```rust
-let run = run_det(&automaton, &tree, root_node);
-assert!(automaton.is_accepting(&run.root_state));
-```
-
-Use `run_det` when the automaton is deterministic (at most one result state per symbol/children tuple). Use `run_nondet` for the general case.
-
-### Combinators
-
-| Type | Description |
-|------|-------------|
-| `Product<A, B>` | Intersection: accepts trees in both `L(A)` and `L(B)` |
-| `InvHom` | Inverse homomorphism: pull back rules through a homomorphism |
-| `Mapped<A, F>` | Symbol remapping view |
-| `Determinized<A>` | Subset construction, turning any automaton deterministic |
-
-### `Memo<A>` — bridging implicit to explicit
-
-When an implicit automaton has its own rich state type (strings, tuples, syntax objects), wrap it in `Memo` to cache transitions and expose dense `StateId` values to runners and combinators. Freeze with `into_explicit()` when all reachable states have been discovered.
-
-### Materialization
-
-`materialize()` saturates a finite implicit automaton into an `Explicit` by seeding from nullary rules and repeatedly applying transitions until no new states appear.
-
-`materialize_topdown_condensed_intersection()` is the parsing workhorse: it drives the condensed inverse-homomorphism construction top-down, building the parse chart while avoiding the exponential blowup of naive Earley-style approaches.
-
-## Refinement traits
-
-Some algorithms need to enumerate rules, not just query them on demand. The refinement traits provide this:
-
-- **`IndexedBottomUpTa`** — given a symbol, child position, and state at that position, enumerate all matching rules. This is the sibling-finder primitive (Groschwitz et al., ACL 2016) that makes intersection-based parsing asymptotically tractable.
-- **`CondensedTa`** — enumerate rules grouped by transition shape: many grammar symbols often share the same homomorphic image, so one evaluation covers the whole group.
-- **`TopDownTa`** — enumerate rules by parent state.
-- **`StateUniverse`** — enumerate all states in a finite automaton; needed by condensed inverse homomorphism when an image term is a bare variable.
-
-Slow blanket fallbacks exist where possible, so you can compose automata before adding fast trait impls.
-
-## Performance
-
-The library is designed to be competitive with Alto on the workloads that motivated it:
-
-- `FxHashMap` (via `rustc-hash` + `hashbrown`) throughout — SipHash is too slow for integer-keyed inner loops.
-- `StateId::STUCK` sentinel instead of `Option<StateId>` in the deterministic run side table.
-- `SmallVec<[_; 4]>` for child-state buffers — most tree nodes have arity ≤ 4.
-- Arity-specialized indexes in `Explicit` built lazily on first use.
-- Condensed rule enumeration cached after the first request.
-- DAG-friendly runner that skips already-computed nodes.
-
-See [`docs/performance.md`](docs/performance.md) for a detailed account of design decisions and known bottlenecks.
-
-## Comparing with Alto
-
-The `tools/alto-compare/` directory contains Java harnesses that run equivalent workloads through Alto. Shell scripts in `scripts/` drive both sides and print timing summaries:
+Java comparison harnesses live in `tools/alto-compare/`; the corresponding
+drivers are:
 
 ```sh
 ./scripts/compare-alto.sh
 ./scripts/compare-condensed-parsing.sh
 ./scripts/compare-intersection.sh
 ```
+
+See [`docs/performance.md`](docs/performance.md) for implementation notes and
+measured bottlenecks.
+
+## Project status
+
+Supported interpretation algebras currently include Alto string algebras and
+tree-with-arities variants. String interpretations can be used as parse input;
+tree interpretations are currently output-only. APIs and file-format coverage
+may still change as the implementation matures.
 
 ## License
 
