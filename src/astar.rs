@@ -35,9 +35,7 @@ use std::hash::Hash;
 
 use agenda::{AgendaUpdate, AstarAgenda};
 use generic_source::{ChildStateRightRuleIndex, GenericCandidateSource, PartnerSet};
-use lazy_span::{
-    LazyStringAstarSource, SiblingEntry, SpanGenerator, SpanLazyFrontier,
-};
+use lazy_span::{LazyStringAstarSource, SiblingEntry, SpanGenerator, SpanLazyFrontier};
 use product_state::{AgendaItem, FinalizedItem, PendingEdge};
 
 trait RightStateInterner<T> {
@@ -90,6 +88,10 @@ impl StateInterner<Span> for SpanInterner {
 /// which never reach `u32::MAX` for realistic sentence lengths.
 const RIGHT_UNARY_SENTINEL: StateId = StateId(u32::MAX);
 
+/// Reusable grammar-side indexes for repeated string A* parses.
+///
+/// A prepared value is tied to the exact [`Explicit`] instance passed to
+/// [`PreparedAstarGrammar::new`]; using it with another grammar panics.
 pub struct PreparedAstarGrammar {
     grammar_addr: usize,
     left_rules: Vec<OwnedRule>,
@@ -98,6 +100,7 @@ pub struct PreparedAstarGrammar {
 }
 
 impl PreparedAstarGrammar {
+    /// Build reusable nullary and span-sibling indexes for `left`.
     pub fn new(left: &Explicit) -> Self {
         let left_rules: Vec<_> = left
             .rules()
@@ -121,8 +124,7 @@ impl PreparedAstarGrammar {
 
     fn assert_matches(&self, left: &Explicit) {
         assert_eq!(
-            self.grammar_addr,
-            left as *const Explicit as usize,
+            self.grammar_addr, left as *const Explicit as usize,
             "PreparedAstarGrammar must be used with the Explicit it was built from"
         );
     }
@@ -456,9 +458,7 @@ where
         if self
             .heuristic_checked
             .get(right.index())
-            .is_some_and(|checked| {
-                left.index() < checked.len() && checked.contains(left.index())
-            })
+            .is_some_and(|checked| left.index() < checked.len() && checked.contains(left.index()))
         {
             self.stats.heuristic_cache_hits += 1;
             if self.heuristic_admitted[right.index()].contains(left.index()) {
@@ -577,14 +577,14 @@ where
             .as_mut()
             .expect("generic right-rule index was not requested")
             .rule_ids_for_trigger_into(
-            self.right,
-            &mut self.right_interner,
-            &mut self.right_rules,
-            &mut self.mat_stats,
-            position,
-            trigger_right,
-            &mut out,
-        );
+                self.right,
+                &mut self.right_interner,
+                &mut self.right_rules,
+                &mut self.mat_stats,
+                position,
+                trigger_right,
+                &mut out,
+            );
         out
     }
 
@@ -776,22 +776,13 @@ where
                                 break;
                             }
                         }
-                        (ok && first_trigger(&children, position, trigger_product)).then_some((
-                            left_rule.result,
-                            children,
-                        ))
+                        (ok && first_trigger(&children, position, trigger_product))
+                            .then_some((left_rule.result, children))
                     }) else {
                         continue;
                     };
                     self.stats.candidate_edges += 1;
-                    self.push_candidate(
-                        rule_idx,
-                        parent_left,
-                        parent_right,
-                        children,
-                        scorer,
-                        h,
-                    );
+                    self.push_candidate(rule_idx, parent_left, parent_right, children, scorer, h);
                 }
 
                 self.matches_scratch = matches;
@@ -1024,7 +1015,6 @@ where
                         }
                     }
                 }
-
             }
         }
     }
@@ -1146,8 +1136,7 @@ where
 
     fn activate_generic_product(&mut self, item: &FinalizedItem) {
         self.ensure_right_state(item.right_state);
-        self.finalized_partners[item.right_state.index()]
-            .insert(item.left_state, item.product);
+        self.finalized_partners[item.right_state.index()].insert(item.left_state, item.product);
     }
 
     /// Run the eager core with an interchangeable candidate source.
@@ -1354,7 +1343,9 @@ where
                 // rather than a rescan O(s) (see docs/n10-asymptotics.md). The
                 // finder slice is append-only, so the captured indices stay valid
                 // for later re-derivation in `lazy_push_sibling_rules`.
-                let siblings = frontier.finder.siblings_slice(span, position, group.sibling_left);
+                let siblings = frontier
+                    .finder
+                    .siblings_slice(span, position, group.sibling_left);
                 let mut pending = std::collections::BinaryHeap::new();
                 for (idx, &sibling) in siblings.iter().enumerate() {
                     if let Some(merit) = self.lazy_sibling_merit(
@@ -1490,11 +1481,7 @@ impl<'source, R> CandidateSource<R, SpanInterner> for StringAstarSource<'source>
 where
     R: CondensedTa<State = Span> + DetBottomUpTa<State = Span>,
 {
-    fn activate(
-        &mut self,
-        ctx: &mut AstarContext<'_, R, SpanInterner>,
-        item: &FinalizedItem,
-    ) {
+    fn activate(&mut self, ctx: &mut AstarContext<'_, R, SpanInterner>, item: &FinalizedItem) {
         let span = *ctx.right_interner.resolve(item.right_state);
         self.left_index.activate_product(
             &mut self.sibling_finder,
@@ -1535,24 +1522,18 @@ impl<'source, R> CandidateSource<R, SpanInterner> for LazyStringAstarSource<'sou
 where
     R: CondensedTa<State = Span> + DetBottomUpTa<State = Span>,
 {
-    fn prepare_next<H, S>(
-        &mut self,
-        ctx: &mut AstarContext<'_, R, SpanInterner>,
-        h: &H,
-        scorer: &S,
-    ) where
+    fn prepare_next<H, S>(&mut self, ctx: &mut AstarContext<'_, R, SpanInterner>, h: &H, scorer: &S)
+    where
         H: IntersectionHeuristic<R>,
         S: WeightScorer,
     {
         loop {
-            let realize_frontier = match (
-                ctx.heap.peek_merit(),
-                self.frontier.frontier.peek_merit(),
-            ) {
-                (_, None) => false,
-                (None, Some(_)) => true,
-                (Some(agenda), Some(frontier)) => frontier > agenda,
-            };
+            let realize_frontier =
+                match (ctx.heap.peek_merit(), self.frontier.frontier.peek_merit()) {
+                    (_, None) => false,
+                    (None, Some(_)) => true,
+                    (Some(agenda), Some(frontier)) => frontier > agenda,
+                };
             if !realize_frontier {
                 break;
             }
@@ -1563,23 +1544,15 @@ where
                 .pop()
                 .expect("peeked lazy frontier entry must still be present");
             ctx.stats.frontier_pops += 1;
-            if let Some(next_merit) = ctx.lazy_realize_generator(
-                &mut self.frontier,
-                id,
-                self.left_index,
-                scorer,
-                h,
-            ) {
+            if let Some(next_merit) =
+                ctx.lazy_realize_generator(&mut self.frontier, id, self.left_index, scorer, h)
+            {
                 self.frontier.frontier.update_or_push(id, next_merit);
             }
         }
     }
 
-    fn activate(
-        &mut self,
-        ctx: &mut AstarContext<'_, R, SpanInterner>,
-        item: &FinalizedItem,
-    ) {
+    fn activate(&mut self, ctx: &mut AstarContext<'_, R, SpanInterner>, item: &FinalizedItem) {
         let span = *ctx.right_interner.resolve(item.right_state);
         self.left_index.activate_product(
             &mut self.frontier.finder,
@@ -1714,6 +1687,7 @@ where
     materialize_astar_string_intersection_with_prepared(left, &prepared, right, h, options, scorer)
 }
 
+/// Materialize a string intersection while reusing prepared grammar indexes.
 pub fn materialize_astar_string_intersection_with_prepared<'h, H, S>(
     left: &Explicit,
     prepared: &PreparedAstarGrammar,
@@ -1800,13 +1774,8 @@ where
                 .builder
                 .as_mut()
                 .expect("chart mode always has a builder");
-            ctx.rule_tracker.add_rule(
-                builder,
-                symbol,
-                edge.children.clone(),
-                product,
-                weight,
-            );
+            ctx.rule_tracker
+                .add_rule(builder, symbol, edge.children.clone(), product, weight);
             ctx.stats.emitted_rules += 1;
         }
     };
@@ -1816,22 +1785,10 @@ where
         && !prepared.span_left_index.has_any_higher_arity();
     if use_lazy {
         let mut source = LazyStringAstarSource::new(&prepared.span_left_index);
-        ctx.run_with_source(
-            &mut source,
-            h,
-            scorer,
-            stop_at_first_goal,
-            on_finalize,
-        );
+        ctx.run_with_source(&mut source, h, scorer, stop_at_first_goal, on_finalize);
     } else {
         let mut source = StringAstarSource::new(&prepared.span_left_index, fallback_rules);
-        ctx.run_with_source(
-            &mut source,
-            h,
-            scorer,
-            stop_at_first_goal,
-            on_finalize,
-        );
+        ctx.run_with_source(&mut source, h, scorer, stop_at_first_goal, on_finalize);
     }
 
     ctx.stats.output_states = ctx.product_pairs.len();
@@ -1903,13 +1860,8 @@ where
                 // Find the product state for the parent (it was just finalized, so
                 // it must be in product_pairs — but we need the parent_id, which is
                 // `_product` itself).
-                ctx.rule_tracker.add_rule(
-                    builder,
-                    symbol,
-                    edge.children.clone(),
-                    _product,
-                    weight,
-                );
+                ctx.rule_tracker
+                    .add_rule(builder, symbol, edge.children.clone(), _product, weight);
                 ctx.stats.emitted_rules += 1;
             }
         },
@@ -1987,6 +1939,9 @@ where
     astar_string_one_best_with_stats_prepared(left, &prepared, right, h, scorer)
 }
 
+/// Find the best string-constrained derivation using prepared grammar indexes.
+///
+/// Returns the derivation, if any, together with detailed A* counters.
 pub fn astar_string_one_best_with_stats_prepared<'h, H, S>(
     left: &Explicit,
     prepared: &PreparedAstarGrammar,
@@ -2041,8 +1996,7 @@ where
         right.inner().concat_symbol(),
     );
     assert!(
-        fallback_rules.ones().next().is_none()
-            && !prepared.span_left_index.has_any_higher_arity(),
+        fallback_rules.ones().next().is_none() && !prepared.span_left_index.has_any_higher_arity(),
         "lazy A* benchmark supports only specialized nullary, unary-identity, and binary-concat rules"
     );
     astar_one_best_with_stats_and_span_sibling(
@@ -2114,13 +2068,7 @@ where
         ctx.run_with_source(&mut source, h, scorer, true, on_finalize);
     } else {
         let mut source = StringAstarSource::new(&prepared.span_left_index, fallback_rules);
-        ctx.run_with_source(
-            &mut source,
-            h,
-            scorer,
-            true,
-            on_finalize,
-        );
+        ctx.run_with_source(&mut source, h, scorer, true, on_finalize);
     }
     ctx.stats.output_states = ctx.product_pairs.len();
 
@@ -2131,12 +2079,9 @@ where
     ctx.stats.right_indexed_queries = ctx.mat_stats.right_indexed_queries;
 
     let mut arena = TreeArena::new();
-    let Some(root) = build_tree_from_arena(
-        goal,
-        &ctx.backpointer_ids,
-        &ctx.backpointers,
-        &mut arena,
-    ) else {
+    let Some(root) =
+        build_tree_from_arena(goal, &ctx.backpointer_ids, &ctx.backpointers, &mut arena)
+    else {
         return (None, ctx.stats);
     };
     let tree =
@@ -2180,11 +2125,17 @@ where
     let mut goal_state: Option<(StateId, f64)> = None;
 
     let mut source = GenericCandidateSource;
-    ctx.run_with_source(&mut source, h, scorer, true, |ctx, product, _edge, inside, _merit| {
-        if goal_state.is_none() && ctx.is_accepting_product(product) {
-            goal_state = Some((product, inside));
-        }
-    });
+    ctx.run_with_source(
+        &mut source,
+        h,
+        scorer,
+        true,
+        |ctx, product, _edge, inside, _merit| {
+            if goal_state.is_none() && ctx.is_accepting_product(product) {
+                goal_state = Some((product, inside));
+            }
+        },
+    );
     ctx.stats.output_states = ctx.product_pairs.len();
 
     let Some((goal, best_score)) = goal_state else {
@@ -2194,12 +2145,9 @@ where
     ctx.stats.right_indexed_queries = ctx.mat_stats.right_indexed_queries;
 
     let mut arena = TreeArena::new();
-    let Some(root) = build_tree_from_arena(
-        goal,
-        &ctx.backpointer_ids,
-        &ctx.backpointers,
-        &mut arena,
-    ) else {
+    let Some(root) =
+        build_tree_from_arena(goal, &ctx.backpointer_ids, &ctx.backpointers, &mut arena)
+    else {
         return (None, ctx.stats);
     };
     let tree =
@@ -2308,12 +2256,7 @@ mod tests {
         hom.add(source, 1, child).unwrap();
     }
 
-    fn add_unary_suffix_hom(
-        hom: &mut Homomorphism,
-        source: Symbol,
-        concat: Symbol,
-        word: Symbol,
-    ) {
+    fn add_unary_suffix_hom(hom: &mut Homomorphism, source: Symbol, concat: Symbol, word: Symbol) {
         let child = hom.add_var(0);
         let suffix = hom.add_symbol(word, Vec::new());
         let term = hom.add_symbol(concat, vec![child, suffix]);
@@ -2336,11 +2279,7 @@ mod tests {
         hom.add(source, 3, term).unwrap();
     }
 
-    fn add_reversed_binary_concat_hom(
-        hom: &mut Homomorphism,
-        source: Symbol,
-        concat: Symbol,
-    ) {
+    fn add_reversed_binary_concat_hom(hom: &mut Homomorphism, source: Symbol, concat: Symbol) {
         let right = hom.add_var(1);
         let left = hom.add_var(0);
         let term = hom.add_symbol(concat, vec![right, left]);
@@ -2448,8 +2387,12 @@ mod tests {
             &ZeroHeuristic,
             &ProbabilityScorer,
         );
-        let (generic, _) =
-            astar_one_best_with_stats_and_index(&grammar, &right, &ZeroHeuristic, &ProbabilityScorer);
+        let (generic, _) = astar_one_best_with_stats_and_index(
+            &grammar,
+            &right,
+            &ZeroHeuristic,
+            &ProbabilityScorer,
+        );
 
         assert_eq!(
             fast.as_ref().map(ViterbiTree::weight),
@@ -2558,14 +2501,8 @@ mod tests {
         builder.add_accepting(gap_root);
         let grammar = builder.build();
 
-        for sentence in [
-            vec![word_b, word_a],
-            vec![word_a, word_x, word_b],
-        ] {
-            let right = InvHom::new(
-                StringDecompositionAutomaton::new(concat, sentence),
-                &hom,
-            );
+        for sentence in [vec![word_b, word_a], vec![word_a, word_x, word_b]] {
+            let right = InvHom::new(StringDecompositionAutomaton::new(concat, sentence), &hom);
             let prepared = PreparedAstarGrammar::new(&grammar);
             let (fast, stats) = astar_string_one_best_with_stats_prepared(
                 &grammar,
@@ -2574,8 +2511,12 @@ mod tests {
                 &ZeroHeuristic,
                 &ProbabilityScorer,
             );
-            let (generic, _) =
-                astar_one_best_with_stats_and_index(&grammar, &right, &ZeroHeuristic, &ProbabilityScorer);
+            let (generic, _) = astar_one_best_with_stats_and_index(
+                &grammar,
+                &right,
+                &ZeroHeuristic,
+                &ProbabilityScorer,
+            );
             assert_eq!(
                 fast.as_ref().map(ViterbiTree::weight),
                 generic.as_ref().map(ViterbiTree::weight)
@@ -2632,7 +2573,11 @@ mod tests {
             },
         );
         let best = chart.viterbi().expect("reopened search should find a tree");
-        assert!((best.weight() - 0.09).abs() < 1e-12, "got {}", best.weight());
+        assert!(
+            (best.weight() - 0.09).abs() < 1e-12,
+            "got {}",
+            best.weight()
+        );
         assert!(stats.reopen_attempts > 0);
         assert!(stats.expanded_states > stats.finalized_states);
     }
@@ -2714,10 +2659,7 @@ mod tests {
     #[test]
     fn memoized_heuristic_is_evaluated_once_per_parent_pair() {
         let (grammar, hom, sentence) = build_ambiguous_binary_string_grammar();
-        let right = InvHom::new(
-            StringDecompositionAutomaton::new(Symbol(0), sentence),
-            &hom,
-        );
+        let right = InvHom::new(StringDecompositionAutomaton::new(Symbol(0), sentence), &hom);
         let prepared = PreparedAstarGrammar::new(&grammar);
         let h = CountingMemoizedHeuristic::new();
 

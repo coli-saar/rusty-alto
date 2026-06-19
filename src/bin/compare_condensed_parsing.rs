@@ -1,9 +1,11 @@
+//! Compare condensed parsing implementations on generated string instances.
+
+use packed_term_arena::tree::TreeArena;
 use rusty_alto::{
     CondensedTa, Explicit, ExplicitBuilder, HomLabel, Homomorphism, InvHom, Rule, StateId,
     StateUniverse, StringDecompositionAutomaton, Symbol, SymbolSet,
     materialize_indexed_condensed_intersection,
 };
-use packed_term_arena::tree::TreeArena;
 use smallvec::SmallVec;
 use std::collections::VecDeque;
 use std::env;

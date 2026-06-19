@@ -191,6 +191,7 @@ pub struct ScoredZeroHeuristic {
 }
 
 impl ScoredZeroHeuristic {
+    /// Construct the constant-one heuristic in `scorer`'s representation.
     pub fn new<S: WeightScorer>(scorer: &S) -> Self {
         Self { one: scorer.one() }
     }

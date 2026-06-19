@@ -1,3 +1,5 @@
+//! Linear, nondeleting tree homomorphisms used by IRTG interpretations.
+
 use crate::{FxHashMap, Symbol};
 use packed_term_arena::tree::{MutAlgebra, Tree, TreeArena};
 use smallvec::SmallVec;

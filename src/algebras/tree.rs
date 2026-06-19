@@ -214,6 +214,16 @@ impl<A> Binarizing<A> {
         Self { inner, append }
     }
 
+    /// Return the wrapped algebra.
+    pub fn inner(&self) -> &A {
+        &self.inner
+    }
+
+    /// Return the configured append symbol.
+    pub fn append_symbol(&self) -> Option<Symbol> {
+        self.append
+    }
+
     /// Unbinarize the subtree at `node`, building the result into `dst`; returns the resulting
     /// forest (a single tree, except where an append node spliced several together).
     fn unbinarize(

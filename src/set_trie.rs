@@ -1,3 +1,5 @@
+//! Trie index for matching tuples against sets of allowed keys.
+
 use crate::FxHashMap;
 use std::hash::{BuildHasher, Hash};
 

@@ -1,3 +1,5 @@
+//! Compare baseline and sibling-indexed automaton intersection algorithms.
+
 use rusty_alto::{Explicit, ExplicitBuilder, Rule, StateId, Symbol};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;

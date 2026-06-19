@@ -1,3 +1,5 @@
+//! Deterministic and nondeterministic bottom-up automaton runners.
+
 use crate::{BottomUpTa, DetBottomUpTa, StateId, Symbol};
 use fixedbitset::FixedBitSet;
 use packed_term_arena::tree::{Tree, TreeArena};

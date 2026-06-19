@@ -1,3 +1,5 @@
+//! Core oracle traits for bottom-up, top-down, indexed, and condensed automata.
+
 use crate::Symbol;
 use smallvec::SmallVec;
 use std::hash::Hash;

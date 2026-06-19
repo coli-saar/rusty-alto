@@ -1,7 +1,10 @@
 //! Algebra interfaces and decomposition automata.
 
+mod feature;
 mod string;
 mod string_astar;
+mod tag_string;
+mod tag_tree;
 mod tree;
 
 use crate::{BottomUpTa, DetBottomUpTa, Signature, Symbol};
@@ -10,6 +13,14 @@ use std::hash::Hash;
 
 pub use string::{
     SentenceSxHeuristic, Span, StringAlgebra, StringDecompositionAutomaton, UniversalSxHeuristic,
+};
+pub use tag_string::{
+    CONC11, CONC12, CONC21, TAG_E, TAG_EE, TagSpan, TagStringAlgebra,
+    TagStringDecompositionAutomaton, TagStringValue, WRAP21, WRAP22,
+};
+pub use tag_tree::{
+    BinarizedTagTreeDecompositionAutomaton, BinarizedTagTreeState, TAG_HOLE, TAG_SUBSTITUTE,
+    TagTreeAlgebra, TagTreeContext, TagTreeDecompositionAutomaton,
 };
 pub use tree::{APPEND_SYMBOL, Binarizing, TreeAlgebra, TreeValue};
 pub(crate) use string::{SpanProductSibling, SpanProductSiblingFinder};
@@ -209,3 +220,7 @@ mod tests {
         assert_eq!(decomp.step_det(algebra.zero, &[two]), None);
     }
 }
+pub use feature::{
+    FS_EMBED_AUX_PREFIX, FS_EMBED_PREFIX, FS_PROJECT_PREFIX, FS_UNIFY, FeatureStructure,
+    FeatureStructureAlgebra, FeatureStructureFilter, FeatureStructureParseError,
+};

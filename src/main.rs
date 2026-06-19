@@ -1,9 +1,10 @@
-use rusty_alto::{Irtg, StringAlgebra, parse_irtg};
+use rusty_alto::{Irtg, RenderedValue, TulipacInputCodec, parse_irtg};
 use std::{
     env,
     error::Error,
     fs::File,
     io::{self, BufRead, IsTerminal, Write},
+    path::Path,
     time::{Duration, Instant},
 };
 
@@ -21,13 +22,17 @@ fn run() -> Result<(), Box<dyn Error>> {
     };
 
     let load_start = Instant::now();
-    let file = File::open(&path)?;
-    let irtg = parse_irtg(file)?;
+    let is_tulipac = Path::new(&path).extension().is_some_and(|ext| ext == "tag");
+    let irtg = if is_tulipac {
+        TulipacInputCodec::new().read_path(&path)?
+    } else {
+        parse_irtg(File::open(&path)?)?
+    };
     let load_time = load_start.elapsed();
 
-    let interpretation_name = choose_string_interpretation(&irtg)
-        .ok_or("IRTG does not contain a supported StringAlgebra interpretation")?;
-    let interpretation = irtg.interpretation::<StringAlgebra>(&interpretation_name)?;
+    let interpretation_name = choose_input_interpretation(&irtg)
+        .ok_or("grammar does not contain a supported input interpretation")?;
+    let interpretation = irtg.interpretation_ref(&interpretation_name).unwrap();
 
     eprintln!("loaded {path} in {}", format_duration(load_time));
     eprintln!("using interpretation {interpretation_name:?}");
@@ -36,8 +41,6 @@ fn run() -> Result<(), Box<dyn Error>> {
     let interactive = stdin.is_terminal();
     let mut stdin = stdin.lock();
     let mut line = String::new();
-    let mut sentence_number = 0usize;
-
     if interactive {
         eprintln!("enter sentences; Ctrl-D exits");
     }
@@ -60,59 +63,72 @@ fn run() -> Result<(), Box<dyn Error>> {
         if sentence.is_empty() {
             continue;
         }
-        sentence_number += 1;
-
         let object_start = Instant::now();
-        let value = match interpretation.parse_object(sentence) {
+        let value = match interpretation.parse_object_erased(sentence) {
             Ok(value) => value,
             Err(err) => {
-                println!("{sentence_number:05} [{sentence}] input-error={err}");
+                println!("Input error: {err}");
                 continue;
             }
         };
         let object_time = object_start.elapsed();
 
         let parse_start = Instant::now();
-        let chart = match irtg.parse([interpretation.input(value)]) {
+        let mut chart = match irtg.parse([interpretation.input_erased(value)]) {
             Ok(chart) => chart,
             Err(err) => {
-                println!("{sentence_number:05} [{sentence}] parse-error={err}");
+                println!("Parse error: {err}");
                 continue;
             }
         };
+        if is_tulipac && irtg.interpretation_ref("ft").is_some() {
+            chart.automaton = irtg.filter_non_null(&chart.automaton, "ft")?;
+        }
         let parse_time = parse_start.elapsed();
 
         let top_start = Instant::now();
         let top = chart.automaton.viterbi();
-        if let Some(top) = &top {
-            let _ = irtg
-                .grammar_signature()
-                .resolve_tree(top.arena(), top.root());
-        }
         let top_time = top_start.elapsed();
         let total_time = object_time + parse_time + top_time;
 
         println!(
-            "{sentence_number:05} [{sentence}] {} parse={} top={} input={}",
+            "Timing: total={} parse={} viterbi={} input={}",
             format_duration_compact(total_time),
             format_duration_compact(parse_time),
             format_duration_compact(top_time),
             format_duration_compact(object_time),
         );
+
+        let Some(top) = top else {
+            println!("No parse.");
+            continue;
+        };
+
+        println!(
+            "Derivation: {}",
+            irtg.resolve_derivation(top.arena(), top.root())
+        );
+        for rendered in irtg.render_derivation(top.arena(), top.root())? {
+            match rendered.value {
+                RenderedValue::Text(value) => println!("{}: {value}", rendered.name),
+                RenderedValue::Tree(value) => println!("{}: {value}", rendered.name),
+            }
+        }
     }
 
     Ok(())
 }
 
-fn choose_string_interpretation(irtg: &Irtg) -> Option<String> {
-    let names = irtg.string_interpretation_names();
+fn choose_input_interpretation(irtg: &Irtg) -> Option<String> {
+    let names = irtg.input_interpretation_names();
     if names.is_empty() {
         return None;
     }
     names
         .iter()
         .copied()
-        .find(|&name| name == "english")
+        .find(|&name| name == "string")
+        .or_else(|| names.iter().copied().find(|&name| name == "english"))
         .or_else(|| names.iter().copied().find(|&name| name == "i"))
         .or_else(|| names.first().copied())
         .map(str::to_owned)

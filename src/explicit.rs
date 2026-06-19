@@ -1,3 +1,5 @@
+//! Dense explicit weighted tree automata and their builder.
+
 use crate::{
     BottomUpTa, DetBottomUpTa, FxHashMap, FxHashSet, IndexedBottomUpTa, StateId, Symbol, TopDownTa,
     traits::{CondensedTa, CondensedTopDownTa, StateUniverse, SymbolSet},

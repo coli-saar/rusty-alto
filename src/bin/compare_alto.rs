@@ -1,7 +1,9 @@
+//! Benchmark and correctness comparison between rusty-alto and Alto automata.
+
+use packed_term_arena::tree::{Tree, TreeArena};
 use rusty_alto::{
     BottomUpTa, DetBottomUpTa, ParsedTreeAutomaton, Signature, StateId, Symbol, parse_alto,
 };
-use packed_term_arena::tree::{Tree, TreeArena};
 use std::collections::HashSet;
 use std::env;
 use std::fs;

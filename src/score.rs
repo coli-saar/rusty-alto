@@ -1,3 +1,5 @@
+//! Rule-weight scoring conventions for Viterbi and A* algorithms.
+
 /// Maps raw rule weights to the score algebra used by one-best algorithms.
 ///
 /// `Explicit` stores the raw weights it was built with. Algorithms that combine

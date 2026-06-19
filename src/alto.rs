@@ -1,3 +1,5 @@
+//! Reader for Alto's textual finite-tree-automaton (`.auto`) format.
+
 use crate::{
     Explicit, ExplicitBuildError, ExplicitBuilder, FxHashMap, Interner, Signature, SignatureError,
     StateId,

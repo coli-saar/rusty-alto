@@ -1,10 +1,72 @@
-//! Output codecs: render an algebra's public value to its textual representation.
+//! Typed input and output codecs.
 //!
 //! An [`OutputCodec`] is keyed on the public value type. Public values are self-contained (no
 //! interner ids), so codecs need no [`Signature`](crate::Signature). This mirrors Alto's
 //! output-codec layer.
 
-use std::fmt;
+use std::{fmt, io::Read};
+
+/// Decode a textual or byte-stream representation into a value.
+pub trait InputCodec<T> {
+    /// Codec-specific failure.
+    type Error;
+
+    /// Decode a UTF-8 string.
+    fn decode(&self, input: &str) -> Result<T, Self::Error>;
+
+    /// Read an entire byte stream as UTF-8 and decode it.
+    fn read<R: Read>(&self, mut reader: R) -> Result<T, InputCodecReadError<Self::Error>> {
+        let mut bytes = Vec::new();
+        reader
+            .read_to_end(&mut bytes)
+            .map_err(InputCodecReadError::Io)?;
+        let input = String::from_utf8(bytes).map_err(InputCodecReadError::Utf8)?;
+        self.decode(&input).map_err(InputCodecReadError::Codec)
+    }
+}
+
+/// Stream-level errors shared by input codecs.
+#[derive(Debug)]
+pub enum InputCodecReadError<E> {
+    /// Reading the byte stream failed.
+    Io(std::io::Error),
+    /// The stream was not valid UTF-8.
+    Utf8(std::string::FromUtf8Error),
+    /// The codec rejected otherwise valid UTF-8 input.
+    Codec(E),
+}
+
+impl<E: fmt::Display> fmt::Display for InputCodecReadError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "failed to read codec input: {error}"),
+            Self::Utf8(error) => write!(f, "codec input is not valid UTF-8: {error}"),
+            Self::Codec(error) => error.fmt(f),
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for InputCodecReadError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Utf8(error) => Some(error),
+            Self::Codec(error) => Some(error),
+        }
+    }
+}
+
+/// Input codec for Alto's textual `.irtg` format.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IrtgInputCodec;
+
+impl InputCodec<crate::Irtg> for IrtgInputCodec {
+    type Error = crate::IrtgError;
+
+    fn decode(&self, input: &str) -> Result<crate::Irtg, Self::Error> {
+        crate::parse_irtg(input.as_bytes())
+    }
+}
 
 /// Render a public algebra value of type `V` as text.
 pub trait OutputCodec<V: ?Sized> {

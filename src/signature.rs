@@ -1,3 +1,5 @@
+//! Ranked symbol signatures with stable dense symbol IDs.
+
 use crate::{FxHashMap, Symbol};
 use packed_term_arena::tree::{Tree, TreeArena};
 use std::fmt;

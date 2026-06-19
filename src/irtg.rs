@@ -1,17 +1,20 @@
 //! Interpreted regular tree grammars.
 
 use crate::{
-    APPEND_SYMBOL, Algebra, Binarizing, DisplayCodec, Explicit, ExplicitBuildError, ExplicitBuilder,
-    FxHashMap, Homomorphism, HomomorphismError, IndexedCondensedIntersectionStats, Interner, InvHom,
-    MinHeuristic, ObligatoryLeafTables, OutputCodec, OutsideHeuristic, ScoredZeroHeuristic,
-    Signature, SignatureError, SpaceJoinCodec, StateId, StringAlgebra, Symbol, TreeAlgebra,
-    UniversalSxHeuristic, ViterbiTree, WeightScorer, ZeroHeuristic,
+    APPEND_SYMBOL, Algebra, BinarizedTagTreeDecompositionAutomaton, Binarizing, BottomUpTa,
+    CondensedTa, DisplayCodec, Explicit, ExplicitBuildError, ExplicitBuilder, FeatureStructure,
+    FeatureStructureAlgebra, FxHashMap, FxHashSet, Homomorphism, HomomorphismError,
+    IndexedCondensedIntersectionStats, Interner, InvHom, MinHeuristic, ObligatoryLeafTables,
+    OutputCodec, OutsideHeuristic, ScoredZeroHeuristic, Signature, SignatureError, SpaceJoinCodec,
+    StateId, StateUniverse, StringAlgebra, Symbol, TagStringAlgebra,
+    TagStringDecompositionAutomaton, TagStringValue, TagTreeAlgebra, TagTreeDecompositionAutomaton,
+    TopDownTa, TreeAlgebra, UniversalSxHeuristic, ViterbiTree, WeightScorer, ZeroHeuristic,
     alto_ast::{AstHomTerm, AstIrtg, AstState, LexError, Tok, lex},
     alto_grammar,
     astar::{
-        AstarOptions, AstarStats, PreparedAstarGrammar, astar_string_one_best_with_stats,
-        astar_string_one_best_with_stats_prepared,
-        materialize_astar_string_intersection_with,
+        AstarOptions, AstarStats, PreparedAstarGrammar, astar_one_best_with_stats,
+        astar_string_one_best_with_stats, astar_string_one_best_with_stats_prepared,
+        materialize_astar_intersection_with, materialize_astar_string_intersection_with,
     },
     materialize::{
         materialize_indexed_condensed_intersection, materialize_topdown_condensed_intersection,
@@ -19,10 +22,100 @@ use crate::{
 };
 use lalrpop_util::ParseError;
 use packed_term_arena::tree::{Tree, TreeArena};
-use std::{any::Any, fmt, io::Read, marker::PhantomData, sync::Mutex};
+use std::{any::Any, fmt, hash::Hash, io::Read, marker::PhantomData, sync::Mutex};
 use thiserror::Error;
 
+fn filter_feature_chart(
+    chart: &Explicit,
+    algebra: &FeatureStructureAlgebra,
+    homomorphism: &Homomorphism,
+) -> Explicit {
+    let filter = InvHom::new(algebra.filter(), homomorphism);
+    let rules: Vec<_> = chart
+        .rules()
+        .map(|rule| {
+            (
+                rule.symbol,
+                rule.children.to_vec(),
+                rule.result,
+                rule.weight,
+            )
+        })
+        .collect();
+    let mut builder = ExplicitBuilder::new();
+    let mut pair_ids = FxHashMap::<(StateId, FeatureStructure), StateId>::default();
+    let mut variants = vec![Vec::<(FeatureStructure, StateId)>::new(); chart.num_states() as usize];
+    let mut emitted = FxHashSet::<(Symbol, Vec<StateId>, StateId)>::default();
+
+    let intern = |left: StateId,
+                  value: FeatureStructure,
+                  builder: &mut ExplicitBuilder,
+                  pair_ids: &mut FxHashMap<(StateId, FeatureStructure), StateId>,
+                  variants: &mut [Vec<(FeatureStructure, StateId)>]| {
+        if let Some(&id) = pair_ids.get(&(left, value.clone())) {
+            return (id, false);
+        }
+        let id = builder.new_state();
+        if chart.is_accepting(&left) {
+            builder.add_accepting(id);
+        }
+        pair_ids.insert((left, value.clone()), id);
+        variants[left.index()].push((value, id));
+        (id, true)
+    };
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (symbol, children, result, weight) in &rules {
+            if children.is_empty() {
+                filter.step(*symbol, &[], &mut |value| {
+                    let (parent, is_new) =
+                        intern(*result, value, &mut builder, &mut pair_ids, &mut variants);
+                    changed |= is_new;
+                    if emitted.insert((*symbol, Vec::new(), parent)) {
+                        builder.add_weighted_rule(*symbol, Vec::new(), parent, *weight);
+                    }
+                });
+                continue;
+            }
+            if children
+                .iter()
+                .any(|child| variants[child.index()].is_empty())
+            {
+                continue;
+            }
+            let pool_storage: Vec<_> = children
+                .iter()
+                .map(|child| variants[child.index()].clone())
+                .collect();
+            let pools: Vec<_> = pool_storage.iter().map(Vec::as_slice).collect();
+            crate::run::cartesian_product(&pools, |combination| {
+                let child_values: Vec<_> =
+                    combination.iter().map(|(value, _)| value.clone()).collect();
+                let child_ids: Vec<_> = combination.iter().map(|(_, id)| *id).collect();
+                filter.step(*symbol, &child_values, &mut |value| {
+                    let (parent, is_new) =
+                        intern(*result, value, &mut builder, &mut pair_ids, &mut variants);
+                    changed |= is_new;
+                    if emitted.insert((*symbol, child_ids.clone(), parent)) {
+                        builder.add_weighted_rule(*symbol, child_ids.clone(), parent, *weight);
+                    }
+                });
+            });
+        }
+    }
+    builder.build()
+}
+
 const STRING_ALGEBRA: &str = "de.up.ling.irtg.algebra.StringAlgebra";
+const TAG_STRING_ALGEBRA: &str = "de.up.ling.irtg.algebra.TagStringAlgebra";
+const TAG_TREE_ALGEBRA: &str = "de.up.ling.irtg.algebra.TagTreeAlgebra";
+const TAG_TREE_WITH_ARITIES_ALGEBRA: &str = "de.up.ling.irtg.algebra.TagTreeWithAritiesAlgebra";
+const BINARIZING_TAG_TREE_ALGEBRA: &str = "de.up.ling.irtg.algebra.BinarizingTagTreeAlgebra";
+const BINARIZING_TAG_TREE_WITH_ARITIES_ALGEBRA: &str =
+    "de.up.ling.irtg.algebra.BinarizingTagTreeWithAritiesAlgebra";
+const FEATURE_STRUCTURE_ALGEBRA: &str = "de.up.ling.irtg.algebra.FeatureStructureAlgebra";
 const TREE_WITH_ARITIES_ALGEBRA: &str = "de.up.ling.irtg.algebra.TreeWithAritiesAlgebra";
 const BINARIZING_TREE_WITH_ARITIES_ALGEBRA: &str =
     "de.up.ling.irtg.algebra.BinarizingTreeWithAritiesAlgebra";
@@ -62,7 +155,9 @@ pub enum AstarHeuristic<'h> {
     /// current sentence.  The table is admissible for any sentence with `n ≤ n_max`.
     /// Build once with [`UniversalSxHeuristic::new`] and reuse across all sentences.
     UniversalSx {
+        /// Precomputed universal SX table.
         table: &'h UniversalSxHeuristic,
+        /// Current sentence length.
         n: usize,
     },
     /// Universal SX combined with the obligatory-leaf F filter via `min`. SX
@@ -71,8 +166,11 @@ pub enum AstarHeuristic<'h> {
     /// `oblig` is grammar-only (build once); the per-input terminal supply is
     /// derived from the sentence at call time.
     UniversalSxF {
+        /// Precomputed universal SX table.
         table: &'h UniversalSxHeuristic,
+        /// Grammar-level obligatory-leaf tables.
         oblig: &'h ObligatoryLeafTables,
+        /// Current sentence length.
         n: usize,
     },
 }
@@ -112,6 +210,45 @@ impl Irtg {
             .collect();
         names.sort_unstable();
         names
+    }
+
+    /// Return the names of all interpretations that can be used as parse inputs.
+    pub fn input_interpretation_names(&self) -> Vec<&str> {
+        let mut names: Vec<_> = self
+            .interpretations
+            .values()
+            .filter(|interpretation| interpretation.is_inputable())
+            .map(|interpretation| interpretation.name.as_str())
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// Filter a parse chart to derivations whose feature-structure interpretation
+    /// evaluates successfully.
+    pub fn filter_non_null(
+        &self,
+        chart: &Explicit,
+        interpretation_name: &str,
+    ) -> Result<Explicit, IrtgError> {
+        let interpretation = self
+            .interpretations
+            .get(interpretation_name)
+            .ok_or_else(|| IrtgError::UnknownInterpretation(interpretation_name.to_owned()))?;
+        let algebra = interpretation.algebra.lock().unwrap();
+        let algebra = algebra
+            .as_ref()
+            .downcast_ref::<FeatureStructureAlgebra>()
+            .ok_or_else(|| IrtgError::WrongAlgebraType {
+                interpretation: interpretation_name.to_owned(),
+                requested: std::any::type_name::<FeatureStructureAlgebra>(),
+                actual: interpretation.class_name.clone(),
+            })?;
+        Ok(filter_feature_chart(
+            chart,
+            algebra,
+            &interpretation.homomorphism,
+        ))
     }
 
     /// Iterate over all interpretations (in unspecified order).
@@ -211,6 +348,69 @@ impl Irtg {
                             c
                         }
                     };
+                    chart = next_chart;
+                }
+                InterpretationKind::TagString => {
+                    let value =
+                        *input
+                            .value
+                            .downcast::<TagStringValue<Symbol>>()
+                            .map_err(|_| IrtgError::WrongInputType {
+                                interpretation: interpretation.name.clone(),
+                            })?;
+                    let decomp = interpretation.decompose_tag_string(value)?;
+                    let (next_chart, stat) = self.run_generic_chart(
+                        &chart,
+                        decomp,
+                        &interpretation.homomorphism,
+                        strategy,
+                        &interpretation.name,
+                    )?;
+                    if let Some(stat) = stat {
+                        stats.push(stat);
+                    }
+                    chart = next_chart;
+                }
+                InterpretationKind::TagTree => {
+                    let value =
+                        *input
+                            .value
+                            .downcast::<Tree>()
+                            .map_err(|_| IrtgError::WrongInputType {
+                                interpretation: interpretation.name.clone(),
+                            })?;
+                    let decomp = interpretation.decompose_tag_tree(value)?;
+                    let (next_chart, stat) = self.run_generic_chart(
+                        &chart,
+                        decomp,
+                        &interpretation.homomorphism,
+                        strategy,
+                        &interpretation.name,
+                    )?;
+                    if let Some(stat) = stat {
+                        stats.push(stat);
+                    }
+                    chart = next_chart;
+                }
+                InterpretationKind::BinarizedTagTree => {
+                    let value =
+                        *input
+                            .value
+                            .downcast::<Tree>()
+                            .map_err(|_| IrtgError::WrongInputType {
+                                interpretation: interpretation.name.clone(),
+                            })?;
+                    let decomp = interpretation.decompose_binarized_tag_tree(value)?;
+                    let (next_chart, stat) = self.run_generic_chart(
+                        &chart,
+                        decomp,
+                        &interpretation.homomorphism,
+                        strategy,
+                        &interpretation.name,
+                    )?;
+                    if let Some(stat) = stat {
+                        stats.push(stat);
+                    }
                     chart = next_chart;
                 }
                 InterpretationKind::OutputOnly => {
@@ -336,6 +536,59 @@ impl Irtg {
                     );
                     Ok((tree, Some(stats)))
                 }
+                InterpretationKind::TagString => {
+                    let value = last
+                        .value
+                        .downcast_ref::<TagStringValue<Symbol>>()
+                        .ok_or_else(|| IrtgError::WrongInputType {
+                            interpretation: interpretation.name.clone(),
+                        })?
+                        .clone();
+                    let decomp = interpretation.decompose_tag_string(value)?;
+                    let (tree, stats) = self.run_generic_one_best(
+                        &self.grammar,
+                        decomp,
+                        &interpretation.homomorphism,
+                        heuristic,
+                        scorer,
+                        &interpretation.name,
+                    )?;
+                    Ok((tree, Some(stats)))
+                }
+                InterpretationKind::TagTree => {
+                    let value = *last.value.downcast_ref::<Tree>().ok_or_else(|| {
+                        IrtgError::WrongInputType {
+                            interpretation: interpretation.name.clone(),
+                        }
+                    })?;
+                    let decomp = interpretation.decompose_tag_tree(value)?;
+                    let (tree, stats) = self.run_generic_one_best(
+                        &self.grammar,
+                        decomp,
+                        &interpretation.homomorphism,
+                        heuristic,
+                        scorer,
+                        &interpretation.name,
+                    )?;
+                    Ok((tree, Some(stats)))
+                }
+                InterpretationKind::BinarizedTagTree => {
+                    let value = *last.value.downcast_ref::<Tree>().ok_or_else(|| {
+                        IrtgError::WrongInputType {
+                            interpretation: interpretation.name.clone(),
+                        }
+                    })?;
+                    let decomp = interpretation.decompose_binarized_tag_tree(value)?;
+                    let (tree, stats) = self.run_generic_one_best(
+                        &self.grammar,
+                        decomp,
+                        &interpretation.homomorphism,
+                        heuristic,
+                        scorer,
+                        &interpretation.name,
+                    )?;
+                    Ok((tree, Some(stats)))
+                }
                 InterpretationKind::OutputOnly => Err(IrtgError::NotInputable {
                     interpretation: interpretation.name.clone(),
                 }),
@@ -350,6 +603,103 @@ impl Irtg {
     // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
+
+    fn run_generic_chart<R>(
+        &self,
+        chart: &Explicit,
+        decomp: R,
+        homomorphism: &Homomorphism,
+        strategy: &MaterializationStrategy<'_>,
+        interpretation: &str,
+    ) -> Result<(Explicit, Option<IndexedCondensedIntersectionStats>), IrtgError>
+    where
+        R: CondensedTa + StateUniverse + TopDownTa,
+        R::State: Clone + Eq + Hash,
+    {
+        let invhom = InvHom::new(decomp, homomorphism);
+        match strategy {
+            MaterializationStrategy::TopDownCondensed => {
+                let (chart, _, stats) = materialize_topdown_condensed_intersection(chart, &invhom);
+                Ok((chart, Some(stats)))
+            }
+            MaterializationStrategy::IndexedCondensed => {
+                let (chart, _, stats) = materialize_indexed_condensed_intersection(chart, &invhom);
+                Ok((chart, Some(stats)))
+            }
+            MaterializationStrategy::Astar { heuristic, options } => {
+                let options = AstarOptions {
+                    stop_at_first_goal: options.stop_at_first_goal,
+                    beam: options.beam,
+                };
+                let chart = match heuristic {
+                    AstarHeuristic::Zero => {
+                        let heuristic = ZeroHeuristic;
+                        materialize_astar_intersection_with(
+                            chart,
+                            &invhom,
+                            &heuristic,
+                            options,
+                            &crate::ProbabilityScorer,
+                        )
+                        .0
+                    }
+                    AstarHeuristic::Outside(heuristic) => {
+                        materialize_astar_intersection_with(
+                            chart,
+                            &invhom,
+                            *heuristic,
+                            options,
+                            &crate::ProbabilityScorer,
+                        )
+                        .0
+                    }
+                    AstarHeuristic::UniversalSx { .. } | AstarHeuristic::UniversalSxF { .. } => {
+                        return Err(IrtgError::IncompatibleHeuristic {
+                            interpretation: interpretation.to_owned(),
+                            message: "SX and SXF heuristics require a StringAlgebra interpretation"
+                                .to_owned(),
+                        });
+                    }
+                };
+                Ok((chart, None))
+            }
+        }
+    }
+
+    fn run_generic_one_best<R, S>(
+        &self,
+        chart: &Explicit,
+        decomp: R,
+        homomorphism: &Homomorphism,
+        heuristic: &AstarHeuristic<'_>,
+        scorer: &S,
+        interpretation: &str,
+    ) -> Result<(Option<ViterbiTree>, AstarStats), IrtgError>
+    where
+        R: CondensedTa + StateUniverse,
+        R::State: Clone + Eq + Hash,
+        S: WeightScorer,
+    {
+        let invhom = InvHom::new(decomp, homomorphism);
+        match heuristic {
+            AstarHeuristic::Zero => {
+                let heuristic = ScoredZeroHeuristic::new(scorer);
+                Ok(astar_one_best_with_stats(
+                    chart, &invhom, &heuristic, scorer,
+                ))
+            }
+            AstarHeuristic::Outside(heuristic) => Ok(astar_one_best_with_stats(
+                chart, &invhom, *heuristic, scorer,
+            )),
+            AstarHeuristic::UniversalSx { .. } | AstarHeuristic::UniversalSxF { .. } => {
+                Err(IrtgError::IncompatibleHeuristic {
+                    interpretation: interpretation.to_owned(),
+                    message: "SX and SXF heuristics require a StringAlgebra interpretation"
+                        .to_owned(),
+                })
+            }
+        }
+    }
 
     /// Check the A* weight precondition: all grammar rule weights must be ≤ 1.
     fn check_astar_weight_precondition(&self) -> Result<(), IrtgError> {
@@ -442,9 +792,7 @@ impl Irtg {
         macro_rules! run {
             ($h:expr) => {
                 if let Some(prepared) = prepared {
-                    astar_string_one_best_with_stats_prepared(
-                        chart, prepared, invhom, $h, scorer,
-                    )
+                    astar_string_one_best_with_stats_prepared(chart, prepared, invhom, $h, scorer)
                 } else {
                     astar_string_one_best_with_stats(chart, invhom, $h, scorer)
                 }
@@ -495,16 +843,84 @@ impl Irtg {
                     let decomp = interpretation.decompose_string(value)?;
                     let invhom = InvHom::new(decomp, &interpretation.homomorphism);
                     if is_last {
-                        let (tree, stats) =
-                            self.run_astar_one_best_with_scorer(
-                                &chart, &invhom, heuristic, scorer, None,
-                            );
+                        let (tree, stats) = self.run_astar_one_best_with_scorer(
+                            &chart, &invhom, heuristic, scorer, None,
+                        );
                         return Ok((tree, Some(stats)));
                     } else {
                         let (next, _, _) =
                             materialize_topdown_condensed_intersection(&chart, &invhom);
                         chart = next;
                     }
+                }
+                InterpretationKind::TagString => {
+                    let value =
+                        *input
+                            .value
+                            .downcast::<TagStringValue<Symbol>>()
+                            .map_err(|_| IrtgError::WrongInputType {
+                                interpretation: interpretation.name.clone(),
+                            })?;
+                    let decomp = interpretation.decompose_tag_string(value)?;
+                    if is_last {
+                        let (tree, stats) = self.run_generic_one_best(
+                            &chart,
+                            decomp,
+                            &interpretation.homomorphism,
+                            heuristic,
+                            scorer,
+                            &interpretation.name,
+                        )?;
+                        return Ok((tree, Some(stats)));
+                    }
+                    let invhom = InvHom::new(decomp, &interpretation.homomorphism);
+                    chart = materialize_topdown_condensed_intersection(&chart, &invhom).0;
+                }
+                InterpretationKind::TagTree => {
+                    let value =
+                        *input
+                            .value
+                            .downcast::<Tree>()
+                            .map_err(|_| IrtgError::WrongInputType {
+                                interpretation: interpretation.name.clone(),
+                            })?;
+                    let decomp = interpretation.decompose_tag_tree(value)?;
+                    if is_last {
+                        let (tree, stats) = self.run_generic_one_best(
+                            &chart,
+                            decomp,
+                            &interpretation.homomorphism,
+                            heuristic,
+                            scorer,
+                            &interpretation.name,
+                        )?;
+                        return Ok((tree, Some(stats)));
+                    }
+                    let invhom = InvHom::new(decomp, &interpretation.homomorphism);
+                    chart = materialize_topdown_condensed_intersection(&chart, &invhom).0;
+                }
+                InterpretationKind::BinarizedTagTree => {
+                    let value =
+                        *input
+                            .value
+                            .downcast::<Tree>()
+                            .map_err(|_| IrtgError::WrongInputType {
+                                interpretation: interpretation.name.clone(),
+                            })?;
+                    let decomp = interpretation.decompose_binarized_tag_tree(value)?;
+                    if is_last {
+                        let (tree, stats) = self.run_generic_one_best(
+                            &chart,
+                            decomp,
+                            &interpretation.homomorphism,
+                            heuristic,
+                            scorer,
+                            &interpretation.name,
+                        )?;
+                        return Ok((tree, Some(stats)));
+                    }
+                    let invhom = InvHom::new(decomp, &interpretation.homomorphism);
+                    chart = materialize_topdown_condensed_intersection(&chart, &invhom).0;
                 }
                 InterpretationKind::OutputOnly => {
                     return Err(IrtgError::NotInputable {
@@ -618,6 +1034,59 @@ impl Interpretation {
         Ok(algebra.decompose(value))
     }
 
+    fn decompose_tag_string(
+        &self,
+        value: TagStringValue<Symbol>,
+    ) -> Result<TagStringDecompositionAutomaton, IrtgError> {
+        let algebra = self.algebra.lock().unwrap();
+        let algebra = algebra
+            .as_ref()
+            .downcast_ref::<TagStringAlgebra>()
+            .ok_or_else(|| IrtgError::WrongInputType {
+                interpretation: self.name.clone(),
+            })?;
+        algebra
+            .decompose(value)
+            .ok_or_else(|| IrtgError::ObjectParse {
+                interpretation: self.name.clone(),
+                message: "TAG decomposition inputs must be contiguous strings".to_owned(),
+            })
+    }
+
+    fn decompose_tag_tree(&self, value: Tree) -> Result<TagTreeDecompositionAutomaton, IrtgError> {
+        let algebra = self.algebra.lock().unwrap();
+        let algebra = algebra
+            .as_ref()
+            .downcast_ref::<TagTreeAlgebra>()
+            .ok_or_else(|| IrtgError::WrongInputType {
+                interpretation: self.name.clone(),
+            })?;
+        Ok(algebra.decompose(value))
+    }
+
+    fn decompose_binarized_tag_tree(
+        &self,
+        value: Tree,
+    ) -> Result<BinarizedTagTreeDecompositionAutomaton, IrtgError> {
+        let algebra = self.algebra.lock().unwrap();
+        let algebra = algebra
+            .as_ref()
+            .downcast_ref::<Binarizing<TagTreeAlgebra>>()
+            .ok_or_else(|| IrtgError::WrongInputType {
+                interpretation: self.name.clone(),
+            })?;
+        let append = algebra
+            .append_symbol()
+            .ok_or_else(|| IrtgError::ObjectParse {
+                interpretation: self.name.clone(),
+                message: "binarizing TAG tree algebra has no append symbol".to_owned(),
+            })?;
+        Ok(BinarizedTagTreeDecompositionAutomaton::new(
+            algebra.inner().decompose_binarized(value),
+            append,
+        ))
+    }
+
     /// Return the interpretation name.
     pub fn name(&self) -> &str {
         &self.name
@@ -641,7 +1110,16 @@ impl Interpretation {
     /// Return whether this interpretation can serve as a parse input (its algebra is decomposable).
     /// Output-only interpretations (e.g. tree algebras) return `false`.
     pub fn is_inputable(&self) -> bool {
-        matches!(self.kind, InterpretationKind::String)
+        !matches!(self.kind, InterpretationKind::OutputOnly)
+    }
+
+    /// Return whether interpreted values use the tree textual representation.
+    pub fn is_tree_valued(&self) -> bool {
+        matches!(
+            self.kind,
+            InterpretationKind::TagTree | InterpretationKind::BinarizedTagTree
+        ) || (self.kind == InterpretationKind::OutputOnly
+            && self.class_name != FEATURE_STRUCTURE_ALGEBRA)
     }
 
     /// Parse a textual object with this interpretation's algebra, returning a type-erased
@@ -656,13 +1134,60 @@ impl Interpretation {
                     .ok_or_else(|| IrtgError::WrongInputType {
                         interpretation: self.name.clone(),
                     })?;
-                let value =
-                    algebra
-                        .parse_object(input)
-                        .map_err(|err| IrtgError::ObjectParse {
-                            interpretation: self.name.clone(),
-                            message: err.to_string(),
-                        })?;
+                let value = algebra
+                    .parse_object(input)
+                    .map_err(|err| IrtgError::ObjectParse {
+                        interpretation: self.name.clone(),
+                        message: err.to_string(),
+                    })?;
+                Ok(Box::new(value))
+            }
+            InterpretationKind::TagString => {
+                let mut algebra = self.algebra.lock().unwrap();
+                let algebra = algebra
+                    .as_mut()
+                    .downcast_mut::<TagStringAlgebra>()
+                    .ok_or_else(|| IrtgError::WrongInputType {
+                        interpretation: self.name.clone(),
+                    })?;
+                let value = algebra
+                    .parse_object(input)
+                    .map_err(|err| IrtgError::ObjectParse {
+                        interpretation: self.name.clone(),
+                        message: err.to_string(),
+                    })?;
+                Ok(Box::new(value))
+            }
+            InterpretationKind::TagTree => {
+                let mut algebra = self.algebra.lock().unwrap();
+                let algebra = algebra
+                    .as_mut()
+                    .downcast_mut::<TagTreeAlgebra>()
+                    .ok_or_else(|| IrtgError::WrongInputType {
+                        interpretation: self.name.clone(),
+                    })?;
+                let value = algebra
+                    .parse_object(input)
+                    .map_err(|err| IrtgError::ObjectParse {
+                        interpretation: self.name.clone(),
+                        message: err.to_string(),
+                    })?;
+                Ok(Box::new(value))
+            }
+            InterpretationKind::BinarizedTagTree => {
+                let mut algebra = self.algebra.lock().unwrap();
+                let algebra = algebra
+                    .as_mut()
+                    .downcast_mut::<Binarizing<TagTreeAlgebra>>()
+                    .ok_or_else(|| IrtgError::WrongInputType {
+                        interpretation: self.name.clone(),
+                    })?;
+                let value = algebra
+                    .parse_object(input)
+                    .map_err(|err| IrtgError::ObjectParse {
+                        interpretation: self.name.clone(),
+                        message: err.to_string(),
+                    })?;
                 Ok(Box::new(value))
             }
             InterpretationKind::OutputOnly => Err(IrtgError::ObjectParse {
@@ -699,6 +1224,12 @@ impl Interpretation {
 enum InterpretationKind {
     /// A [`StringAlgebra`] interpretation: can be a parse input (decomposable).
     String,
+    /// A decomposable TAG string interpretation.
+    TagString,
+    /// A decomposable TAG derived-tree interpretation.
+    TagTree,
+    /// A decomposable binarized TAG derived-tree interpretation.
+    BinarizedTagTree,
     /// An output-only interpretation (e.g. a tree algebra): values can be produced from a
     /// derivation tree, but the algebra cannot be decomposed for use as a parse input.
     OutputOnly,
@@ -846,6 +1377,14 @@ pub enum IrtgError {
         /// Interpretation name.
         interpretation: String,
     },
+    /// A parse strategy selected a heuristic that is not defined for this algebra.
+    #[error("heuristic is incompatible with interpretation {interpretation:?}: {message}")]
+    IncompatibleHeuristic {
+        /// Interpretation name.
+        interpretation: String,
+        /// Human-readable incompatibility.
+        message: String,
+    },
     /// The algebra could not parse an object.
     #[error("failed to parse object for interpretation {interpretation:?}: {message}")]
     ObjectParse {
@@ -886,7 +1425,7 @@ pub fn parse_irtg<R: Read>(mut reader: R) -> Result<Irtg, IrtgError> {
     build_irtg(ast)
 }
 
-fn build_irtg(ast: AstIrtg) -> Result<Irtg, IrtgError> {
+pub(crate) fn build_irtg(ast: AstIrtg) -> Result<Irtg, IrtgError> {
     let mut builder = ExplicitBuilder::new();
     let mut states = Interner::new();
     let mut state_ids = FxHashMap::default();
@@ -950,11 +1489,74 @@ fn build_irtg(ast: AstIrtg) -> Result<Irtg, IrtgError> {
                 signature,
                 renderer,
             )
+        } else if decl.algebra == TAG_STRING_ALGEBRA {
+            let signature = algebra_signatures.remove(&decl.name).unwrap_or_default();
+            let algebra = TagStringAlgebra::with_signature(signature.clone());
+            let renderer = Box::new(TypedDerivationCodec::<TagStringAlgebra, DisplayCodec>::new(
+                DisplayCodec,
+            ));
+            (
+                InterpretationKind::TagString,
+                Box::new(algebra),
+                signature,
+                renderer,
+            )
+        } else if decl.algebra == TAG_TREE_ALGEBRA || decl.algebra == TAG_TREE_WITH_ARITIES_ALGEBRA
+        {
+            let signature = algebra_signatures.remove(&decl.name).unwrap_or_default();
+            let algebra = if decl.algebra == TAG_TREE_WITH_ARITIES_ALGEBRA {
+                TagTreeAlgebra::with_arities(signature.clone())
+            } else {
+                TagTreeAlgebra::tree(signature.clone())
+            };
+            let renderer = Box::new(TypedDerivationCodec::<TagTreeAlgebra, DisplayCodec>::new(
+                DisplayCodec,
+            ));
+            (
+                InterpretationKind::TagTree,
+                Box::new(algebra),
+                signature,
+                renderer,
+            )
+        } else if decl.algebra == BINARIZING_TAG_TREE_ALGEBRA
+            || decl.algebra == BINARIZING_TAG_TREE_WITH_ARITIES_ALGEBRA
+        {
+            let mut signature = algebra_signatures.remove(&decl.name).unwrap_or_default();
+            let append = Some(signature.intern(APPEND_SYMBOL.to_owned(), 2)?);
+            let inner = if decl.algebra == BINARIZING_TAG_TREE_WITH_ARITIES_ALGEBRA {
+                TagTreeAlgebra::with_arities(signature.clone())
+            } else {
+                TagTreeAlgebra::tree(signature.clone())
+            };
+            let algebra = Binarizing::new(inner, append);
+            let renderer = Box::new(TypedDerivationCodec::<
+                Binarizing<TagTreeAlgebra>,
+                DisplayCodec,
+            >::new(DisplayCodec));
+            (
+                InterpretationKind::BinarizedTagTree,
+                Box::new(algebra),
+                signature,
+                renderer,
+            )
+        } else if decl.algebra == FEATURE_STRUCTURE_ALGEBRA {
+            let signature = algebra_signatures.remove(&decl.name).unwrap_or_default();
+            let algebra = FeatureStructureAlgebra::with_signature(signature.clone());
+            let renderer = Box::new(
+                TypedDerivationCodec::<FeatureStructureAlgebra, DisplayCodec>::new(DisplayCodec),
+            );
+            (
+                InterpretationKind::OutputOnly,
+                Box::new(algebra),
+                signature,
+                renderer,
+            )
         } else if decl.algebra == TREE_WITH_ARITIES_ALGEBRA {
             let signature = algebra_signatures.remove(&decl.name).unwrap_or_default();
             let algebra = TreeAlgebra::with_arities(signature.clone());
-            let renderer =
-                Box::new(TypedDerivationCodec::<TreeAlgebra, DisplayCodec>::new(DisplayCodec));
+            let renderer = Box::new(TypedDerivationCodec::<TreeAlgebra, DisplayCodec>::new(
+                DisplayCodec,
+            ));
             (
                 InterpretationKind::OutputOnly,
                 Box::new(algebra),
@@ -965,10 +1567,9 @@ fn build_irtg(ast: AstIrtg) -> Result<Irtg, IrtgError> {
             let signature = algebra_signatures.remove(&decl.name).unwrap_or_default();
             let append = signature.get(APPEND_SYMBOL);
             let algebra = Binarizing::new(TreeAlgebra::with_arities(signature.clone()), append);
-            let renderer = Box::new(TypedDerivationCodec::<
-                Binarizing<TreeAlgebra>,
-                DisplayCodec,
-            >::new(DisplayCodec));
+            let renderer = Box::new(
+                TypedDerivationCodec::<Binarizing<TreeAlgebra>, DisplayCodec>::new(DisplayCodec),
+            );
             (
                 InterpretationKind::OutputOnly,
                 Box::new(algebra),
@@ -1471,5 +2072,69 @@ mod tests {
             .unwrap();
 
         assert!(result.is_some(), "expected a best tree for 'john watches'");
+    }
+
+    fn tiny_tag_irtg() -> &'static [u8] {
+        br#"
+        interpretation string: de.up.ling.irtg.algebra.TagStringAlgebra
+        interpretation tree: de.up.ling.irtg.algebra.TagTreeAlgebra
+
+        S! -> r
+          [string] *WRAP21*(*CONC12*(a, *EE*), b)
+          [tree] @(*, f(a))
+        "#
+    }
+
+    #[test]
+    fn tag_string_and_tree_are_both_parse_inputs() {
+        let irtg = parse_irtg(tiny_tag_irtg()).unwrap();
+        let string = irtg.interpretation::<TagStringAlgebra>("string").unwrap();
+        let tree = irtg.interpretation::<TagTreeAlgebra>("tree").unwrap();
+        let string_value = string.parse_object("a b").unwrap();
+        let tree_value = tree.parse_object("f(a)").unwrap();
+
+        let chart = irtg
+            .parse([string.input(string_value), tree.input(tree_value)])
+            .unwrap();
+        assert!(chart.automaton.viterbi().is_some());
+    }
+
+    #[test]
+    fn tag_inputs_support_generic_zero_astar() {
+        let irtg = parse_irtg(tiny_tag_irtg()).unwrap();
+        let string = irtg.interpretation::<TagStringAlgebra>("string").unwrap();
+        let value = string.parse_object("a b").unwrap();
+        let result = irtg
+            .best_with(
+                [string.input(value)],
+                &MaterializationStrategy::Astar {
+                    heuristic: AstarHeuristic::Zero,
+                    options: AstarOptions {
+                        stop_at_first_goal: true,
+                        beam: None,
+                    },
+                },
+            )
+            .unwrap();
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn binarized_tag_tree_is_inputable() {
+        let irtg = parse_irtg(
+            br#"
+            interpretation tree: de.up.ling.irtg.algebra.BinarizingTagTreeAlgebra
+
+            S! -> r
+              [tree] f(_@_(a, _@_(b, c)))
+            "# as &[u8],
+        )
+        .unwrap();
+        let tree = irtg
+            .interpretation::<Binarizing<TagTreeAlgebra>>("tree")
+            .unwrap();
+        let value = tree.parse_object("f(a, b, c)").unwrap();
+        let chart = irtg.parse([tree.input(value)]).unwrap();
+        assert!(chart.automaton.viterbi().is_some());
     }
 }

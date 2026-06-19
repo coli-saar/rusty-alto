@@ -1,3 +1,5 @@
+//! Compact IDs for automaton states, ranked symbols, and arities.
+
 use std::fmt;
 
 /// Dense integer identifier for an automaton state.

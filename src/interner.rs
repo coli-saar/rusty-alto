@@ -1,3 +1,5 @@
+//! Stable interning from hashable values to dense [`StateId`]s.
+
 use crate::{FxHashMap, StateId};
 use std::hash::Hash;
 

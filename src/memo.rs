@@ -1,3 +1,5 @@
+//! Memoizing adapter from rich implicit states to dense state IDs.
+
 use crate::{
     BottomUpTa, DetBottomUpTa, Explicit, ExplicitBuilder, FxHashMap, IndexedBottomUpTa, Interner,
     StateId, Symbol, TopDownTa,

@@ -105,15 +105,39 @@ Parseval configuration, and extended examples.
 
 ### Interactive parser
 
-The default `rusty-alto` binary is a small interactive frontend for a grammar
-with a string interpretation:
+The default `rusty-alto` binary is a small interactive frontend for Alto
+`.irtg` grammars and Tulipac `.tag` grammars:
 
 ```sh
 cargo run --release -- grammar.irtg
+cargo run --release -- grammar.tag
 ```
 
+The file extension selects the input codec. Tulipac grammars support
+`#include` directives and automatically use their feature-structure
+interpretation as a parse filter when one is present.
+
 Enter one sentence per line; press Ctrl-D to stop. When stdin is redirected,
-the binary processes one sentence per input line.
+the binary processes one sentence per input line:
+
+```sh
+printf '%s\n' 'the dog runs' | cargo run --release -- grammar.tag
+```
+
+For each successful parse, the frontend prints timings, the best derivation
+tree, and every interpretation value. It intentionally does not echo or number
+the input sentence:
+
+```text
+Timing: total=12.4ms parse=10.8ms viterbi=0.3ms input=1.3ms
+Derivation: r1(r7, r12)
+ft: [...]
+string: the dog runs
+tree: S(NP(the, dog), VP(runs))
+```
+
+Sentences outside the grammar are reported as `No parse.`. Grammar-loading and
+input errors are written to standard error.
 
 ## Library sketch
 
@@ -137,6 +161,13 @@ decomposition automata, and composed automata share this interface. Optional
 refinement traits expose indexed, condensed, deterministic, and top-down views
 when an algorithm can use them efficiently.
 
+Input codecs implement `InputCodec<T>`. `IrtgInputCodec` reads Alto IRTGs;
+`TulipacInputCodec` reads Tulipac TAG grammars and converts them to IRTGs with
+`string`, `tree`, and—when feature annotations occur—`ft` interpretations.
+Use `TulipacInputCodec::read_path` when the grammar contains relative
+`#include` directives. Feature constraints can be applied to a parse chart
+with `irtg.filter_non_null(&chart.automaton, "ft")`.
+
 ## Alto compatibility and performance
 
 The implementation is heavily inspired by Alto, including its IRTG model,
@@ -159,10 +190,10 @@ measured bottlenecks.
 
 ## Project status
 
-Supported interpretation algebras currently include Alto string algebras and
-tree-with-arities variants. String interpretations can be used as parse input;
-tree interpretations are currently output-only. APIs and file-format coverage
-may still change as the implementation matures.
+Supported interpretation algebras include Alto string, TAG string, tree-with-arities,
+TAG tree, and their binarizing variants. String and TAG interpretations can be used
+as parse inputs; ordinary tree-with-arities interpretations remain output-only.
+APIs and file-format coverage may still change as the implementation matures.
 
 ## Publishing
 

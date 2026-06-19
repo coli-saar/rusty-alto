@@ -1,3 +1,5 @@
+//! Algorithms that explore implicit automata and materialize intersections.
+
 use crate::{
     Arity, BottomUpTa, CondensedTa, CondensedTopDownTa, Explicit, ExplicitBuilder, FxHashSet,
     Interner, KeySet, Memo, SetTrie, StateId, Symbol, SymbolSet, run::cartesian_product,

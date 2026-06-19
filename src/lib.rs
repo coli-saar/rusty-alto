@@ -52,6 +52,7 @@ lalrpop_util::lalrpop_mod!(
     alto_grammar
 );
 pub mod codec;
+pub mod codecs;
 pub mod combinators;
 pub mod corpus;
 pub mod explicit;
@@ -73,8 +74,14 @@ pub mod traits;
 pub mod viterbi;
 
 pub use algebras::{
-    APPEND_SYMBOL, Algebra, Binarizing, EvaluatingDecompositionAutomaton, SentenceSxHeuristic, Span,
-    StringAlgebra, StringDecompositionAutomaton, TreeAlgebra, TreeValue, UniversalSxHeuristic,
+    APPEND_SYMBOL, Algebra, BinarizedTagTreeDecompositionAutomaton, BinarizedTagTreeState,
+    Binarizing, CONC11, CONC12, CONC21, EvaluatingDecompositionAutomaton, FS_EMBED_AUX_PREFIX,
+    FS_EMBED_PREFIX, FS_PROJECT_PREFIX, FS_UNIFY, FeatureStructure, FeatureStructureAlgebra,
+    FeatureStructureFilter, FeatureStructureParseError, SentenceSxHeuristic, Span, StringAlgebra,
+    StringDecompositionAutomaton, TAG_E, TAG_EE, TAG_HOLE, TAG_SUBSTITUTE, TagSpan,
+    TagStringAlgebra, TagStringDecompositionAutomaton, TagStringValue, TagTreeAlgebra,
+    TagTreeContext, TagTreeDecompositionAutomaton, TreeAlgebra, TreeValue, UniversalSxHeuristic,
+    WRAP21, WRAP22,
 };
 pub use application::{
     AutomatonSummary, InterpretationInfo, ParseStrategy, RenderedInterpretation, RenderedValue,
@@ -89,7 +96,10 @@ pub use astar::{
     materialize_astar_viterbi_forest, materialize_astar_viterbi_forest_with,
     materialize_astar_string_intersection_with_prepared,
 };
-pub use codec::{DisplayCodec, OutputCodec, SpaceJoinCodec};
+pub use codec::{
+    DisplayCodec, InputCodec, InputCodecReadError, IrtgInputCodec, OutputCodec, SpaceJoinCodec,
+};
+pub use codecs::{TulipacError, TulipacInputCodec};
 pub use combinators::{Determinized, InvHom, Mapped, Product};
 pub use corpus::{Corpus, CorpusError, CorpusWriter, Instance, read_corpus};
 pub use explicit::{Explicit, ExplicitBuildError, ExplicitBuilder, Rule};

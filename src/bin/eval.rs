@@ -10,8 +10,9 @@
 use rusty_alto::{
     AstarHeuristic, AstarOptions, AstarStats, Binarizing, CorpusWriter, EvalbParams, Instance,
     Irtg, LogProbabilityScorer, MaterializationStrategy, ObligatoryLeafTables, OutsideHeuristic,
-    ParsevalCounts, ParsevalSkip, PreparedAstarGrammar, Symbol, TreeAlgebra, TreeValue,
-    UniversalSxHeuristic, ViterbiTree, compare_trees, count_gold, parse_irtg, read_corpus,
+    ParsevalCounts, ParsevalSkip, PreparedAstarGrammar, Symbol, TagTreeAlgebra, TreeAlgebra,
+    TreeValue, UniversalSxHeuristic, ViterbiTree, compare_trees, count_gold, parse_irtg,
+    read_corpus,
 };
 use packed_term_arena::{parser::parse_tree, tree::TreeArena};
 use std::{
@@ -62,6 +63,8 @@ struct Args {
 enum TreeInterpretationKind {
     Plain,
     Binarizing,
+    Tag,
+    BinarizingTag,
 }
 
 struct ParsedInstance {
@@ -527,6 +530,13 @@ fn prepare_parseval(args: &Args, irtg: &Irtg) -> Result<Option<ParsevalConfig>, 
         TreeInterpretationKind::Plain
     } else if irtg.interpretation::<Binarizing<TreeAlgebra>>(name).is_ok() {
         TreeInterpretationKind::Binarizing
+    } else if irtg.interpretation::<TagTreeAlgebra>(name).is_ok() {
+        TreeInterpretationKind::Tag
+    } else if irtg
+        .interpretation::<Binarizing<TagTreeAlgebra>>(name)
+        .is_ok()
+    {
+        TreeInterpretationKind::BinarizingTag
     } else {
         return Err(format!(
             "Parseval interpretation {name:?} uses {}, not a supported constituency-tree algebra",
@@ -559,6 +569,12 @@ fn evaluate_tree(
             .interpret_derivation(arena, root)?,
         TreeInterpretationKind::Binarizing => irtg
             .interpretation::<Binarizing<TreeAlgebra>>(name)?
+            .interpret_derivation(arena, root)?,
+        TreeInterpretationKind::Tag => irtg
+            .interpretation::<TagTreeAlgebra>(name)?
+            .interpret_derivation(arena, root)?,
+        TreeInterpretationKind::BinarizingTag => irtg
+            .interpretation::<Binarizing<TagTreeAlgebra>>(name)?
             .interpret_derivation(arena, root)?,
     })
 }
