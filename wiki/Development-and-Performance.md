@@ -30,12 +30,12 @@ cargo build --release --bin eval
 
 Release mode is essential for meaningful parser timings.
 
-## Documentation maintenance
+## Package and API documentation
 
-The `Documentation` GitHub Actions workflow builds rustdoc with warnings
-treated as errors. Pull requests therefore catch stale intra-doc links and
-invalid examples. Successful builds on `main` publish the result to GitHub
-Pages.
+The `Package and publish` GitHub Actions workflow runs tests and verifies the
+crates.io archive on pull requests and pushes to `main`. Publishing a matching
+GitHub Release uploads the crate to crates.io. docs.rs then builds and hosts the
+public API documentation for that immutable release.
 
 Wiki source lives in `wiki/` in the main repository. The `Wiki` workflow
 synchronizes it to GitHub's separate wiki repository after changes reach

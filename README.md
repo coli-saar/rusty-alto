@@ -29,8 +29,8 @@ scores.
 
 The [project wiki](https://github.com/coli-saar/rusty-alto/wiki) explains the
 architecture and the main design decisions. The
-[Rust API documentation](https://coli-saar.github.io/rusty-alto/rusty_alto/)
-is rebuilt from `main`.
+[Rust API documentation](https://docs.rs/rusty-alto) is published by docs.rs
+for every crates.io release.
 
 ## Building
 
@@ -161,6 +161,18 @@ tree-with-arities variants. String interpretations can be used as parse input;
 tree interpretations are currently output-only. APIs and file-format coverage
 may still change as the implementation matures.
 
+## Publishing
+
+Pull requests and pushes to `main` run the full test suite and verify the exact
+crate archive with `cargo package`. Publishing is triggered by creating a
+GitHub Release whose tag matches the version in `Cargo.toml`, for example
+`v0.1.0`.
+
+Repository maintainers must configure a `CARGO_REGISTRY_TOKEN` secret in the
+`crates-io` GitHub environment. See
+[`docs/publishing.md`](docs/publishing.md) for the complete release checklist.
+
 ## License
 
-To be determined.
+Licensed under the Apache License, Version 2.0. See
+[`LICENSE-APACHE`](LICENSE-APACHE).

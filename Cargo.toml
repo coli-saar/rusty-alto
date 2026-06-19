@@ -2,7 +2,27 @@
 name = "rusty-alto"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 default-run = "rusty-alto"
+description = "Weighted tree automata and interpreted regular tree grammars with Alto-compatible I/O"
+license = "Apache-2.0"
+repository = "https://github.com/coli-saar/rusty-alto"
+homepage = "https://github.com/coli-saar/rusty-alto"
+documentation = "https://docs.rs/rusty-alto"
+readme = "README.md"
+keywords = ["tree-automata", "irtg", "parsing", "grammar", "nlp"]
+categories = ["algorithms", "parsing", "science"]
+publish = ["crates-io"]
+include = [
+    "/src/**",
+    "/benches/**",
+    "/build.rs",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/LICENSE-APACHE",
+    "/README.md",
+    "/docs/publishing.md",
+]
 
 [dependencies]
 fixedbitset = "0.5"

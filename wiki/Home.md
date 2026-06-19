@@ -26,7 +26,7 @@ Start here:
   `packed-term-arena`.
 
 For the public Rust API, see the
-[generated cargo documentation](https://coli-saar.github.io/rusty-alto/rusty_alto/).
+[generated cargo documentation](https://docs.rs/rusty-alto).
 For command-line usage, see the
 [README](https://github.com/coli-saar/rusty-alto#readme) and
 [`docs/eval.md`](https://github.com/coli-saar/rusty-alto/blob/main/docs/eval.md).
