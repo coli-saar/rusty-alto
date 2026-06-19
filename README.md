@@ -1,7 +1,7 @@
 # rusty-alto
 
-[![Crates.io](https://img.shields.io/crates/v/rusty-alto.svg)](https://crates.io/crates/rusty-alto)
-[![Documentation](https://docs.rs/rusty-alto/badge.svg)](https://docs.rs/rusty-alto)
+[![Crates.io](https://img.shields.io/crates/v/rusty-alto.svg?cacheSeconds=300)](https://crates.io/crates/rusty-alto)
+[![Documentation](https://img.shields.io/docsrs/rusty-alto?cacheSeconds=300)](https://docs.rs/rusty-alto)
 
 `rusty-alto` is a fast Rust library and command-line toolkit for weighted
 bottom-up tree automata and interpreted regular tree grammars (IRTGs). It reads
