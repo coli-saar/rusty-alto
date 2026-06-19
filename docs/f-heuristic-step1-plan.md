@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use std::env;
 use rusty_alto::{parse_irtg, Explicit, StateId, Symbol, StringAlgebra, BottomUpTa};
 use rusty_alto::homomorphism::HomLabel;          // also: rusty_alto::HomLabel
-use rusty_tree::tree::{Tree, TreeArena};         // same crate string.rs already uses
+use packed_term_arena::tree::{Tree, TreeArena};         // same crate string.rs already uses
 ```
 
 Relevant APIs (all `pub`):

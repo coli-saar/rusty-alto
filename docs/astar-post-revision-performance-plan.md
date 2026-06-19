@@ -243,8 +243,8 @@ copy traffic affect both RSS and cache locality.
 - Test arbitrary-arity fallback rules so spills remain correct.
 
 If the compact child tuple is sufficiently general, consider proposing it to
-`rusty-tree` rather than adding general-purpose tree tuple handling here. Do not
-modify `rusty-tree` as part of this work.
+`packed-term-arena` rather than adding general-purpose tree tuple handling here. Do not
+modify `packed-term-arena` as part of this work.
 
 ## P5 — Complete Prepared Grammar Reuse
 

@@ -1,5 +1,5 @@
 use crate::{FxHashMap, Symbol};
-use rusty_tree::tree::{MutAlgebra, Tree, TreeArena};
+use packed_term_arena::tree::{MutAlgebra, Tree, TreeArena};
 use smallvec::SmallVec;
 use thiserror::Error;
 

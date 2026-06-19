@@ -1,7 +1,7 @@
 use rusty_alto::{
     BottomUpTa, DetBottomUpTa, ParsedTreeAutomaton, Signature, StateId, Symbol, parse_alto,
 };
-use rusty_tree::tree::{Tree, TreeArena};
+use packed_term_arena::tree::{Tree, TreeArena};
 use std::collections::HashSet;
 use std::env;
 use std::fs;

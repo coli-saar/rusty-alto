@@ -510,8 +510,8 @@ enum YieldToken {
 
 /// Walk the frontier of a homomorphism term left-to-right, producing yield tokens.
 fn walk_frontier(
-    arena: &rusty_tree::tree::TreeArena<HomLabel>,
-    node: rusty_tree::tree::Tree,
+    arena: &packed_term_arena::tree::TreeArena<HomLabel>,
+    node: packed_term_arena::tree::Tree,
 ) -> Vec<YieldToken> {
     match *arena.get_label(node) {
         HomLabel::Var(i) => vec![YieldToken::Child(i)],
@@ -1796,7 +1796,7 @@ mod tests {
     ) {
         use crate::ExplicitBuilder;
 
-        let mut hom_arena = rusty_tree::tree::TreeArena::new();
+        let mut hom_arena = packed_term_arena::tree::TreeArena::new();
 
         // Build word symbols and concat
         let mut sig = crate::Signature::new();

@@ -31,8 +31,8 @@ Two practical complications shape the trait surface:
 
 **Tree dependencies**
 
-We are using `rusty-tree` to manage trees. Include a dependency to this package, it is installed locally for now.
-The source code is in `~/Documents/workspace/rusty-tree`.
+We are using `packed-term-arena` to manage trees. Include a dependency to this package, it is installed locally for now.
+The source code is in `~/Documents/workspace/packed-term-arena`.
 
 **No `serde`** in the initial implementation. We can add it later behind a feature flag.
 

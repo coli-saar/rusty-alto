@@ -9,8 +9,8 @@
 //! `corpus::{Corpus, CorpusWriter, Instance}`, generic over [`Read`]/[`Write`].
 
 use crate::{Irtg, Symbol};
-use rusty_tree::parser::parse_tree;
-use rusty_tree::tree::{Tree, TreeArena};
+use packed_term_arena::parser::parse_tree;
+use packed_term_arena::tree::{Tree, TreeArena};
 use std::any::Any;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use thiserror::Error;

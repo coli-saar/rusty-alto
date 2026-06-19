@@ -1,7 +1,7 @@
 //! One-best Viterbi extraction for explicit weighted tree automata.
 
 use crate::{Explicit, ProbabilityScorer, StateId, Symbol, TopDownTa, WeightScorer};
-use rusty_tree::tree::{Tree, TreeArena};
+use packed_term_arena::tree::{Tree, TreeArena};
 use smallvec::SmallVec;
 
 /// The highest-weighted tree found in an automaton language.

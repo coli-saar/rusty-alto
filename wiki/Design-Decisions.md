@@ -92,9 +92,9 @@ The Rust implementation keeps those semantic lessons while using ownership,
 dense storage, borrowed lookups, and monomorphized fast paths where they make
 the implementation cleaner or faster.
 
-## Keep general tree functionality in rusty-tree
+## Keep general tree functionality in packed-term-arena
 
-`rusty-alto` uses `rusty-tree` as its arena representation. General operations
+`rusty-alto` uses `packed-term-arena` as its arena representation. General operations
 such as traversal, copying, parsing, or tree display should be proposed for
-`rusty-tree` rather than reimplemented locally. This repository should contain
+`packed-term-arena` rather than reimplemented locally. This repository should contain
 tree code only when it is specific to automata, grammars, or evaluation.

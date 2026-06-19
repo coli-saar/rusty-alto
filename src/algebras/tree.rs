@@ -16,8 +16,8 @@
 //! provide decomposition, so an interpretation backed by them cannot be a parse input.
 
 use crate::{Algebra, Signature, Symbol};
-use rusty_tree::parser::{TreeParseError, parse_tree};
-use rusty_tree::tree::{Tree, TreeArena};
+use packed_term_arena::parser::{TreeParseError, parse_tree};
+use packed_term_arena::tree::{Tree, TreeArena};
 use std::cell::RefCell;
 use std::fmt;
 
@@ -289,7 +289,7 @@ mod tests {
         signature
     }
 
-    /// Build a `TreeArena<Symbol>` term from a rusty_tree-parsed repr (symbols must be in `sig`).
+    /// Build a `TreeArena<Symbol>` term from a packed_term_arena-parsed repr (symbols must be in `sig`).
     fn term(signature: &Signature, repr: &str) -> (TreeArena<Symbol>, Tree) {
         let mut str_arena = TreeArena::new();
         let root = parse_tree(&mut str_arena, repr).unwrap();
@@ -335,7 +335,7 @@ mod tests {
     #[test]
     fn binarizing_unbinarizes_then_strips() {
         // S_3('_@_'(NP_0, '_@_'(V_0, NP_0))) -> S(NP, V, NP). `_@_` is quoted only because this
-        // test parses via rusty_tree; real hom images are built by `Homomorphism::apply`.
+        // test parses via packed_term_arena; real hom images are built by `Homomorphism::apply`.
         let signature = sig(&[("S_3", 3), ("NP_0", 0), ("V_0", 0), (APPEND_SYMBOL, 2)]);
         let inner = TreeAlgebra::with_arities(signature.clone());
         let algebra = Binarizing::new(inner, signature.get(APPEND_SYMBOL));

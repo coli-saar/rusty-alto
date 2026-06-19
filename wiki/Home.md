@@ -23,7 +23,7 @@ Start here:
   performance trade-offs that shape the implementation.
 - [Development and performance](Development-and-Performance) describes the
   repository layout, testing, benchmarking, and the relationship with Alto and
-  `rusty-tree`.
+  `packed-term-arena`.
 
 For the public Rust API, see the
 [generated cargo documentation](https://coli-saar.github.io/rusty-alto/rusty_alto/).

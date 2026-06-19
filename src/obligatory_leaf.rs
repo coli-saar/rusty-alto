@@ -22,7 +22,7 @@ use crate::{
     Symbol, TopDownTa,
 };
 use crate::combinators::InvHom;
-use rusty_tree::tree::{Tree, TreeArena};
+use packed_term_arena::tree::{Tree, TreeArena};
 use std::collections::BTreeMap;
 
 /// Build-time sparse leaf multiset: leaf-symbol id -> count.

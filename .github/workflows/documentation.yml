@@ -24,12 +24,6 @@ jobs:
         with:
           path: rusty-alto
 
-      - name: Check out rusty-tree
-        uses: actions/checkout@v4
-        with:
-          repository: alexanderkoller/rusty-tree
-          path: rusty-tree
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 

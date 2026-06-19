@@ -29,7 +29,7 @@ use crate::{
     viterbi::{Backpointer, ViterbiTree, build_tree_from_arena},
 };
 use fixedbitset::FixedBitSet;
-use rusty_tree::tree::TreeArena;
+use packed_term_arena::tree::TreeArena;
 use smallvec::SmallVec;
 use std::hash::Hash;
 

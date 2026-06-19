@@ -13,7 +13,7 @@
 
 use rusty_alto::homomorphism::HomLabel;
 use rusty_alto::{parse_irtg, StateId, StringAlgebra, Symbol, TopDownTa};
-use rusty_tree::tree::Tree;
+use packed_term_arena::tree::Tree;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::File;
@@ -71,7 +71,7 @@ fn bag_min(a: &Bag, b: &Bag) -> Bag {
 // ---------------------------------------------------------------------------
 
 fn frontier(
-    arena: &rusty_tree::tree::TreeArena<HomLabel>,
+    arena: &packed_term_arena::tree::TreeArena<HomLabel>,
     node: Tree,
     children: &[StateId],
     out: &mut Vec<Tok>,

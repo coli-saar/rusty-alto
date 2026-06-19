@@ -13,7 +13,7 @@ use rusty_alto::{
     ParsevalCounts, ParsevalSkip, PreparedAstarGrammar, Symbol, TreeAlgebra, TreeValue,
     UniversalSxHeuristic, ViterbiTree, compare_trees, count_gold, parse_irtg, read_corpus,
 };
-use rusty_tree::{parser::parse_tree, tree::TreeArena};
+use packed_term_arena::{parser::parse_tree, tree::TreeArena};
 use std::{
     env,
     error::Error,
@@ -551,7 +551,7 @@ fn evaluate_tree(
     name: &str,
     kind: TreeInterpretationKind,
     arena: &TreeArena<Symbol>,
-    root: rusty_tree::tree::Tree,
+    root: packed_term_arena::tree::Tree,
 ) -> Result<TreeValue, Box<dyn Error>> {
     Ok(match kind {
         TreeInterpretationKind::Plain => irtg

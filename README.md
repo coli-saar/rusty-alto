@@ -25,7 +25,7 @@ scores.
 - Viterbi extraction, sorted language enumeration, corpus output, and
   EVALB-style Parseval scoring.
 - Trees represented with
-  [`rusty-tree`](https://github.com/alexanderkoller/rusty-tree).
+  [`packed-term-arena`](https://crates.io/crates/packed-term-arena).
 
 The [project wiki](https://github.com/coli-saar/rusty-alto/wiki) explains the
 architecture and the main design decisions. The
@@ -34,13 +34,9 @@ is rebuilt from `main`.
 
 ## Building
 
-The project currently uses a sibling checkout of `rusty-tree`. Clone both
-repositories into the same directory:
+Clone the repository:
 
 ```sh
-mkdir rusty-alto-workspace
-cd rusty-alto-workspace
-git clone https://github.com/alexanderkoller/rusty-tree.git
 git clone https://github.com/coli-saar/rusty-alto.git
 cd rusty-alto
 ```

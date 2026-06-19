@@ -1,6 +1,6 @@
 use crate::{BottomUpTa, DetBottomUpTa, StateId, Symbol};
 use fixedbitset::FixedBitSet;
-use rusty_tree::tree::{Tree, TreeArena};
+use packed_term_arena::tree::{Tree, TreeArena};
 use smallvec::SmallVec;
 
 /// Side table produced by [`run_det`].

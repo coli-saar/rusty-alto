@@ -4,7 +4,7 @@ use crate::{
     run::cartesian_product,
     traits::{CondensedTa, CondensedTopDownTa, StateUniverse, SymbolSet, TopDownTa},
 };
-use rusty_tree::tree::TreeArena;
+use packed_term_arena::tree::TreeArena;
 use smallvec::SmallVec;
 
 /// Nondeleting inverse-homomorphism automaton.

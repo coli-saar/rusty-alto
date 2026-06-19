@@ -1,13 +1,13 @@
 # Tree Integration Notes
 
-rusty-tree's `TreeArena<E>` now has `len()`, `is_empty()`, `post_order()`, `copy_into()`, and `dup_subtree()`. This makes it straightforward to bridge `TreeArena` with rusty-alto's `Arena` trait and to clean up a manual reimplementation.
+packed-term-arena's `TreeArena<E>` now has `len()`, `is_empty()`, `post_order()`, `copy_into()`, and `dup_subtree()`. This makes it straightforward to bridge `TreeArena` with rusty-alto's `Arena` trait and to clean up a manual reimplementation.
 
 ## 1. `Tree` as `NodeId`
 
 `Tree` already satisfies the `NodeId` contract: it's `Copy + Eq + Hash` and has `fn index(self) -> usize`. One impl in `src/arena.rs`:
 
 ```rust
-impl crate::NodeId for rusty_tree::tree::Tree {
+impl crate::NodeId for packed_term_arena::tree::Tree {
     fn index(self) -> usize {
         self.index()
     }
@@ -19,10 +19,10 @@ impl crate::NodeId for rusty_tree::tree::Tree {
 With `len()` and `post_order()` now available, the impl is mechanical. Add to `src/arena.rs`:
 
 ```rust
-impl crate::Arena for rusty_tree::tree::TreeArena<crate::Symbol> {
-    type NodeId = rusty_tree::tree::Tree;
-    type Children<'a> = std::iter::Copied<std::slice::Iter<'a, rusty_tree::tree::Tree>>;
-    type PostOrder<'a> = std::vec::IntoIter<rusty_tree::tree::Tree>;
+impl crate::Arena for packed_term_arena::tree::TreeArena<crate::Symbol> {
+    type NodeId = packed_term_arena::tree::Tree;
+    type Children<'a> = std::iter::Copied<std::slice::Iter<'a, packed_term_arena::tree::Tree>>;
+    type PostOrder<'a> = std::vec::IntoIter<packed_term_arena::tree::Tree>;
 
     fn len(&self) -> usize {
         self.len()

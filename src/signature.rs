@@ -1,5 +1,5 @@
 use crate::{FxHashMap, Symbol};
-use rusty_tree::tree::{Tree, TreeArena};
+use packed_term_arena::tree::{Tree, TreeArena};
 use std::fmt;
 
 /// Bidirectional map between external label names and dense [`Symbol`] IDs.

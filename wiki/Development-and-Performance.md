@@ -19,15 +19,8 @@
 
 ## Local build
 
-`rusty-tree` is currently a sibling path dependency:
-
-```text
-workspace/
-  rusty-alto/
-  rusty-tree/
-```
-
-From `rusty-alto`:
+`packed-term-arena` is downloaded from crates.io with the other Rust
+dependencies. From `rusty-alto`:
 
 ```sh
 cargo test
@@ -39,10 +32,10 @@ Release mode is essential for meaningful parser timings.
 
 ## Documentation maintenance
 
-The `Documentation` GitHub Actions workflow checks out both repositories and
-builds rustdoc with warnings treated as errors. Pull requests therefore catch
-stale intra-doc links and invalid examples. Successful builds on `main` publish
-the result to GitHub Pages.
+The `Documentation` GitHub Actions workflow builds rustdoc with warnings
+treated as errors. Pull requests therefore catch stale intra-doc links and
+invalid examples. Successful builds on `main` publish the result to GitHub
+Pages.
 
 Wiki source lives in `wiki/` in the main repository. The `Wiki` workflow
 synchronizes it to GitHub's separate wiki repository after changes reach

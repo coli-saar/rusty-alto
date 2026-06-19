@@ -2,7 +2,7 @@
 
 use crate::{Explicit, FxHashSet, StateId, Symbol, TopDownTa};
 use fixedbitset::FixedBitSet;
-use rusty_tree::tree::{Tree, TreeArena};
+use packed_term_arena::tree::{Tree, TreeArena};
 use std::{cmp::Ordering, collections::BinaryHeap, mem};
 
 /// A weighted tree generated from an automaton language.

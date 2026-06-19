@@ -18,7 +18,7 @@ use crate::{
     },
 };
 use lalrpop_util::ParseError;
-use rusty_tree::tree::{Tree, TreeArena};
+use packed_term_arena::tree::{Tree, TreeArena};
 use std::{any::Any, fmt, io::Read, marker::PhantomData, sync::Mutex};
 use thiserror::Error;
 

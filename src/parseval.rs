@@ -1,7 +1,7 @@
 //! Fast EVALB-style Parseval scoring for constituency trees.
 
 use crate::{FxHashMap, FxHashSet};
-use rusty_tree::tree::{Tree, TreeArena};
+use packed_term_arena::tree::{Tree, TreeArena};
 use smallvec::SmallVec;
 use std::{error::Error, fmt};
 
@@ -483,7 +483,7 @@ fn match_label_multisets(predicted: &[Constituent<'_>], gold: &[Constituent<'_>]
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusty_tree::parser::parse_tree;
+    use packed_term_arena::parser::parse_tree;
 
     fn tree(text: &str) -> (TreeArena<String>, Tree) {
         let mut arena = TreeArena::new();

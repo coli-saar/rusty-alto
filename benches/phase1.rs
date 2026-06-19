@@ -7,7 +7,7 @@ use rusty_alto::{
     StringDecompositionAutomaton, Symbol, TopDownTa, compare_trees, materialize,
     materialize_indexed_condensed_intersection, parse_irtg, run_det, run_nondet,
 };
-use rusty_tree::tree::{Tree, TreeArena};
+use packed_term_arena::tree::{Tree, TreeArena};
 use std::collections::HashSet;
 
 const A: Symbol = Symbol(0);

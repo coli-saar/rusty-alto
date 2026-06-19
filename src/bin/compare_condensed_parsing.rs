@@ -3,7 +3,7 @@ use rusty_alto::{
     StateUniverse, StringDecompositionAutomaton, Symbol, SymbolSet,
     materialize_indexed_condensed_intersection,
 };
-use rusty_tree::tree::TreeArena;
+use packed_term_arena::tree::TreeArena;
 use smallvec::SmallVec;
 use std::collections::VecDeque;
 use std::env;

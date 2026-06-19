@@ -28,7 +28,7 @@ use rusty_alto::{
     SentenceSxHeuristic, Span, StateId, StringAlgebra, StringDecompositionAutomaton, Symbol,
     TopDownTa, UniversalSxHeuristic,
 };
-use rusty_tree::tree::Tree;
+use packed_term_arena::tree::Tree;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -54,7 +54,7 @@ struct FlatRule {
 }
 
 fn frontier(
-    arena: &rusty_tree::tree::TreeArena<HomLabel>,
+    arena: &packed_term_arena::tree::TreeArena<HomLabel>,
     node: Tree,
     children: &[StateId],
     out: &mut Vec<Tok>,

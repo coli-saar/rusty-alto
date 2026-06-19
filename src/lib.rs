@@ -22,7 +22,7 @@
 //!
 //! ```
 //! use rusty_alto::*;
-//! use rusty_tree::tree::TreeArena;
+//! use packed_term_arena::tree::TreeArena;
 //!
 //! let a = Symbol(0);
 //! let f = Symbol(1);

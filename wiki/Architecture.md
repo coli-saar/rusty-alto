@@ -98,11 +98,11 @@ be frozen into an `Explicit` automaton.
 
 ## Trees and runs
 
-`rusty-tree` owns the general tree arena and parser. `run.rs` evaluates an
+`packed-term-arena` owns the general tree arena and parser. `run.rs` evaluates an
 automaton over a tree in post-order. Deterministic and nondeterministic runners
 are separate so the deterministic path can use one state per node.
 
-Tree operations that are broadly useful belong in `rusty-tree`; `rusty-alto`
+Tree operations that are broadly useful belong in `packed-term-arena`; `rusty-alto`
 should only add automaton-specific tree logic.
 
 ## IRTGs and algebras

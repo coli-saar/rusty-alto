@@ -5,7 +5,7 @@ mod string_astar;
 mod tree;
 
 use crate::{BottomUpTa, DetBottomUpTa, Signature, Symbol};
-use rusty_tree::tree::{Tree, TreeArena};
+use packed_term_arena::tree::{Tree, TreeArena};
 use std::hash::Hash;
 
 pub use string::{
