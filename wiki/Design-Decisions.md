@@ -92,6 +92,32 @@ The Rust implementation keeps those semantic lessons while using ownership,
 dense storage, borrowed lookups, and monomorphized fast paths where they make
 the implementation cleaner or faster.
 
+## Keep codecs typed by the values they consume or produce
+
+Input formats are grouped by their exact semantic result type. Thus `.irtg`
+and `.tag` are both `InputCodec<Irtg>` implementations, while `.auto` produces
+`ExplicitWithSignature`. Selecting a format by extension never requires
+erasing the decoded object type.
+
+Textual output codecs are similarly keyed by an algebra's standalone public
+value type. The algebra owns only its preferred display codec; all other
+textual encodings remain independent and become available automatically to
+every algebra with the matching value type.
+
+Codec metadata is intentionally lazy. Building file filters or Copy menus must
+not parse files, evaluate derivations, or encode values.
+
+## Keep signatures outside `Explicit`
+
+`Explicit` is the numeric, algorithm-facing automaton representation. It does
+not own a terminal signature because derived automata are frequently built
+from existing automata, and copying naming data would add cost and unclear
+ownership.
+
+Readers that must preserve source names return a document-level wrapper such
+as `ExplicitWithSignature`. Algorithms can immediately borrow or move out its
+`Explicit` field.
+
 ## Keep general tree functionality in packed-term-arena
 
 `rusty-alto` uses `packed-term-arena` as its arena representation. General operations

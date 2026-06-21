@@ -20,6 +20,21 @@
 //! subtrees. A node assigned `STUCK` did not match any transition rule, or one
 //! of its children was already stuck.
 //!
+//! # Grammars, algebras, and codecs
+//!
+//! [`Irtg`] combines a weighted grammar automaton with named homomorphisms and
+//! algebras. Built-in algebras cover strings, trees, TAG strings, TAG derived
+//! trees, and feature structures.
+//!
+//! [`InputCodecRegistry`] discovers file readers by their exact result type:
+//! both `.irtg` and Tulipac `.tag` codecs produce [`Irtg`], while `.auto`
+//! produces [`ExplicitWithSignature`]. [`OutputCodecRegistry`] discovers
+//! textual encodings by an algebra's public value type. An algebra's preferred
+//! GUI-neutral display is available through [`Algebra::visualize`].
+//!
+//! Codec metadata lookup is lazy: listing available formats does not read,
+//! evaluate, or encode anything.
+//!
 //! ```
 //! use rusty_alto::*;
 //! use packed_term_arena::tree::TreeArena;

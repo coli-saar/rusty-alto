@@ -3,10 +3,10 @@
 ## Conceptual layers
 
 ```text
-Alto files and corpora
+Alto files, Tulipac grammars, and corpora
         |
         v
- parsers + signatures  ----->  explicit grammar automaton
+ typed input codecs + signatures  ----->  explicit grammar automaton
         |                              |
         v                              v
  interpretations  -----> homomorphisms + algebra decomposition automata
@@ -82,6 +82,10 @@ used.
 `Explicit` is both a normal automaton and the materialized output of parsing
 and composition algorithms.
 
+It deliberately does not own a `Signature`. File readers that need to retain
+source symbol and state names return `ExplicitWithSignature`, keeping naming
+metadata at the document boundary without forcing derived automata to copy it.
+
 ## Lazy combinators
 
 The types in `combinators/` construct automaton views without copying all
@@ -114,12 +118,27 @@ An `Irtg` contains:
 - named interpretations.
 
 Each interpretation combines an algebra, an algebra signature, and a
-homomorphism from grammar symbols to algebra terms. Currently, string algebras
-can decompose observed inputs into automata. Tree-with-arities algebras can
-evaluate derivations but are output-only.
+homomorphism from grammar symbols to algebra terms. String, TAG string, and TAG
+derived-tree algebras can decompose observed inputs into automata.
+Tree-with-arities and feature-structure algebras can evaluate derivations but
+are output-only. Feature-structure filters can additionally reject derivations
+whose feature terms fail to evaluate.
 
 `alto_ast.rs`, `alto_grammar.lalrpop`, `alto.rs`, and `irtg.rs` implement the
 Alto-compatible syntax and construct the runtime representation.
+
+## Codecs and presentation
+
+`InputCodecRegistry` groups readers by their exact result type. The standard
+registry offers `.irtg` and Tulipac `.tag` readers for `Irtg`, and an `.auto`
+reader for `ExplicitWithSignature`. Selection by metadata or extension does not
+read the file.
+
+`OutputCodecRegistry` groups textual encodings by exact public algebra value
+type. Separately, every algebra owns one preferred display codec and exposes
+it through `Algebra::visualize`. This keeps algebra-specific presentation
+knowledge in the library while leaving widget layout, menus, and clipboard
+behavior to frontends.
 
 ## Results and evaluation
 

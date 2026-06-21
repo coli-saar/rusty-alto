@@ -8,6 +8,7 @@
 | `src/explicit.rs` | Stored weighted automata and lazy indexes. |
 | `src/combinators/` | Product, inverse homomorphism, mapping, determinization. |
 | `src/algebras/` | Algebra interfaces and string/tree implementations. |
+| `src/codec.rs`, `src/codecs/` | Typed codec registries and concrete grammar readers. |
 | `src/irtg.rs` | Interpretations and the high-level parsing API. |
 | `src/materialize.rs` | General and condensed chart construction. |
 | `src/astar.rs`, `src/astar/` | Exact one-best search and specialized indexes. |
@@ -76,3 +77,6 @@ Before accepting a performance change:
 Historical measurements and active bottleneck analyses live in `docs/`, in
 particular `docs/performance.md`, `docs/benchmark-results.md`, and the A*
 design notes.
+
+The GUI handoff for file loading, value visualization, and Copy menus is
+documented in `docs/codec-infrastructure.md`.

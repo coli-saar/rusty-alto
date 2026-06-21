@@ -1,9 +1,15 @@
 //! Typed input and output codecs.
 //!
-//! An [`OutputCodec`] is keyed on the public value type. Public values are self-contained (no
-//! interner ids), so codecs need no [`Signature`](crate::Signature). An algebra owns one codec
-//! that produces its preferred [`VisualRepresentation`]; independent textual codecs are stored in
-//! an [`OutputCodecRegistry`] and are available to every algebra with the same public value type.
+//! An [`InputCodec`] is keyed on the type it produces. [`InputCodecRegistry`]
+//! can therefore offer several formats for one semantic result, such as
+//! `.irtg` and `.tag` for [`Irtg`], without mixing in codecs for other types.
+//!
+//! An [`OutputCodec`] is keyed on the public value type. Public values are
+//! self-contained (no interner ids), so codecs need no
+//! [`Signature`](crate::Signature). An algebra owns one codec that produces
+//! its preferred [`VisualRepresentation`]; independent textual codecs are
+//! stored in an [`OutputCodecRegistry`] and are available to every algebra
+//! with the same public value type.
 //!
 //! Registry lookup is by exact Rust type. Listing codecs only returns their metadata and does not
 //! encode a value. A GUI can therefore evaluate a derivation on demand, call

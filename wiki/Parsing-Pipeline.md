@@ -5,7 +5,9 @@ match one or more observed inputs.
 
 ## 1. Read the grammar
 
-`parse_irtg` parses Alto syntax and builds:
+An `InputCodec<Irtg>` reads the grammar. The standard codec registry selects
+`.irtg` syntax directly or compiles a Tulipac `.tag` grammar to the same `Irtg`
+result type. The resulting grammar contains:
 
 - an explicit weighted tree automaton for grammar derivations;
 - a signature for grammar rule labels;
@@ -19,9 +21,11 @@ recognize strings or interpreted trees.
 A typed interpretation parses the external object. For a string algebra, the
 input text becomes a sequence of interned terminal symbols.
 
-The algebra then constructs a decomposition automaton for that value. Its
-states are spans, and it recognizes exactly the algebra terms that evaluate to
-the observed string.
+The algebra then constructs a decomposition automaton for that value. String
+states are spans; TAG string values may also represent discontinuous pairs,
+and TAG derived-tree decomposition uses subtrees and one-hole contexts. Each
+decomposition recognizes exactly the algebra terms that evaluate to the
+observed value.
 
 ## 3. Apply inverse homomorphism
 
@@ -95,6 +99,8 @@ tree. The direct A* interface returns the one-best derivation without requiring
 a full chart.
 
 The grammar signature resolves numeric rule symbols back to names. Each
-interpretation can then evaluate the derivation tree to produce its string or
-tree value. `eval` writes these values and the derivation into an annotated
-Alto corpus.
+interpretation can then evaluate the derivation tree to produce its public
+value. Its algebra-owned display codec chooses a GUI-neutral visual
+representation; independent textual output codecs provide Copy/export
+formats. `eval` writes interpretation values and the derivation into an
+annotated Alto corpus.

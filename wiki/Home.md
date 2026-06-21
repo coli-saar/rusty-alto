@@ -10,6 +10,8 @@ The main pieces are:
 - an explicit, indexed automaton representation;
 - lazy automaton combinators;
 - algebras, homomorphisms, and IRTG interpretations;
+- typed input/output codec registries and algebra-owned display codecs;
+- TAG string, TAG derived-tree, and feature-structure algebras;
 - materialization and A* algorithms that turn composed automata into parse
   charts or one-best derivations;
 - runners, Viterbi extraction, corpus I/O, and evaluation tools.
@@ -19,6 +21,8 @@ Start here:
 - [Architecture](Architecture) follows data through the main modules.
 - [Parsing pipeline](Parsing-Pipeline) explains how an IRTG and an input
   sentence become a derivation.
+- [Codec infrastructure](Codec-Infrastructure) explains format discovery,
+  algebra value visualization, and the GUI integration boundary.
 - [Design decisions](Design-Decisions) records the abstractions and
   performance trade-offs that shape the implementation.
 - [Development and performance](Development-and-Performance) describes the

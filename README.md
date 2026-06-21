@@ -17,7 +17,9 @@ scores.
 ## Highlights
 
 - Alto-compatible readers for `.auto` tree automata, `.irtg` grammars, and
-  corpus files.
+  corpus files, plus Tulipac `.tag` grammars compiled to IRTGs.
+- Typed input-codec discovery by result type and filename extension, and
+  typed output-codec discovery by algebra value type.
 - A small oracle-style automaton API that supports both stored and
   on-demand transitions.
 - Weighted explicit automata with lazy, arity-specialized indexes.
@@ -27,6 +29,8 @@ scores.
 - Exact one-best A* parsing with zero, outside, SX, and SXF heuristics.
 - Viterbi extraction, sorted language enumeration, corpus output, and
   EVALB-style Parseval scoring.
+- String, tree, TAG string, TAG tree, and feature-structure algebras, including
+  structured GUI-neutral value visualization.
 - Trees represented with
   [`packed-term-arena`](https://crates.io/crates/packed-term-arena).
 
@@ -161,12 +165,34 @@ decomposition automata, and composed automata share this interface. Optional
 refinement traits expose indexed, condensed, deterministic, and top-down views
 when an algorithm can use them efficiently.
 
-Input codecs implement `InputCodec<T>`. `IrtgInputCodec` reads Alto IRTGs;
-`TulipacInputCodec` reads Tulipac TAG grammars and converts them to IRTGs with
-`string`, `tree`, and—when feature annotations occur—`ft` interpretations.
-Use `TulipacInputCodec::read_path` when the grammar contains relative
-`#include` directives. Feature constraints can be applied to a parse chart
+Input codecs implement `InputCodec<T>` and are collected in an
+`InputCodecRegistry` by their exact result type. The standard registry maps
+both `.irtg` and `.tag` to `Irtg`; `.auto` maps to
+`ExplicitWithSignature`, preserving source symbol and state names without
+making `Explicit` own a signature:
+
+```rust
+use rusty_alto::{InputCodecRegistry, Irtg};
+
+let registry = InputCodecRegistry::standard();
+let path = std::path::Path::new("grammar.tag");
+let codec = registry.codec_for_path::<Irtg>(path)?;
+let irtg = codec.read_path(path)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+`TulipacInputCodec` compiles TAG grammars to IRTGs with `string`, `tree`,
+and—when feature annotations occur—`ft` interpretations. Its path reader
+resolves relative `#include` directives. Feature constraints can be applied
 with `irtg.filter_non_null(&chart.automaton, "ft")`.
+
+Output codecs implement `OutputCodec<V>` for a public algebra value type.
+`OutputCodecRegistry` discovers all textual encodings for that exact type,
+while each algebra owns one preferred display codec exposed through
+`Algebra::visualize`. Codec metadata can be inspected without parsing,
+evaluation, or encoding. See
+[`docs/codec-infrastructure.md`](docs/codec-infrastructure.md) for the complete
+API and the intended GUI integration.
 
 ## Alto compatibility and performance
 
@@ -190,17 +216,21 @@ measured bottlenecks.
 
 ## Project status
 
-Supported interpretation algebras include Alto string, TAG string, tree-with-arities,
-TAG tree, and their binarizing variants. String and TAG interpretations can be used
-as parse inputs; ordinary tree-with-arities interpretations remain output-only.
+Supported interpretation algebras include Alto string, TAG string,
+tree-with-arities, TAG tree, feature structures, and binarizing variants.
+String and TAG interpretations can be used as parse inputs; ordinary
+tree-with-arities and feature-structure interpretations remain output-only.
 APIs and file-format coverage may still change as the implementation matures.
+
+Release notes for version 0.2.0 are in
+[`docs/releases/0.2.0.md`](docs/releases/0.2.0.md).
 
 ## Publishing
 
 Pull requests and pushes to `main` run the full test suite and verify the exact
 crate archive with `cargo package`. Publishing is triggered by creating a
 GitHub Release whose tag matches the version in `Cargo.toml`, for example
-`v0.1.0`.
+`v0.2.0`.
 
 Repository maintainers must configure a `CARGO_REGISTRY_TOKEN` secret in the
 `crates-io` GitHub environment. See
