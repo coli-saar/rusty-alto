@@ -5,8 +5,8 @@
 
 use rusty_alto::{
     AstarHeuristic, AstarOptions, InvHom, Irtg, LogProbabilityScorer, MaterializationStrategy,
-    MinHeuristic, ObligatoryLeafTables, OutsideHeuristic, PreparedAstarGrammar, ScoredZeroHeuristic,
-    StringAlgebra, StringDecompositionAutomaton, UniversalSxHeuristic,
+    MinHeuristic, ObligatoryLeafTables, OutsideHeuristic, PreparedAstarGrammar,
+    ScoredZeroHeuristic, StringAlgebra, StringDecompositionAutomaton, UniversalSxHeuristic,
     astar_string_one_best_with_stats_prepared, parse_irtg,
 };
 use std::{
@@ -715,7 +715,10 @@ fn run_strategy(
             };
 
             // Obligatory-leaf F tables (grammar-only; this is F's whole precompute).
-            eprint!("\r{:<16} building obligatory-leaf tables... ", strategy.name());
+            eprint!(
+                "\r{:<16} building obligatory-leaf tables... ",
+                strategy.name()
+            );
             let _ = io::stderr().flush();
             let setup_start = Instant::now();
             let oblig =
@@ -936,7 +939,12 @@ fn run_astar_strategy(
             astar_string_one_best_with_stats_prepared(irtg.grammar(), prepared, &invhom, &h, scorer)
         }
         MaterializationStrategy::Astar {
-            heuristic: AstarHeuristic::UniversalSxF { table, oblig, n: sx_n },
+            heuristic:
+                AstarHeuristic::UniversalSxF {
+                    table,
+                    oblig,
+                    n: sx_n,
+                },
             ..
         } => {
             debug_assert_eq!(*sx_n, n);

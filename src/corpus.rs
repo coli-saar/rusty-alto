@@ -111,9 +111,7 @@ pub fn read_corpus<R: Read>(
     irtg: &Irtg,
     limit: Option<usize>,
 ) -> Result<Corpus, CorpusError> {
-    let all: Vec<String> = BufReader::new(reader)
-        .lines()
-        .collect::<io::Result<_>>()?;
+    let all: Vec<String> = BufReader::new(reader).lines().collect::<io::Result<_>>()?;
 
     let mut i = 0usize;
 
@@ -203,19 +201,18 @@ pub fn read_corpus<R: Read>(
                 .expect("interpretation validated while reading the header");
             // Only parse interpretations that can be parse inputs; output-only interpretations
             // (e.g. tree algebras) keep their raw text and are evaluated into, not parsed from.
-            let value = if interp.is_inputable() {
-                Some(
-                    interp
-                        .parse_object_erased(text)
-                        .map_err(|err| CorpusError::ObjectParse {
+            let value =
+                if interp.is_inputable() {
+                    Some(interp.parse_object_erased(text).map_err(|err| {
+                        CorpusError::ObjectParse {
                             line: lineno + 1,
                             interpretation: name.clone(),
                             message: err.to_string(),
-                        })?,
-                )
-            } else {
-                None
-            };
+                        }
+                    })?)
+                } else {
+                    None
+                };
             objects.push(InterpObject {
                 name: name.clone(),
                 text: text.clone(),
@@ -267,7 +264,11 @@ impl<W: Write> CorpusWriter<W> {
         interpretations: &[(String, String)],
         annotated: bool,
     ) -> io::Result<Self> {
-        let kind = if annotated { "annotated" } else { "unannotated" };
+        let kind = if annotated {
+            "annotated"
+        } else {
+            "unannotated"
+        };
         let blank = prefix.trim_end();
         writeln!(writer, "{prefix}IRTG {kind} corpus file, v1.0")?;
         writeln!(writer, "{blank}")?;
@@ -311,7 +312,8 @@ impl<W: Write> CorpusWriter<W> {
         if self.annotated {
             let tree_line = match derivation {
                 Some((arena, root)) => {
-                    let (resolved, resolved_root) = irtg.grammar_signature().resolve_tree(arena, root);
+                    let (resolved, resolved_root) =
+                        irtg.grammar_signature().resolve_tree(arena, root);
                     resolved_root.display(&resolved).to_string()
                 }
                 None => NULL_MARKER.to_string(),
@@ -348,7 +350,11 @@ V -> r5
         let mut inputs = Vec::new();
         for obj in &mut instance.objects {
             let value = obj.value.take().unwrap();
-            inputs.push(irtg.interpretation_ref(&obj.name).unwrap().input_erased(value));
+            inputs.push(
+                irtg.interpretation_ref(&obj.name)
+                    .unwrap()
+                    .input_erased(value),
+            );
         }
         irtg.best_with(inputs, &MaterializationStrategy::TopDownCondensed)
             .unwrap()
@@ -393,7 +399,9 @@ V -> r5
         // The derivation tree interprets back to the input yield.
         let interp = irtg.interpretation_ref("i").unwrap();
         assert_eq!(
-            interp.interpret_to_string(tree.arena(), tree.root()).unwrap(),
+            interp
+                .interpret_to_string(tree.arena(), tree.root())
+                .unwrap(),
             "john watches mary",
         );
 
@@ -437,7 +445,12 @@ V -> r5
         {
             let mut writer = CorpusWriter::new(&mut buf, &[], "# ", &interps, true).unwrap();
             writer
-                .write_instance(&irtg, &corpus.interpretation_order, None, &corpus.instances[0])
+                .write_instance(
+                    &irtg,
+                    &corpus.interpretation_order,
+                    None,
+                    &corpus.instances[0],
+                )
                 .unwrap();
         }
 

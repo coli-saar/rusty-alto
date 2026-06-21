@@ -1,8 +1,8 @@
 use super::Algebra;
 use crate::{
     BottomUpTa, CondensedTa, DetBottomUpTa, Explicit, FxHashMap, IndexedBottomUpTa, InvHom,
-    ProbabilityScorer, Signature, StateId, StateUniverse, Symbol, SymbolSet, TopDownTa,
-    WeightScorer,
+    OutputCodec, ProbabilityScorer, Signature, SpaceJoinCodec, StateId, StateUniverse, Symbol,
+    SymbolSet, TextVisualizationCodec, TopDownTa, VisualRepresentation, WeightScorer,
     heuristic::IntersectionHeuristic,
     homomorphism::{HomLabel, Homomorphism},
 };
@@ -172,6 +172,7 @@ impl SpanProductSiblingFinder {
 pub struct StringAlgebra {
     signature: Signature,
     concat: Symbol,
+    display_codec: TextVisualizationCodec<SpaceJoinCodec>,
 }
 
 impl StringAlgebra {
@@ -179,13 +180,21 @@ impl StringAlgebra {
     pub fn new() -> Self {
         let mut signature = Signature::new();
         let concat = signature.intern(CONCAT.to_owned(), 2).unwrap();
-        Self { signature, concat }
+        Self {
+            signature,
+            concat,
+            display_codec: TextVisualizationCodec::new(SpaceJoinCodec),
+        }
     }
 
     /// Create a string algebra from an existing operation signature.
     pub fn with_signature(mut signature: Signature) -> Self {
         let concat = signature.intern(CONCAT.to_owned(), 2).unwrap();
-        Self { signature, concat }
+        Self {
+            signature,
+            concat,
+            display_codec: TextVisualizationCodec::new(SpaceJoinCodec),
+        }
     }
 
     /// Return the concat operation symbol.
@@ -256,6 +265,10 @@ impl Algebra for StringAlgebra {
             .iter()
             .map(|&symbol| self.signature.resolve(symbol).to_owned())
             .collect()
+    }
+
+    fn visualize(&self, value: &Self::Value) -> VisualRepresentation {
+        self.display_codec.encode(value)
     }
 }
 
@@ -1103,11 +1116,8 @@ impl SxHeuristic {
                                 0
                             });
                             let child1_bi = &bi[child1_state.index()];
-                            for (w1, &bi1) in child1_bi
-                                .iter()
-                                .enumerate()
-                                .take(max_w1 + 1)
-                                .skip(mw1)
+                            for (w1, &bi1) in
+                                child1_bi.iter().enumerate().take(max_w1 + 1).skip(mw1)
                             {
                                 let w0 = remaining_for_children - w1;
                                 if mw0 < INF && w0 < mw0 {
@@ -1145,11 +1155,8 @@ impl SxHeuristic {
                                 0
                             });
                             let child0_bi = &bi[child0_state.index()];
-                            for (w0, &bi0) in child0_bi
-                                .iter()
-                                .enumerate()
-                                .take(max_w0 + 1)
-                                .skip(mw0)
+                            for (w0, &bi0) in
+                                child0_bi.iter().enumerate().take(max_w0 + 1).skip(mw0)
                             {
                                 let w1 = remaining_for_children - w0;
                                 if mw1 < INF && w1 < mw1 {

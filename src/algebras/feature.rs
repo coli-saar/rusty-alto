@@ -1,11 +1,17 @@
-//! Feature structures and the algebra used by Tulipac TAG grammars.
+//! General-purpose feature structures and their evaluation algebra.
 //!
 //! Values are immutable graphs. Repeated variables in a parsed literal denote
 //! reentrant nodes; unification preserves this sharing. The algebra implements
-//! Alto's `unify`, `proj_*`, `emb_*`, and `emba_*` operations.
+//! Alto's `unify`, `proj_*`, and `emb_*` operations, plus a general `remap_*`
+//! operation for selecting several top-level attributes in a single linear
+//! term. Higher-level formalisms compose these primitives without adding
+//! domain-specific attributes or operations to this algebra.
 
 use super::Algebra;
-use crate::{BottomUpTa, FxHashMap, Signature, Symbol};
+use crate::{
+    BottomUpTa, FeatureStructureVisualizationCodec, FxHashMap, OutputCodec, Signature, Symbol,
+    VisualRepresentation,
+};
 use std::{
     collections::{BTreeMap, HashMap},
     fmt,
@@ -17,8 +23,11 @@ pub const FS_UNIFY: &str = "unify";
 pub const FS_PROJECT_PREFIX: &str = "proj_";
 /// Prefix for unary embedding operations such as `emb_n1`.
 pub const FS_EMBED_PREFIX: &str = "emb_";
-/// Prefix for auxiliary-tree embedding operations such as `emba_n1t_n1b`.
-pub const FS_EMBED_AUX_PREFIX: &str = "emba_";
+/// Prefix for unary multi-attribute remapping operations.
+///
+/// A label such as `remap_left=first,right=second` selects `left` and `right`
+/// from its argument and returns them under `first` and `second`.
+pub const FS_REMAP_PREFIX: &str = "remap_";
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Node {
@@ -58,7 +67,7 @@ impl FeatureStructure {
         Some(graph.freeze(left))
     }
 
-    /// Return the value stored below a root attribute.
+    /// Return the value stored under a top-level attribute.
     pub fn project(&self, attribute: &str) -> Option<Self> {
         let Node::Map(attributes) = &self.nodes[0] else {
             return None;
@@ -75,23 +84,63 @@ impl FeatureStructure {
         self.with_new_root(vec![(attribute.to_owned(), 1)])
     }
 
-    /// Embed the source `root` and `foot` values under two new attributes.
-    pub fn embed_aux(&self, top: &str, bottom: &str) -> Option<Self> {
-        let root = self.attribute("root")? + 1;
-        let foot = self.attribute("foot")? + 1;
-        let mut attributes = vec![(top.to_owned(), root), (bottom.to_owned(), foot)];
-        attributes.sort_by(|left, right| left.0.cmp(&right.0));
-        Some(self.with_new_root(attributes))
-    }
-
-    fn attribute(&self, name: &str) -> Option<usize> {
-        let Node::Map(attributes) = &self.nodes[0] else {
+    /// Select and rename several top-level attributes.
+    ///
+    /// Each pair is `(source, target)`. The operation returns `None` when a
+    /// source attribute is absent or two mappings use the same target.
+    /// Reentrancies among selected values are preserved.
+    pub fn remap(&self, mappings: &[(&str, &str)]) -> Option<Self> {
+        let Node::Map(source_attributes) = &self.nodes[0] else {
             return None;
         };
-        attributes
-            .binary_search_by(|(candidate, _)| candidate.as_str().cmp(name))
-            .ok()
-            .map(|index| attributes[index].1)
+        let mut selected = Vec::with_capacity(mappings.len());
+        for &(source, target) in mappings {
+            let child = source_attributes
+                .binary_search_by(|(candidate, _)| candidate.as_str().cmp(source))
+                .ok()
+                .map(|index| source_attributes[index].1)?;
+            selected.push((target.to_owned(), child));
+        }
+        selected.sort_by(|left, right| left.0.cmp(&right.0));
+        if selected.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return None;
+        }
+
+        fn copy(
+            source: &FeatureStructure,
+            node: usize,
+            remap: &mut HashMap<usize, usize>,
+            target: &mut Vec<Node>,
+        ) -> usize {
+            if let Some(&mapped) = remap.get(&node) {
+                return mapped;
+            }
+            let mapped = target.len();
+            remap.insert(node, mapped);
+            target.push(Node::Variable);
+            target[mapped] = match &source.nodes[node] {
+                Node::Variable => Node::Variable,
+                Node::Atom(atom) => Node::Atom(atom.clone()),
+                Node::Map(attributes) => Node::Map(
+                    attributes
+                        .iter()
+                        .map(|(attribute, child)| {
+                            (attribute.clone(), copy(source, *child, remap, target))
+                        })
+                        .collect(),
+                ),
+            };
+            mapped
+        }
+
+        let mut nodes = vec![Node::Map(Vec::new())];
+        let mut remap = HashMap::new();
+        let attributes = selected
+            .into_iter()
+            .map(|(target, child)| (target, copy(self, child, &mut remap, &mut nodes)))
+            .collect();
+        nodes[0] = Node::Map(attributes);
+        Some(Self { nodes })
     }
 
     fn with_new_root(&self, attributes: Vec<(String, usize)>) -> Self {
@@ -299,19 +348,22 @@ enum Operation {
     Unify,
     Project(String),
     Embed(String),
-    EmbedAux(String, String),
+    Remap(Vec<(String, String)>),
     Literal(FeatureStructure),
     InvalidLiteral,
 }
 
-/// Alto-compatible feature-structure algebra.
+/// Feature-structure algebra compatible with Alto's general operations.
 ///
 /// Literal operation symbols parse to [`FeatureStructure`] values. Malformed
-/// literals and failed unifications make evaluation undefined.
+/// literals and failed operations make evaluation undefined. The `remap_*`
+/// extension keeps multi-attribute selection linear, so it can be used in
+/// inverse homomorphisms without repeating a source variable.
 #[derive(Clone, Debug)]
 pub struct FeatureStructureAlgebra {
     signature: Signature,
     operations: FxHashMap<Symbol, Operation>,
+    display_codec: FeatureStructureVisualizationCodec,
 }
 
 impl FeatureStructureAlgebra {
@@ -325,12 +377,10 @@ impl FeatureStructureAlgebra {
                 Operation::Unify
             } else if let Some(attribute) = label.strip_prefix(FS_PROJECT_PREFIX) {
                 Operation::Project(attribute.to_owned())
-            } else if let Some(attributes) = label.strip_prefix(FS_EMBED_AUX_PREFIX) {
-                let mut parts = attributes.splitn(2, '_');
-                Operation::EmbedAux(
-                    parts.next().unwrap_or_default().to_owned(),
-                    parts.next().unwrap_or_default().to_owned(),
-                )
+            } else if let Some(specification) = label.strip_prefix(FS_REMAP_PREFIX) {
+                parse_remappings(specification)
+                    .map(Operation::Remap)
+                    .unwrap_or(Operation::InvalidLiteral)
             } else if let Some(attribute) = label.strip_prefix(FS_EMBED_PREFIX) {
                 Operation::Embed(attribute.to_owned())
             } else {
@@ -344,6 +394,7 @@ impl FeatureStructureAlgebra {
         Self {
             signature,
             operations,
+            display_codec: FeatureStructureVisualizationCodec,
         }
     }
 
@@ -371,7 +422,13 @@ impl Algebra for FeatureStructureAlgebra {
             (Operation::Unify, [left, right]) => left.unify(right),
             (Operation::Project(attribute), [value]) => value.project(attribute),
             (Operation::Embed(attribute), [value]) => Some(value.embed(attribute)),
-            (Operation::EmbedAux(top, bottom), [value]) => value.embed_aux(top, bottom),
+            (Operation::Remap(mappings), [value]) => {
+                let mappings = mappings
+                    .iter()
+                    .map(|(source, target)| (source.as_str(), target.as_str()))
+                    .collect::<Vec<_>>();
+                value.remap(&mappings)
+            }
             (Operation::Literal(value), []) => Some(value.clone()),
             (Operation::InvalidLiteral, _) => None,
             _ => None,
@@ -385,6 +442,27 @@ impl Algebra for FeatureStructureAlgebra {
     fn to_external(&self, value: &Self::InternalValue) -> Self::Value {
         value.clone()
     }
+
+    fn visualize(&self, value: &Self::Value) -> VisualRepresentation {
+        self.display_codec.encode(value)
+    }
+}
+
+fn parse_remappings(specification: &str) -> Option<Vec<(String, String)>> {
+    if specification.is_empty() {
+        return None;
+    }
+    specification
+        .split(',')
+        .map(|mapping| {
+            let (source, target) = mapping.split_once('=')?;
+            if source.is_empty() || target.is_empty() || target.contains('=') {
+                None
+            } else {
+                Some((source.to_owned(), target.to_owned()))
+            }
+        })
+        .collect()
 }
 
 /// Bottom-up evaluator that rejects failed feature-structure operations.
@@ -556,10 +634,30 @@ mod tests {
     }
 
     #[test]
-    fn auxiliary_embedding_unifies_top_and_bottom() {
-        let core = FeatureStructure::parse("[n2t: [gen: #g], n2b: [gen: masc]]").unwrap();
-        let nop = FeatureStructure::parse("[foot: #1 [], root: #1]").unwrap();
-        let embedded = nop.embed_aux("n2t", "n2b").unwrap();
+    fn projection_embedding_and_unification_are_attribute_agnostic() {
+        let source = FeatureStructure::parse("[left: [gen: #g], right: [gen: masc]]").unwrap();
+        let left = source.project("left").unwrap().embed("target_a");
+        let right = source.project("right").unwrap().embed("target_b");
+        let embedded = left.unify(&right).unwrap();
+        let core = FeatureStructure::parse("[target_a: [gen: #g], target_b: [gen: masc]]").unwrap();
         assert!(core.unify(&embedded).is_some());
+    }
+
+    #[test]
+    fn remapping_selects_multiple_attributes_and_preserves_reentrancy() {
+        let source = FeatureStructure::parse("[left: #x [gen: masc], right: #x]").unwrap();
+        let remapped = source
+            .remap(&[("left", "first"), ("right", "second")])
+            .unwrap();
+        assert_eq!(
+            remapped,
+            FeatureStructure::parse("[first: #x [gen: masc], second: #x]").unwrap()
+        );
+        assert!(source.remap(&[("missing", "target")]).is_none());
+        assert!(
+            source
+                .remap(&[("left", "same"), ("right", "same")])
+                .is_none()
+        );
     }
 }

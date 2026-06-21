@@ -11,9 +11,9 @@
 //! Then reports coverage statistics so we can judge whether an F-style
 //! obligatory-leaf filter would prune any A* items.
 
-use rusty_alto::homomorphism::HomLabel;
-use rusty_alto::{parse_irtg, StateId, StringAlgebra, Symbol, TopDownTa};
 use packed_term_arena::tree::Tree;
+use rusty_alto::homomorphism::HomLabel;
+use rusty_alto::{StateId, StringAlgebra, Symbol, TopDownTa, parse_irtg};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::File;
@@ -26,7 +26,7 @@ use std::io::BufReader;
 /// One flattened left-to-right yield token.
 #[derive(Clone, Debug, PartialEq)]
 enum Tok {
-    Word(u32),   // leaf symbol id
+    Word(u32),    // leaf symbol id
     Child(usize), // child state index
 }
 
@@ -109,7 +109,10 @@ fn extract_flat_rules(
         };
         // Skip rules with stuck or out-of-range children.
         let children: &[StateId] = rule.children;
-        if children.iter().any(|c| c.is_stuck() || c.index() >= num_states) {
+        if children
+            .iter()
+            .any(|c| c.is_stuck() || c.index() >= num_states)
+        {
             continue;
         }
         if rule.result.is_stuck() || rule.result.index() >= num_states {
@@ -137,11 +140,7 @@ fn extract_flat_rules(
 // Core computation (also used by tests)
 // ---------------------------------------------------------------------------
 
-fn compute(
-    num_states: usize,
-    flat_rules: &[FlatRule],
-    accepting: &[usize],
-) -> ObligationTables {
+fn compute(num_states: usize, flat_rules: &[FlatRule], accepting: &[usize]) -> ObligationTables {
     // Phase B: mic
     let mut mic: Vec<Option<Bag>> = vec![None; num_states];
     loop {
@@ -294,7 +293,9 @@ fn report(
 
     if universe.is_empty() {
         println!("No item-eligible states — nothing to measure.");
-        println!("SUMMARY productive=0 reachable=0 universe=0 frac_mic_nonempty=0.00 frac_req_nonempty=0.00");
+        println!(
+            "SUMMARY productive=0 reachable=0 universe=0 frac_mic_nonempty=0.00 frac_req_nonempty=0.00"
+        );
         return;
     }
 
@@ -383,7 +384,10 @@ fn report(
         let mean_d = sizes_distinct.iter().sum::<usize>() as f64 / sizes_distinct.len() as f64;
         let mean_t = sizes_total.iter().sum::<u32>() as f64 / sizes_total.len() as f64;
 
-        println!("Obligation size distribution (states with req_any non-empty: {}):", req_any_nonempty.len());
+        println!(
+            "Obligation size distribution (states with req_any non-empty: {}):",
+            req_any_nonempty.len()
+        );
         println!(
             "  distinct terminals: min={} median={} mean={:.1} p90={} max={}",
             sizes_distinct.first().unwrap(),
@@ -512,7 +516,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Using interpretation: {name:?}");
 
     let (flat_rules, accepting) = extract_flat_rules(grammar, hom, num_states);
-    eprintln!("Flat rules: {}  accepting: {}", flat_rules.len(), accepting.len());
+    eprintln!(
+        "Flat rules: {}  accepting: {}",
+        flat_rules.len(),
+        accepting.len()
+    );
 
     let (mic, req_left, req_right) = compute(num_states, &flat_rules, &accepting);
 
@@ -550,10 +558,22 @@ mod tests {
     #[test]
     fn worked_example() {
         let flat_rules = vec![
-            FlatRule { result: 0, tokens: vec![Tok::Child(1), Tok::Child(2)] }, // S->A B
-            FlatRule { result: 1, tokens: vec![Tok::Word(10)] },                // A->"x"
-            FlatRule { result: 2, tokens: vec![Tok::Word(11)] },                // B->"y"
-            FlatRule { result: 1, tokens: vec![Tok::Word(12)] },                // A->"z"
+            FlatRule {
+                result: 0,
+                tokens: vec![Tok::Child(1), Tok::Child(2)],
+            }, // S->A B
+            FlatRule {
+                result: 1,
+                tokens: vec![Tok::Word(10)],
+            }, // A->"x"
+            FlatRule {
+                result: 2,
+                tokens: vec![Tok::Word(11)],
+            }, // B->"y"
+            FlatRule {
+                result: 1,
+                tokens: vec![Tok::Word(12)],
+            }, // A->"z"
         ];
         let accepting = vec![0usize];
 
@@ -565,7 +585,11 @@ mod tests {
         // mic[B=2] = {11:1}
         let mut expected_mic_b = BTreeMap::new();
         expected_mic_b.insert(11u32, 1u32);
-        assert_eq!(mic[2], Some(expected_mic_b.clone()), "mic[B] should be {{y:1}}");
+        assert_eq!(
+            mic[2],
+            Some(expected_mic_b.clone()),
+            "mic[B] should be {{y:1}}"
+        );
 
         // mic[S=0] = {11:1}
         assert_eq!(mic[0], Some(expected_mic_b), "mic[S] should be {{y:1}}");
@@ -573,17 +597,41 @@ mod tests {
         // req_right[A=1] = {11:1}
         let mut expected_rr_a = BTreeMap::new();
         expected_rr_a.insert(11u32, 1u32);
-        assert_eq!(req_right[1], Some(expected_rr_a), "req_right[A] should be {{y:1}}");
+        assert_eq!(
+            req_right[1],
+            Some(expected_rr_a),
+            "req_right[A] should be {{y:1}}"
+        );
 
         // req_left[A=1] = {}
-        assert_eq!(req_left[1], Some(BTreeMap::new()), "req_left[A] should be empty");
+        assert_eq!(
+            req_left[1],
+            Some(BTreeMap::new()),
+            "req_left[A] should be empty"
+        );
 
         // req_left[B=2] = {}  req_right[B=2] = {}
-        assert_eq!(req_left[2], Some(BTreeMap::new()), "req_left[B] should be empty");
-        assert_eq!(req_right[2], Some(BTreeMap::new()), "req_right[B] should be empty");
+        assert_eq!(
+            req_left[2],
+            Some(BTreeMap::new()),
+            "req_left[B] should be empty"
+        );
+        assert_eq!(
+            req_right[2],
+            Some(BTreeMap::new()),
+            "req_right[B] should be empty"
+        );
 
         // req_left[S=0] = {}  req_right[S=0] = {}
-        assert_eq!(req_left[0], Some(BTreeMap::new()), "req_left[S] should be empty");
-        assert_eq!(req_right[0], Some(BTreeMap::new()), "req_right[S] should be empty");
+        assert_eq!(
+            req_left[0],
+            Some(BTreeMap::new()),
+            "req_left[S] should be empty"
+        );
+        assert_eq!(
+            req_right[0],
+            Some(BTreeMap::new()),
+            "req_right[S] should be empty"
+        );
     }
 }

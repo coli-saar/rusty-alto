@@ -1,8 +1,7 @@
-use rusty_alto::{Irtg, RenderedValue, TulipacInputCodec, parse_irtg};
+use rusty_alto::{InputCodecRegistry, Irtg, RenderedValue};
 use std::{
     env,
     error::Error,
-    fs::File,
     io::{self, BufRead, IsTerminal, Write},
     path::Path,
     time::{Duration, Instant},
@@ -17,17 +16,15 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn Error>> {
     let Some(path) = env::args().nth(1) else {
-        eprintln!("usage: rusty-alto <grammar.irtg>");
+        eprintln!("usage: rusty-alto <grammar.irtg|grammar.tag>");
         std::process::exit(2);
     };
 
     let load_start = Instant::now();
-    let is_tulipac = Path::new(&path).extension().is_some_and(|ext| ext == "tag");
-    let irtg = if is_tulipac {
-        TulipacInputCodec::new().read_path(&path)?
-    } else {
-        parse_irtg(File::open(&path)?)?
-    };
+    let registry = InputCodecRegistry::standard();
+    let codec = registry.codec_for_path::<Irtg>(Path::new(&path))?;
+    let is_tulipac = codec.metadata().name == "tulipac";
+    let irtg = codec.read_path(Path::new(&path))?;
     let load_time = load_start.elapsed();
 
     let interpretation_name = choose_input_interpretation(&irtg)

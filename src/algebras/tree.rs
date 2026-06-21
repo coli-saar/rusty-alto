@@ -15,7 +15,9 @@
 //! These algebras are **output-only**: they evaluate a derivation tree into a value, but do not
 //! provide decomposition, so an interpretation backed by them cannot be a parse input.
 
-use crate::{Algebra, Signature, Symbol};
+use crate::{
+    Algebra, OutputCodec, Signature, Symbol, TreeVisualizationCodec, VisualRepresentation,
+};
 use packed_term_arena::parser::{TreeParseError, parse_tree};
 use packed_term_arena::tree::{Tree, TreeArena};
 use std::cell::RefCell;
@@ -29,6 +31,14 @@ pub const APPEND_SYMBOL: &str = "_@_";
 pub struct TreeValue {
     arena: TreeArena<String>,
     root: Tree,
+}
+
+impl Clone for TreeValue {
+    fn clone(&self) -> Self {
+        let mut arena = TreeArena::new();
+        let root = copy_subtree(&self.arena, self.root, &mut arena);
+        Self { arena, root }
+    }
 }
 
 impl TreeValue {
@@ -130,6 +140,7 @@ pub struct TreeAlgebra {
     signature: Signature,
     with_arities: bool,
     scratch: RefCell<TreeArena<String>>,
+    display_codec: TreeVisualizationCodec,
 }
 
 impl TreeAlgebra {
@@ -139,6 +150,7 @@ impl TreeAlgebra {
             signature,
             with_arities: false,
             scratch: RefCell::new(TreeArena::new()),
+            display_codec: TreeVisualizationCodec,
         }
     }
 
@@ -148,6 +160,7 @@ impl TreeAlgebra {
             signature,
             with_arities: true,
             scratch: RefCell::new(TreeArena::new()),
+            display_codec: TreeVisualizationCodec,
         }
     }
 
@@ -192,6 +205,10 @@ impl Algebra for TreeAlgebra {
         // Tree algebras are output-only; this is provided for completeness and parses the surface
         // tree into the scratch arena, returning its root handle.
         parse_tree(&mut self.scratch.borrow_mut(), input)
+    }
+
+    fn visualize(&self, value: &Self::Value) -> VisualRepresentation {
+        self.display_codec.encode(value)
     }
 }
 
@@ -271,6 +288,10 @@ impl<A: Algebra> Algebra for Binarizing<A> {
 
     fn to_external(&self, value: &Self::InternalValue) -> Self::Value {
         self.inner.to_external(value)
+    }
+
+    fn visualize(&self, value: &Self::Value) -> VisualRepresentation {
+        self.inner.visualize(value)
     }
 
     fn evaluate_term(&self, arena: &TreeArena<Symbol>, root: Tree) -> Option<Self::Value> {
@@ -372,6 +393,9 @@ mod tests {
     fn parse_object_round_trips() {
         let mut algebra = TreeAlgebra::with_arities(Signature::new());
         let internal = algebra.parse_object("S(NP, VP(V, NP))").unwrap();
-        assert_eq!(algebra.to_external(&internal).to_string(), "S(NP, VP(V, NP))");
+        assert_eq!(
+            algebra.to_external(&internal).to_string(),
+            "S(NP, VP(V, NP))"
+        );
     }
 }

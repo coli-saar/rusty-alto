@@ -26,6 +26,17 @@ pub struct AutomatonSummary {
     pub is_empty: bool,
 }
 
+/// Cardinality of an explicit automaton's derivation-tree language.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LanguageCardinality {
+    /// The language contains exactly this many derivation trees.
+    Finite(usize),
+    /// A productive cycle makes the language infinite.
+    Infinite,
+    /// The finite count exceeds the platform's `usize` range.
+    TooLarge,
+}
+
 /// Metadata about one interpretation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InterpretationInfo {
@@ -121,6 +132,125 @@ impl Explicit {
                 .unwrap_or(0),
             is_empty: self.is_empty(),
         }
+    }
+
+    /// Return the number of accepted derivation trees without enumerating them.
+    pub fn language_cardinality(&self) -> LanguageCardinality {
+        let state_count = self.num_states() as usize;
+        let rules = self.rules().collect::<Vec<_>>();
+        let mut productive = vec![false; state_count];
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for rule in &rules {
+                if !productive[rule.result.index()]
+                    && rule.children.iter().all(|child| productive[child.index()])
+                {
+                    productive[rule.result.index()] = true;
+                    changed = true;
+                }
+            }
+        }
+
+        let mut relevant = vec![false; state_count];
+        let mut stack = (0..state_count)
+            .map(|index| StateId(index as u32))
+            .filter(|state| self.is_accepting(state) && productive[state.index()])
+            .collect::<Vec<_>>();
+        while let Some(state) = stack.pop() {
+            if std::mem::replace(&mut relevant[state.index()], true) {
+                continue;
+            }
+            for rule in rules.iter().filter(|rule| rule.result == state) {
+                if rule.children.iter().all(|child| productive[child.index()]) {
+                    stack.extend(rule.children.iter().copied());
+                }
+            }
+        }
+
+        fn has_cycle(
+            state: StateId,
+            rules: &[crate::Rule<'_>],
+            productive: &[bool],
+            relevant: &[bool],
+            colors: &mut [u8],
+        ) -> bool {
+            colors[state.index()] = 1;
+            for child in rules
+                .iter()
+                .filter(|rule| {
+                    rule.result == state
+                        && rule.children.iter().all(|child| productive[child.index()])
+                })
+                .flat_map(|rule| rule.children.iter().copied())
+                .filter(|child| relevant[child.index()])
+            {
+                if colors[child.index()] == 1
+                    || (colors[child.index()] == 0
+                        && has_cycle(child, rules, productive, relevant, colors))
+                {
+                    return true;
+                }
+            }
+            colors[state.index()] = 2;
+            false
+        }
+
+        let mut colors = vec![0; state_count];
+        for index in 0..state_count {
+            if relevant[index]
+                && colors[index] == 0
+                && has_cycle(
+                    StateId(index as u32),
+                    &rules,
+                    &productive,
+                    &relevant,
+                    &mut colors,
+                )
+            {
+                return LanguageCardinality::Infinite;
+            }
+        }
+
+        fn count_state(
+            state: StateId,
+            rules: &[crate::Rule<'_>],
+            productive: &[bool],
+            memo: &mut [Option<Option<usize>>],
+        ) -> Option<usize> {
+            if let Some(count) = memo[state.index()] {
+                return count;
+            }
+            let mut total = 0usize;
+            for rule in rules.iter().filter(|rule| {
+                rule.result == state && rule.children.iter().all(|child| productive[child.index()])
+            }) {
+                let mut combinations = 1usize;
+                for &child in rule.children {
+                    combinations =
+                        combinations.checked_mul(count_state(child, rules, productive, memo)?)?;
+                }
+                total = total.checked_add(combinations)?;
+            }
+            memo[state.index()] = Some(Some(total));
+            Some(total)
+        }
+
+        let mut memo = vec![None; state_count];
+        let mut total = 0usize;
+        for index in 0..state_count {
+            let state = StateId(index as u32);
+            if self.is_accepting(&state) && productive[index] {
+                let Some(count) = count_state(state, &rules, &productive, &mut memo) else {
+                    return LanguageCardinality::TooLarge;
+                };
+                let Some(next) = total.checked_add(count) else {
+                    return LanguageCardinality::TooLarge;
+                };
+                total = next;
+            }
+        }
+        LanguageCardinality::Finite(total)
     }
 
     /// Resolve rules with caller-supplied state and symbol naming.
@@ -413,9 +543,37 @@ VP -> sleeps [1.0]
                 .unwrap()
                 .input_erased(string)])
             .unwrap();
+        assert!(chart.state_names.iter().any(|name| name == "NP[0,1]"));
+        assert!(chart.state_names.iter().any(|name| name == "VP[1,2]"));
+        assert!(chart.state_names.iter().any(|name| name == "S[0,2]"));
         let best = chart.automaton.viterbi().unwrap();
         let rendered = irtg.render_derivation(best.arena(), best.root()).unwrap();
         assert!(matches!(rendered[0].value, RenderedValue::Text(_)));
         assert!(matches!(rendered[1].value, RenderedValue::Tree(_)));
+    }
+
+    #[test]
+    fn reports_finite_and_infinite_language_cardinality() {
+        let finite = parse_irtg(GRAMMAR.as_bytes()).unwrap();
+        assert_eq!(
+            finite.grammar().language_cardinality(),
+            LanguageCardinality::Finite(1)
+        );
+
+        let recursive = parse_irtg(
+            br#"
+            interpretation string: de.up.ling.irtg.algebra.StringAlgebra
+
+            S! -> wrap(S)
+              [string] *(x, ?1)
+            S -> leaf
+              [string] x
+            "# as &[u8],
+        )
+        .unwrap();
+        assert_eq!(
+            recursive.grammar().language_cardinality(),
+            LanguageCardinality::Infinite
+        );
     }
 }

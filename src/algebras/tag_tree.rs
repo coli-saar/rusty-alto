@@ -6,7 +6,8 @@
 
 use super::{Algebra, TreeValue};
 use crate::{
-    BottomUpTa, CondensedTa, FxHashMap, Signature, StateUniverse, Symbol, SymbolSet, TopDownTa,
+    BottomUpTa, CondensedTa, FxHashMap, OutputCodec, Signature, StateUniverse, Symbol, SymbolSet,
+    TopDownTa, TreeVisualizationCodec, VisualRepresentation,
 };
 use packed_term_arena::{
     parser::{TreeParseError, parse_tree},
@@ -65,6 +66,7 @@ pub struct TagTreeAlgebra {
     hole: Symbol,
     with_arities: bool,
     scratch: RefCell<TreeArena<String>>,
+    display_codec: TreeVisualizationCodec,
 }
 
 impl TagTreeAlgebra {
@@ -89,6 +91,7 @@ impl TagTreeAlgebra {
             hole,
             with_arities,
             scratch: RefCell::new(TreeArena::new()),
+            display_codec: TreeVisualizationCodec,
         }
     }
 
@@ -178,6 +181,10 @@ impl Algebra for TagTreeAlgebra {
         let root = copy_subtree(&self.scratch.borrow(), *value, &mut arena);
         *self.scratch.borrow_mut() = TreeArena::new();
         TreeValue::new(arena, root)
+    }
+
+    fn visualize(&self, value: &Self::Value) -> VisualRepresentation {
+        self.display_codec.encode(value)
     }
 }
 

@@ -7,6 +7,7 @@
 //!        [--jobs N] [--times times.csv] [--input INTERP]
 //!        [--parseval INTERP] [--parseval-output FILE] [--evalb-param FILE]
 
+use packed_term_arena::{parser::parse_tree, tree::TreeArena};
 use rusty_alto::{
     AstarHeuristic, AstarOptions, AstarStats, Binarizing, CorpusWriter, EvalbParams, Instance,
     Irtg, LogProbabilityScorer, MaterializationStrategy, ObligatoryLeafTables, OutsideHeuristic,
@@ -14,7 +15,6 @@ use rusty_alto::{
     TreeValue, UniversalSxHeuristic, ViterbiTree, compare_trees, count_gold, parse_irtg,
     read_corpus,
 };
-use packed_term_arena::{parser::parse_tree, tree::TreeArena};
 use std::{
     env,
     error::Error,

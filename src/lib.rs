@@ -43,9 +43,9 @@
 //! ```
 
 pub mod algebras;
-pub mod application;
 pub mod alto;
 pub mod alto_ast;
+pub mod application;
 pub mod astar;
 lalrpop_util::lalrpop_mod!(
     #[allow(clippy::all)]
@@ -75,29 +75,35 @@ pub mod viterbi;
 
 pub use algebras::{
     APPEND_SYMBOL, Algebra, BinarizedTagTreeDecompositionAutomaton, BinarizedTagTreeState,
-    Binarizing, CONC11, CONC12, CONC21, EvaluatingDecompositionAutomaton, FS_EMBED_AUX_PREFIX,
-    FS_EMBED_PREFIX, FS_PROJECT_PREFIX, FS_UNIFY, FeatureStructure, FeatureStructureAlgebra,
+    Binarizing, CONC11, CONC12, CONC21, EvaluatingDecompositionAutomaton, FS_EMBED_PREFIX,
+    FS_PROJECT_PREFIX, FS_REMAP_PREFIX, FS_UNIFY, FeatureStructure, FeatureStructureAlgebra,
     FeatureStructureFilter, FeatureStructureParseError, SentenceSxHeuristic, Span, StringAlgebra,
     StringDecompositionAutomaton, TAG_E, TAG_EE, TAG_HOLE, TAG_SUBSTITUTE, TagSpan,
     TagStringAlgebra, TagStringDecompositionAutomaton, TagStringValue, TagTreeAlgebra,
     TagTreeContext, TagTreeDecompositionAutomaton, TreeAlgebra, TreeValue, UniversalSxHeuristic,
     WRAP21, WRAP22,
 };
-pub use application::{
-    AutomatonSummary, InterpretationInfo, ParseStrategy, RenderedInterpretation, RenderedValue,
-    ResolvedRule,
+#[allow(deprecated)]
+pub use alto::{
+    AltoParseError, ExplicitWithSignature, ParsedTreeAutomaton, parse_alto,
+    parse_alto_with_signature,
 };
-pub use alto::{AltoParseError, ParsedTreeAutomaton, parse_alto, parse_alto_with_signature};
+pub use application::{
+    AutomatonSummary, InterpretationInfo, LanguageCardinality, ParseStrategy,
+    RenderedInterpretation, RenderedValue, ResolvedRule,
+};
 pub use astar::{
     AstarOptions, AstarStats, PreparedAstarGrammar, astar_one_best, astar_one_best_with,
     astar_one_best_with_stats, astar_string_one_best_lazy_benchmark_with_stats_prepared,
-    astar_string_one_best_with_stats_prepared,
-    materialize_astar_intersection, materialize_astar_intersection_with,
+    astar_string_one_best_with_stats_prepared, materialize_astar_intersection,
+    materialize_astar_intersection_with, materialize_astar_string_intersection_with_prepared,
     materialize_astar_viterbi_forest, materialize_astar_viterbi_forest_with,
-    materialize_astar_string_intersection_with_prepared,
 };
 pub use codec::{
-    DisplayCodec, InputCodec, InputCodecReadError, IrtgInputCodec, OutputCodec, SpaceJoinCodec,
+    AltoTreeAutomatonInputCodec, CodecMetadata, DisplayCodec, FeatureStructureVisualizationCodec,
+    InputCodec, InputCodecError, InputCodecRegistry, InputCodecRegistryError, IrtgInputCodec,
+    OutputCodec, OutputCodecRegistry, RegisteredInputCodec, SpaceJoinCodec, TextOutputCodec,
+    TextVisualizationCodec, TreeVisualizationCodec, VisualRepresentation,
 };
 pub use codecs::{TulipacError, TulipacInputCodec};
 pub use combinators::{Determinized, InvHom, Mapped, Product};
@@ -106,7 +112,6 @@ pub use explicit::{Explicit, ExplicitBuildError, ExplicitBuilder, Rule};
 pub use heuristic::{
     IntersectionHeuristic, MinHeuristic, OutsideHeuristic, ScoredZeroHeuristic, ZeroHeuristic,
 };
-pub use obligatory_leaf::{ObligatoryLeafHeuristic, ObligatoryLeafTables};
 pub use homomorphism::{HomLabel, HomTerm, Homomorphism, HomomorphismError};
 pub use ids::{Arity, StateId, Symbol};
 pub use interner::Interner;
@@ -118,8 +123,10 @@ pub use materialize::{
     IndexedCondensedIntersectionStats, materialize, materialize_indexed_condensed_intersection,
     materialize_indexed_condensed_intersection_with_pairs,
     materialize_topdown_condensed_intersection,
+    materialize_topdown_condensed_intersection_with_pairs,
 };
 pub use memo::{Memo, MemoStats};
+pub use obligatory_leaf::{ObligatoryLeafHeuristic, ObligatoryLeafTables};
 pub use parseval::{
     EvalbParamError, EvalbParams, ParsevalCounts, ParsevalSkip, compare_trees, count_gold,
 };

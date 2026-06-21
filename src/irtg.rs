@@ -17,7 +17,10 @@ use crate::{
         materialize_astar_intersection_with, materialize_astar_string_intersection_with,
     },
     materialize::{
-        materialize_indexed_condensed_intersection, materialize_topdown_condensed_intersection,
+        materialize_indexed_condensed_intersection,
+        materialize_indexed_condensed_intersection_with_pairs,
+        materialize_topdown_condensed_intersection,
+        materialize_topdown_condensed_intersection_with_pairs,
     },
 };
 use lalrpop_util::ParseError;
@@ -310,6 +313,9 @@ impl Irtg {
         }
 
         let mut chart = self.grammar.clone();
+        let mut state_names = (0..chart.num_states())
+            .map(|state| self.states.resolve(StateId(state)).clone())
+            .collect::<Vec<_>>();
         let mut stats = Vec::new();
 
         for input in inputs {
@@ -325,14 +331,42 @@ impl Irtg {
                     let invhom = InvHom::new(decomp, &interpretation.homomorphism);
                     let next_chart = match strategy {
                         MaterializationStrategy::TopDownCondensed => {
-                            let (c, _, stat) =
-                                materialize_topdown_condensed_intersection(&chart, &invhom);
+                            let (c, right_states, pairs, stat) =
+                                materialize_topdown_condensed_intersection_with_pairs(
+                                    &chart, &invhom,
+                                );
+                            state_names = pairs
+                                .into_iter()
+                                .map(|(left, right)| {
+                                    let span = right_states.resolve(right);
+                                    format!(
+                                        "{}[{},{}]",
+                                        state_names[left.index()],
+                                        span.start,
+                                        span.end
+                                    )
+                                })
+                                .collect();
                             stats.push(stat);
                             c
                         }
                         MaterializationStrategy::IndexedCondensed => {
-                            let (c, _, stat) =
-                                materialize_indexed_condensed_intersection(&chart, &invhom);
+                            let (c, right_states, pairs, stat) =
+                                materialize_indexed_condensed_intersection_with_pairs(
+                                    &chart, &invhom,
+                                );
+                            state_names = pairs
+                                .into_iter()
+                                .map(|(left, right)| {
+                                    let span = right_states.resolve(right);
+                                    format!(
+                                        "{}[{},{}]",
+                                        state_names[left.index()],
+                                        span.start,
+                                        span.end
+                                    )
+                                })
+                                .collect();
                             stats.push(stat);
                             c
                         }
@@ -344,6 +378,9 @@ impl Irtg {
                             // Instead, call materialize_astar_intersection with a fresh options value.
                             // We route via a helper to avoid duplicating logic.
                             let c = self.run_astar_chart(&chart, &invhom, heuristic, strategy)?;
+                            state_names = (0..c.num_states())
+                                .map(|state| format!("q{state}"))
+                                .collect();
                             // A* produces no IndexedCondensedIntersectionStats; we push nothing.
                             c
                         }
@@ -370,6 +407,9 @@ impl Irtg {
                         stats.push(stat);
                     }
                     chart = next_chart;
+                    state_names = (0..chart.num_states())
+                        .map(|state| format!("q{state}"))
+                        .collect();
                 }
                 InterpretationKind::TagTree => {
                     let value =
@@ -391,6 +431,9 @@ impl Irtg {
                         stats.push(stat);
                     }
                     chart = next_chart;
+                    state_names = (0..chart.num_states())
+                        .map(|state| format!("q{state}"))
+                        .collect();
                 }
                 InterpretationKind::BinarizedTagTree => {
                     let value =
@@ -412,6 +455,9 @@ impl Irtg {
                         stats.push(stat);
                     }
                     chart = next_chart;
+                    state_names = (0..chart.num_states())
+                        .map(|state| format!("q{state}"))
+                        .collect();
                 }
                 InterpretationKind::OutputOnly => {
                     return Err(IrtgError::NotInputable {
@@ -423,6 +469,7 @@ impl Irtg {
 
         Ok(ParseChart {
             automaton: chart,
+            state_names,
             stats,
         })
     }
@@ -978,7 +1025,7 @@ impl<A, C> DerivationRenderer for TypedDerivationCodec<A, C>
 where
     A: Algebra + 'static,
     A: Send,
-    C: OutputCodec<A::Value> + fmt::Debug + Send + Sync,
+    C: OutputCodec<A::Value, Output = String> + fmt::Debug + Send + Sync,
 {
     fn render(
         &self,
@@ -1327,6 +1374,8 @@ pub struct ParseInput<'i> {
 pub struct ParseChart {
     /// Explicit grammar chart after all input constraints were applied.
     pub automaton: Explicit,
+    /// Human-readable state labels in dense state-ID order.
+    pub state_names: Vec<String>,
     /// Per-intersection materialization statistics.
     pub stats: Vec<IndexedCondensedIntersectionStats>,
 }
@@ -1432,6 +1481,11 @@ pub(crate) fn build_irtg(ast: AstIrtg) -> Result<Irtg, IrtgError> {
     let mut grammar_signature = Signature::new();
     let mut homs = FxHashMap::default();
     let mut algebra_signatures = FxHashMap::default();
+    let interpretation_algebras = ast
+        .interpretations
+        .iter()
+        .map(|decl| (decl.name.clone(), decl.algebra.clone()))
+        .collect::<FxHashMap<_, _>>();
 
     for decl in &ast.interpretations {
         homs.insert(decl.name.clone(), Homomorphism::new());
@@ -1465,7 +1519,18 @@ pub(crate) fn build_irtg(ast: AstIrtg) -> Result<Irtg, IrtgError> {
             let signature = algebra_signatures
                 .get_mut(&hom_rule.interpretation)
                 .expect("hom and signature maps are initialized together");
-            let term = lower_hom_term(&hom_rule.term, hom, signature)?;
+            let normalized;
+            let term = if interpretation_algebras
+                .get(&hom_rule.interpretation)
+                .map(String::as_str)
+                == Some(FEATURE_STRUCTURE_ALGEBRA)
+            {
+                normalized = normalize_legacy_feature_term(&hom_rule.term);
+                &normalized
+            } else {
+                &hom_rule.term
+            };
+            let term = lower_hom_term(term, hom, signature)?;
             hom.add(symbol, rule.auto.children.len(), term)?;
         }
     }
@@ -1619,6 +1684,22 @@ fn state_id(
     debug_assert_eq!(id, interned);
     state_ids.insert(state.name.clone(), id);
     id
+}
+
+fn normalize_legacy_feature_term(term: &AstHomTerm) -> AstHomTerm {
+    match term {
+        AstHomTerm::Variable(variable) => AstHomTerm::Variable(*variable),
+        AstHomTerm::Symbol(label, children) => {
+            let children = children.iter().map(normalize_legacy_feature_term).collect();
+            if let Some(specification) = label.strip_prefix("emba_") {
+                let mut attributes = specification.split('_');
+                if let (Some(top), Some(bottom)) = (attributes.next(), attributes.next()) {
+                    return AstHomTerm::Symbol(format!("remap_root={top},foot={bottom}"), children);
+                }
+            }
+            AstHomTerm::Symbol(label.clone(), children)
+        }
+    }
 }
 
 fn lower_hom_term(
@@ -2136,5 +2217,30 @@ mod tests {
         let value = tree.parse_object("f(a, b, c)").unwrap();
         let chart = irtg.parse([tree.input(value)]).unwrap();
         assert!(chart.automaton.viterbi().is_some());
+    }
+
+    #[test]
+    fn legacy_alto_aux_embedding_is_normalized_outside_the_algebra() {
+        let irtg = parse_irtg(
+            br#"
+            interpretation ft: de.up.ling.irtg.algebra.FeatureStructureAlgebra
+
+            S! -> combine(A)
+              [ft] emba_top_bottom(?1)
+
+            A -> value
+              [ft] "[root: #x [], foot: #x]"
+            "# as &[u8],
+        )
+        .unwrap();
+        let ft = irtg
+            .interpretation::<FeatureStructureAlgebra>("ft")
+            .unwrap();
+        assert!(ft.algebra_signature().get("emba_top_bottom").is_none());
+        assert!(
+            ft.algebra_signature()
+                .get("remap_root=top,foot=bottom")
+                .is_some()
+        );
     }
 }

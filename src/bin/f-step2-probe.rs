@@ -20,15 +20,15 @@
 //!
 //! Usage: f-step2-probe <GRAMMAR.irtg> <SENTENCES.txt>
 
+use packed_term_arena::tree::Tree;
 use rusty_alto::combinators::InvHom;
 use rusty_alto::homomorphism::HomLabel;
 use rusty_alto::materialize::materialize_indexed_condensed_intersection_with_pairs;
 use rusty_alto::{
-    parse_irtg, Explicit, IntersectionHeuristic, LogProbabilityScorer,
-    SentenceSxHeuristic, Span, StateId, StringAlgebra, StringDecompositionAutomaton, Symbol,
-    TopDownTa, UniversalSxHeuristic,
+    Explicit, IntersectionHeuristic, LogProbabilityScorer, SentenceSxHeuristic, Span, StateId,
+    StringAlgebra, StringDecompositionAutomaton, Symbol, TopDownTa, UniversalSxHeuristic,
+    parse_irtg,
 };
-use packed_term_arena::tree::Tree;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -346,7 +346,12 @@ fn load_sx_cache(grammar_path: &str, n_needed: usize) -> Option<UniversalSxHeuri
         .flatten()
         .filter_map(|e| {
             let p = e.path();
-            let stem = p.file_stem()?.to_str()?.strip_prefix("nmax")?.parse().ok()?;
+            let stem = p
+                .file_stem()?
+                .to_str()?
+                .strip_prefix("nmax")?
+                .parse()
+                .ok()?;
             (stem >= n_needed).then_some((stem, p))
         })
         .collect();
@@ -388,7 +393,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Obligatory-leaf tables (once per grammar).
     let (flat_rules, accepting) = extract_flat_rules(grammar, hom, num_states);
     let (_mic, req_left, req_right) = compute_obligatory(num_states, &flat_rules, &accepting);
-    eprintln!("Flat rules: {}  accepting: {}", flat_rules.len(), accepting.len());
+    eprintln!(
+        "Flat rules: {}  accepting: {}",
+        flat_rules.len(),
+        accepting.len()
+    );
 
     // Load sentences via the algebra parser (handles interning).
     let mut sentences: Vec<Vec<Symbol>> = Vec::new();
@@ -483,7 +492,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tot_sx += sx_c;
         tot_f += f_c;
         tot_min += min_c;
-        println!("{},{},{},{},{},{},{}", si + 1, n, reach, zero_c, sx_c, f_c, min_c);
+        println!(
+            "{},{},{},{},{},{},{}",
+            si + 1,
+            n,
+            reach,
+            zero_c,
+            sx_c,
+            f_c,
+            min_c
+        );
     }
 
     let pct = |part: usize, whole: usize| {
@@ -495,16 +513,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     eprintln!();
     eprintln!("=== SUMMARY (predicted_finalized over reachable items) ===");
-    eprintln!("sentences parsed : {}  (no-parse: {no_parse})", sentences.len() - no_parse);
+    eprintln!(
+        "sentences parsed : {}  (no-parse: {no_parse})",
+        sentences.len() - no_parse
+    );
     eprintln!("reachable items  : {tot_reach}");
-    eprintln!("zero  finalized  : {tot_zero}  ({:.3})", pct(tot_zero, tot_reach));
-    eprintln!("SX    finalized  : {tot_sx}  ({:.3})", pct(tot_sx, tot_reach));
+    eprintln!(
+        "zero  finalized  : {tot_zero}  ({:.3})",
+        pct(tot_zero, tot_reach)
+    );
+    eprintln!(
+        "SX    finalized  : {tot_sx}  ({:.3})",
+        pct(tot_sx, tot_reach)
+    );
     eprintln!("F     finalized  : {tot_f}  ({:.3})", pct(tot_f, tot_reach));
-    eprintln!("min   finalized  : {tot_min}  ({:.3})", pct(tot_min, tot_reach));
+    eprintln!(
+        "min   finalized  : {tot_min}  ({:.3})",
+        pct(tot_min, tot_reach)
+    );
     eprintln!();
-    eprintln!("SX  saves vs zero : {:.1}%", (1.0 - pct(tot_sx, tot_zero)) * 100.0);
-    eprintln!("min saves vs zero : {:.1}%", (1.0 - pct(tot_min, tot_zero)) * 100.0);
-    eprintln!("min saves vs SX   : {:.1}%", (1.0 - pct(tot_min, tot_sx)) * 100.0);
+    eprintln!(
+        "SX  saves vs zero : {:.1}%",
+        (1.0 - pct(tot_sx, tot_zero)) * 100.0
+    );
+    eprintln!(
+        "min saves vs zero : {:.1}%",
+        (1.0 - pct(tot_min, tot_zero)) * 100.0
+    );
+    eprintln!(
+        "min saves vs SX   : {:.1}%",
+        (1.0 - pct(tot_min, tot_sx)) * 100.0
+    );
     println!(
         "SUMMARY reach={tot_reach} zero={tot_zero} sx={tot_sx} f={tot_f} min={tot_min} \
          min_vs_sx={:.4}",
@@ -526,10 +565,22 @@ mod tests {
     //   r1: S -> A B    r2: A -> "x"    r3: B -> "y"    r4: A -> "z"
     fn sample() -> (usize, Vec<FlatRule>, Vec<usize>) {
         let rules = vec![
-            FlatRule { result: 0, tokens: vec![Tok::Child(1), Tok::Child(2)] },
-            FlatRule { result: 1, tokens: vec![Tok::Word(10)] },
-            FlatRule { result: 2, tokens: vec![Tok::Word(11)] },
-            FlatRule { result: 1, tokens: vec![Tok::Word(12)] },
+            FlatRule {
+                result: 0,
+                tokens: vec![Tok::Child(1), Tok::Child(2)],
+            },
+            FlatRule {
+                result: 1,
+                tokens: vec![Tok::Word(10)],
+            },
+            FlatRule {
+                result: 2,
+                tokens: vec![Tok::Word(11)],
+            },
+            FlatRule {
+                result: 1,
+                tokens: vec![Tok::Word(12)],
+            },
         ];
         (3, rules, vec![0])
     }

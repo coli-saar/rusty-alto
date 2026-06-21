@@ -7,12 +7,17 @@ mod tag_string;
 mod tag_tree;
 mod tree;
 
-use crate::{BottomUpTa, DetBottomUpTa, Signature, Symbol};
+use crate::{BottomUpTa, DetBottomUpTa, Signature, Symbol, VisualRepresentation};
 use packed_term_arena::tree::{Tree, TreeArena};
 use std::hash::Hash;
 
 pub use string::{
     SentenceSxHeuristic, Span, StringAlgebra, StringDecompositionAutomaton, UniversalSxHeuristic,
+};
+pub(crate) use string::{SpanProductSibling, SpanProductSiblingFinder};
+pub(crate) use string_astar::{
+    SpanAstarLeftIndex, SpanBinarySiblingGroup, SpanInterner, StringAstarSource,
+    string_fallback_rules,
 };
 pub use tag_string::{
     CONC11, CONC12, CONC21, TAG_E, TAG_EE, TagSpan, TagStringAlgebra,
@@ -23,11 +28,6 @@ pub use tag_tree::{
     TagTreeAlgebra, TagTreeContext, TagTreeDecompositionAutomaton,
 };
 pub use tree::{APPEND_SYMBOL, Binarizing, TreeAlgebra, TreeValue};
-pub(crate) use string::{SpanProductSibling, SpanProductSiblingFinder};
-pub(crate) use string_astar::{
-    SpanAstarLeftIndex, SpanBinarySiblingGroup, SpanInterner, StringAstarSource,
-    string_fallback_rules,
-};
 
 /// Algebra over a domain of values.
 ///
@@ -67,6 +67,9 @@ pub trait Algebra {
 
     /// Map an internal value to its standalone public form.
     fn to_external(&self, value: &Self::InternalValue) -> Self::Value;
+
+    /// Convert a public value into this algebra's preferred GUI-neutral representation.
+    fn visualize(&self, value: &Self::Value) -> VisualRepresentation;
 
     /// Evaluate a term tree bottom-up to an internal value, applying [`evaluate`](Self::evaluate)
     /// at every node (e.g. a homomorphic image produced from a derivation tree).
@@ -155,6 +158,7 @@ impl<A: Algebra> DetBottomUpTa for EvaluatingDecompositionAutomaton<'_, A> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use packed_term_arena::tree::TreeArena;
 
     #[derive(Clone)]
     struct Tiny {
@@ -204,6 +208,10 @@ mod tests {
         fn to_external(&self, value: &Self::InternalValue) -> Self::Value {
             *value
         }
+
+        fn visualize(&self, value: &Self::Value) -> VisualRepresentation {
+            VisualRepresentation::Text(value.to_string())
+        }
     }
 
     #[test]
@@ -219,8 +227,33 @@ mod tests {
         assert!(decomp.is_accepting(&two));
         assert_eq!(decomp.step_det(algebra.zero, &[two]), None);
     }
+
+    #[test]
+    fn built_in_algebras_choose_structured_or_text_visualizations() {
+        let string = StringAlgebra::new();
+        assert!(matches!(
+            string.visualize(&vec!["hello".to_owned(), "world".to_owned()]),
+            VisualRepresentation::Text(text) if text == "hello world"
+        ));
+
+        let tree = TreeAlgebra::tree(Signature::new());
+        let mut arena = TreeArena::new();
+        let root = arena.add_node("root".to_owned(), Vec::new());
+        let value = TreeValue::new(arena, root);
+        assert!(matches!(
+            tree.visualize(&value),
+            VisualRepresentation::Tree(_)
+        ));
+
+        let feature = FeatureStructureAlgebra::with_signature(Signature::new());
+        let value = FeatureStructure::parse("[number: singular]").unwrap();
+        assert!(matches!(
+            feature.visualize(&value),
+            VisualRepresentation::FeatureStructure(_)
+        ));
+    }
 }
 pub use feature::{
-    FS_EMBED_AUX_PREFIX, FS_EMBED_PREFIX, FS_PROJECT_PREFIX, FS_UNIFY, FeatureStructure,
+    FS_EMBED_PREFIX, FS_PROJECT_PREFIX, FS_REMAP_PREFIX, FS_UNIFY, FeatureStructure,
     FeatureStructureAlgebra, FeatureStructureFilter, FeatureStructureParseError,
 };

@@ -9,13 +9,13 @@ use crate::{
 use lalrpop_util::ParseError;
 use thiserror::Error;
 
-/// Parsed tree automaton.
+/// An explicit automaton together with the symbol signature and state names used by its source.
 ///
 /// Alto's `.auto` format writes rules top-down, for example
 /// `S! -> f(A,A) [1.0]`. This reader builds the equivalent bottom-up
 /// [`Explicit`] automaton, i.e. the rule above becomes `f(A,A) -> S`.
 #[derive(Clone, Debug)]
-pub struct ParsedTreeAutomaton {
+pub struct ExplicitWithSignature {
     /// Bottom-up explicit automaton built from the Alto rules.
     pub automaton: Explicit,
     /// Mapping from Alto state names to dense state IDs.
@@ -23,6 +23,10 @@ pub struct ParsedTreeAutomaton {
     /// Mapping from Alto terminal symbols to symbol IDs.
     pub signature: Signature,
 }
+
+/// Former name of [`ExplicitWithSignature`].
+#[deprecated(note = "renamed to ExplicitWithSignature")]
+pub type ParsedTreeAutomaton = ExplicitWithSignature;
 
 /// Error returned when parsing Alto `.auto` input.
 #[derive(Clone, Debug, Error, PartialEq)]
@@ -130,7 +134,7 @@ impl From<LexError> for AltoParseError {
 /// - quoted names with single or double quotes
 /// - optional weights, defaulting to `1.0`
 /// - `// ...` line comments and `/* ... */` block comments
-pub fn parse_alto(input: &str) -> Result<ParsedTreeAutomaton, AltoParseError> {
+pub fn parse_alto(input: &str) -> Result<ExplicitWithSignature, AltoParseError> {
     let mut signature = Signature::new();
     parse_alto_with_signature(input, &mut signature)
 }
@@ -138,13 +142,13 @@ pub fn parse_alto(input: &str) -> Result<ParsedTreeAutomaton, AltoParseError> {
 /// Parse an Alto `.auto` file using a caller-owned shared signature.
 ///
 /// This is useful when automata and input trees should be compiled into the
-/// same raw [`crate::Symbol`] space. The returned [`ParsedTreeAutomaton`]
+/// same raw [`crate::Symbol`] space. The returned [`ExplicitWithSignature`]
 /// contains a clone of the signature after parsing; the caller can keep using
 /// `signature` to parse or validate trees before running the automaton.
 pub fn parse_alto_with_signature(
     input: &str,
     signature: &mut Signature,
-) -> Result<ParsedTreeAutomaton, AltoParseError> {
+) -> Result<ExplicitWithSignature, AltoParseError> {
     let tokens = lex(input)?;
     let ast = alto_grammar::FtaParser::new()
         .parse(tokens.into_iter().map(Ok))
@@ -155,7 +159,7 @@ pub fn parse_alto_with_signature(
 fn build_alto(
     ast: AstFta,
     signature: &mut Signature,
-) -> Result<ParsedTreeAutomaton, AltoParseError> {
+) -> Result<ExplicitWithSignature, AltoParseError> {
     let mut builder = ExplicitBuilder::new();
     let mut states = Interner::new();
     let mut state_ids = FxHashMap::default();
@@ -180,7 +184,7 @@ fn build_alto(
         builder.add_weighted_rule(symbol, child_ids, parent, rule.weight.unwrap_or(1.0));
     }
 
-    Ok(ParsedTreeAutomaton {
+    Ok(ExplicitWithSignature {
         automaton: builder.try_build()?,
         states,
         signature: signature.clone(),

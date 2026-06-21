@@ -15,13 +15,13 @@
 //! (capturing each leaf `Symbol`) rather than extending the SX builder's
 //! `YieldToken`, so the pure SX path is untouched.
 
+use crate::combinators::InvHom;
 use crate::homomorphism::{HomLabel, Homomorphism};
 use crate::score::WeightScorer;
 use crate::{
     Explicit, FxHashMap, IntersectionHeuristic, Span, StateId, StringDecompositionAutomaton,
     Symbol, TopDownTa,
 };
-use crate::combinators::InvHom;
 use packed_term_arena::tree::{Tree, TreeArena};
 use std::collections::BTreeMap;
 
@@ -417,7 +417,10 @@ mod tests {
     fn from_grammar_matches_worked_example() {
         let (tables, s, a, bb) = worked_example();
         // A always has a `y` (11) to its right; nothing forced to its left.
-        assert_eq!(tables.req_right[a.index()].as_deref(), Some(&[(11u32, 1u32)][..]));
+        assert_eq!(
+            tables.req_right[a.index()].as_deref(),
+            Some(&[(11u32, 1u32)][..])
+        );
         assert_eq!(tables.req_left[a.index()].as_deref(), Some(&[][..]));
         // A forces nothing, so B's sides are empty; root has empty obligations.
         assert_eq!(tables.req_left[bb.index()].as_deref(), Some(&[][..]));
@@ -435,14 +438,18 @@ mod tests {
         // A over [0,1): a `y` lies to its right -> pass.
         assert_eq!(
             IntersectionHeuristic::<StringDecompositionAutomaton>::outside_estimate(
-                &h, a, &Span::new(0, 1)
+                &h,
+                a,
+                &Span::new(0, 1)
             ),
             0.0
         );
         // A over [0,2): nothing to its right -> the required `y` is gone -> prune.
         assert_eq!(
             IntersectionHeuristic::<StringDecompositionAutomaton>::outside_estimate(
-                &h, a, &Span::new(0, 2)
+                &h,
+                a,
+                &Span::new(0, 2)
             ),
             f64::NEG_INFINITY
         );
@@ -462,16 +469,12 @@ mod tests {
             assert_eq!(admitted, est != f64::NEG_INFINITY, "span {span:?}");
         }
         // A over [0,1): `y` lies right -> admitted; over [0,2): gone -> rejected.
-        assert!(IntersectionHeuristic::<StringDecompositionAutomaton>::admits(
-            &h,
-            a,
-            &Span::new(0, 1)
-        ));
-        assert!(!IntersectionHeuristic::<StringDecompositionAutomaton>::admits(
-            &h,
-            a,
-            &Span::new(0, 2)
-        ));
+        assert!(
+            IntersectionHeuristic::<StringDecompositionAutomaton>::admits(&h, a, &Span::new(0, 1))
+        );
+        assert!(
+            !IntersectionHeuristic::<StringDecompositionAutomaton>::admits(&h, a, &Span::new(0, 2))
+        );
     }
 
     #[test]
@@ -481,13 +484,17 @@ mod tests {
         let h = tables.for_sentence(&[Symbol(10), Symbol(11)], &ProbabilityScorer);
         assert_eq!(
             IntersectionHeuristic::<StringDecompositionAutomaton>::outside_estimate(
-                &h, a, &Span::new(0, 1)
+                &h,
+                a,
+                &Span::new(0, 1)
             ),
             1.0
         );
         assert_eq!(
             IntersectionHeuristic::<StringDecompositionAutomaton>::outside_estimate(
-                &h, a, &Span::new(0, 2)
+                &h,
+                a,
+                &Span::new(0, 2)
             ),
             0.0
         );

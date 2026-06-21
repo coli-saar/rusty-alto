@@ -6,7 +6,7 @@
 //! feature annotations occur, an `ft` feature-structure interpretation.
 
 use crate::{
-    InputCodec, Irtg, IrtgError,
+    CodecMetadata, InputCodec, InputCodecError, Irtg, IrtgError,
     alto_ast::{
         AstAutoRule, AstHomRule, AstHomTerm, AstInterpretationDecl, AstIrtg, AstRule, AstState,
     },
@@ -16,6 +16,7 @@ use packed_term_arena::tree::{Tree, TreeArena};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt, fs,
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -42,10 +43,7 @@ impl TulipacInputCodec {
         Self
     }
 
-    /// Read a grammar from a path. Relative `#include` paths are resolved against
-    /// the including file's directory.
-    pub fn read_path(&self, path: impl AsRef<Path>) -> Result<Irtg, TulipacError> {
-        let path = path.as_ref();
+    fn read_path_inner(&self, path: &Path) -> Result<Irtg, TulipacError> {
         let mut declarations = Declarations::default();
         let mut include_stack = Vec::new();
         parse_path(path, &mut declarations, &mut include_stack)?;
@@ -54,16 +52,32 @@ impl TulipacInputCodec {
 }
 
 impl InputCodec<Irtg> for TulipacInputCodec {
-    type Error = TulipacError;
+    fn metadata(&self) -> &'static CodecMetadata {
+        static METADATA: CodecMetadata = CodecMetadata {
+            name: "tulipac",
+            description: "TAG grammar (Tulipac format)",
+            extension: Some("tag"),
+        };
+        &METADATA
+    }
 
-    fn decode(&self, input: &str) -> Result<Irtg, Self::Error> {
-        let declarations = Parser::new(input)?.parse_grammar()?;
+    fn read(&self, reader: &mut dyn Read) -> Result<Irtg, InputCodecError> {
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes)?;
+        let input = String::from_utf8(bytes)?;
+        let declarations = Parser::new(&input)
+            .and_then(Parser::parse_grammar)
+            .map_err(InputCodecError::codec)?;
         if let Some(include) = declarations.includes.first() {
-            return Err(TulipacError::Semantic(format!(
+            return Err(InputCodecError::codec(TulipacError::Semantic(format!(
                 "#include {include:?} requires TulipacInputCodec::read_path"
-            )));
+            ))));
         }
-        compile(declarations)
+        compile(declarations).map_err(InputCodecError::codec)
+    }
+
+    fn read_path(&self, path: &Path) -> Result<Irtg, InputCodecError> {
+        self.read_path_inner(path).map_err(InputCodecError::codec)
     }
 }
 
@@ -1152,7 +1166,7 @@ fn feature_term(
                     ))
                 } else {
                     Ok(AstHomTerm::Symbol(
-                        format!("emba_{node}t_{node}b"),
+                        format!("remap_root={node}t,foot={node}b"),
                         vec![term.clone()],
                     ))
                 }
@@ -1311,6 +1325,63 @@ mod tests {
         word 'den': det[case=acc]
     "#;
 
+    const ADJUNCTION: &str = r#"
+        tree clause:
+          S @NA {
+            NP!
+            VP {
+              V+ @NA
+            }
+          }
+
+        tree noun:
+          NP @NA {
+            N+ @NA
+          }
+
+        tree adverb:
+          VP @NA {
+            Adv+ @NA
+            VP*
+          }
+
+        word 'john': noun
+        word 'sleeps': clause
+        word 'quickly': adverb
+    "#;
+
+    const RECURSIVE_ADJUNCTION: &str = r#"
+        tree seed:
+          S @NA {
+            VP {
+              Center+ @NA
+            }
+          }
+
+        tree copy:
+          VP {
+            Left+ @NA
+            VP*
+            Right+ @NA
+          }
+
+        word 'c': seed
+        word 'a': copy
+    "#;
+
+    fn best_derivation(irtg: &Irtg, sentence: &str) -> String {
+        let string = irtg.interpretation::<TagStringAlgebra>("string").unwrap();
+        let value = string.parse_object(sentence).unwrap();
+        let best = irtg
+            .parse([string.input(value)])
+            .unwrap()
+            .automaton
+            .viterbi()
+            .unwrap();
+        irtg.resolve_derivation(best.arena(), best.root())
+            .to_string()
+    }
+
     #[test]
     fn reads_and_parses_tulipac_grammar() {
         let irtg = TulipacInputCodec.decode(CHASING).unwrap();
@@ -1324,6 +1395,30 @@ mod tests {
                 .is_some()
         );
         assert!(irtg.interpretation::<TagTreeAlgebra>("tree").is_ok());
+    }
+
+    #[test]
+    fn parses_tulipac_adjunction_with_exact_derivations() {
+        let irtg = TulipacInputCodec.decode(ADJUNCTION).unwrap();
+
+        assert_eq!(
+            best_derivation(&irtg, "john sleeps"),
+            "clause-sleeps(noun-john, '*NOP*_VP_A')"
+        );
+        assert_eq!(
+            best_derivation(&irtg, "john quickly sleeps"),
+            "clause-sleeps(noun-john, adverb-quickly)"
+        );
+    }
+
+    #[test]
+    fn recursively_adjoins_an_auxiliary_tree_around_its_foot() {
+        let irtg = TulipacInputCodec.decode(RECURSIVE_ADJUNCTION).unwrap();
+
+        assert_eq!(
+            best_derivation(&irtg, "a a c a a"),
+            "seed-c(copy-a(copy-a('*NOP*_VP_A')))"
+        );
     }
 
     #[test]
@@ -1420,7 +1515,14 @@ mod tests {
         std::fs::write(&trees, "tree v: S @NA { V+ }").unwrap();
         std::fs::write(&grammar, "#include 'trees.tag'\nword sleeps: v").unwrap();
 
-        let irtg = TulipacInputCodec.read_path(&grammar).unwrap();
+        let stream_error = TulipacInputCodec
+            .decode("#include 'trees.tag'\nword sleeps: v")
+            .unwrap_err();
+        assert!(stream_error.to_string().contains("requires"));
+
+        let registry = crate::InputCodecRegistry::standard();
+        let codec = registry.codec_for_path::<Irtg>(&grammar).unwrap();
+        let irtg = codec.read_path(&grammar).unwrap();
         let string = irtg.interpretation::<TagStringAlgebra>("string").unwrap();
         let value = string.parse_object("sleeps").unwrap();
         assert!(

@@ -1,13 +1,13 @@
 use criterion::{
     BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
 };
+use packed_term_arena::tree::{Tree, TreeArena};
 use rusty_alto::{
     BottomUpTa, CondensedTa, DetBottomUpTa, Determinized, EvalbParams, Explicit, ExplicitBuilder,
     HomLabel, Homomorphism, IndexedBottomUpTa, InvHom, Memo, Product, Span, StateId, StringAlgebra,
     StringDecompositionAutomaton, Symbol, TopDownTa, compare_trees, materialize,
     materialize_indexed_condensed_intersection, parse_irtg, run_det, run_nondet,
 };
-use packed_term_arena::tree::{Tree, TreeArena};
 use std::collections::HashSet;
 
 const A: Symbol = Symbol(0);

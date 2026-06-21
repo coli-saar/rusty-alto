@@ -5,8 +5,8 @@
 
 use super::{Algebra, Span};
 use crate::{
-    BottomUpTa, CondensedTa, FxHashMap, IndexedBottomUpTa, Signature, StateUniverse, Symbol,
-    SymbolSet, TopDownTa,
+    BottomUpTa, CondensedTa, DisplayCodec, FxHashMap, IndexedBottomUpTa, OutputCodec, Signature,
+    StateUniverse, Symbol, SymbolSet, TextVisualizationCodec, TopDownTa, VisualRepresentation,
 };
 use std::{convert::Infallible, fmt};
 
@@ -75,6 +75,7 @@ enum Operation {
 pub struct TagStringAlgebra {
     signature: Signature,
     operations: FxHashMap<Symbol, Operation>,
+    display_codec: TextVisualizationCodec<DisplayCodec>,
 }
 
 impl TagStringAlgebra {
@@ -101,6 +102,7 @@ impl TagStringAlgebra {
         Self {
             signature,
             operations,
+            display_codec: TextVisualizationCodec::new(DisplayCodec),
         }
     }
 
@@ -221,6 +223,10 @@ impl Algebra for TagStringAlgebra {
                 TagStringValue::Pair(resolve(left), resolve(right))
             }
         }
+    }
+
+    fn visualize(&self, value: &Self::Value) -> VisualRepresentation {
+        self.display_codec.encode(value)
     }
 }
 

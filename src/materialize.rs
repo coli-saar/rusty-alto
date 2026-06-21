@@ -760,6 +760,27 @@ where
     R: CondensedTopDownTa,
     R::State: Clone + Eq + Hash,
 {
+    let (explicit, right_interner, _pairs, stats) =
+        materialize_topdown_condensed_intersection_with_pairs(left, right);
+    (explicit, right_interner, stats)
+}
+
+/// Like [`materialize_topdown_condensed_intersection`], but also returns the
+/// product-state identities in output-state order.
+#[allow(clippy::type_complexity)]
+pub fn materialize_topdown_condensed_intersection_with_pairs<R>(
+    left: &Explicit,
+    right: &R,
+) -> (
+    Explicit,
+    Interner<R::State>,
+    Vec<(StateId, StateId)>,
+    IndexedCondensedIntersectionStats,
+)
+where
+    R: CondensedTopDownTa,
+    R::State: Clone + Eq + Hash,
+{
     let left_rules: Vec<_> = left
         .rules()
         .map(|rule| OwnedRule {
@@ -795,7 +816,7 @@ where
     ctx.stats.output_states = ctx.product_pairs.len();
     let explicit = ctx.builder.build_trusted();
     ctx.stats.output_rules = explicit.rules().count();
-    (explicit, ctx.right_interner, ctx.stats)
+    (explicit, ctx.right_interner, ctx.product_pairs, ctx.stats)
 }
 
 struct TopDownIntersection<'a, R>

@@ -1,7 +1,6 @@
 use crate::{
     FxHashMap, HomLabel, Homomorphism, Interner, Span, StateId, Symbol,
-    algebras::SpanProductSiblingFinder,
-    materialize::OwnedRule,
+    algebras::SpanProductSiblingFinder, materialize::OwnedRule,
 };
 use fixedbitset::FixedBitSet;
 
@@ -25,8 +24,7 @@ impl StringYieldTemplate {
             0 => hom.get(rule.symbol).map(|_| Self::Nullary),
             1 => {
                 let term = hom.get(rule.symbol)?;
-                (*hom.arena().get_label(term) == HomLabel::Var(0))
-                    .then_some(Self::UnaryIdentity)
+                (*hom.arena().get_label(term) == HomLabel::Var(0)).then_some(Self::UnaryIdentity)
             }
             2 => {
                 let term = hom.get(rule.symbol)?;
