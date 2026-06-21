@@ -2,7 +2,8 @@
 
 use crate::{
     Arity, BottomUpTa, CondensedTa, CondensedTopDownTa, Explicit, ExplicitBuilder, FxHashSet,
-    Interner, KeySet, Memo, SetTrie, StateId, Symbol, SymbolSet, run::cartesian_product,
+    Interner, KeySet, Memo, ParseControl, SetTrie, StateId, Symbol, SymbolSet,
+    control::ParseCancelled, run::cartesian_product,
 };
 use fixedbitset::FixedBitSet;
 use smallvec::SmallVec;
@@ -462,6 +463,7 @@ pub(crate) fn for_each_nullary_edge<R, I>(
     right: &R,
     right_interner: &mut I,
     stats: &mut IndexedCondensedIntersectionStats,
+    control: Option<&ParseControl>,
     on_edge: &mut dyn FnMut(NullaryEdge),
 ) where
     R: CondensedTa,
@@ -469,6 +471,9 @@ pub(crate) fn for_each_nullary_edge<R, I>(
     I: StateInterner<R::State>,
 {
     right.condensed_nullary_rules(&mut |symbols, right_result| {
+        if control.is_some_and(ParseControl::is_cancelled) {
+            return;
+        }
         stats.right_nullary_rules += 1;
         let right_result = right_interner.intern(right_result);
         for symbol in symbols.iter() {
@@ -476,6 +481,9 @@ pub(crate) fn for_each_nullary_edge<R, I>(
                 continue;
             };
             for &left_rule_idx in left_rule_indexes {
+                if control.is_some_and(ParseControl::is_cancelled) {
+                    return;
+                }
                 let left_rule = &left_rules[left_rule_idx];
                 on_edge(NullaryEdge {
                     rule_index: left_rule_idx,
@@ -508,6 +516,7 @@ pub(crate) fn for_each_candidate_edge<R: CondensedTa>(
     right_interner: &mut Interner<R::State>,
     right_by_child_cache: &mut FxHashMap<(usize, StateId), Vec<OwnedCondensedRule<StateId>>>,
     stats: &mut IndexedCondensedIntersectionStats,
+    control: Option<&ParseControl>,
     on_edge: &mut dyn FnMut(CandidateEdge),
 ) where
     R::State: Clone + Eq + Hash,
@@ -517,6 +526,9 @@ pub(crate) fn for_each_candidate_edge<R: CondensedTa>(
     };
 
     for &(symbol, position, left_rule_idx) in left_occurrences {
+        if control.is_some_and(ParseControl::is_cancelled) {
+            return;
+        }
         stat_inc!(stats, left_occurrences_considered);
         let left_rule = &left_rules[left_rule_idx];
         let cache_key = (position, trigger_right);
@@ -528,6 +540,9 @@ pub(crate) fn for_each_candidate_edge<R: CondensedTa>(
                 position,
                 &raw_state,
                 &mut |children, symbols, result| {
+                    if control.is_some_and(ParseControl::is_cancelled) {
+                        return;
+                    }
                     collected.push(OwnedCondensedRule {
                         children: children
                             .iter()
@@ -543,6 +558,9 @@ pub(crate) fn for_each_candidate_edge<R: CondensedTa>(
         });
 
         for right_rule in right_rules {
+            if control.is_some_and(ParseControl::is_cancelled) {
+                return;
+            }
             stat_inc!(stats, right_rules_scanned);
             if !right_rule.symbols.contains(symbol)
                 || right_rule.children.len() != left_rule.children.len()
@@ -633,6 +651,33 @@ where
     R: CondensedTa,
     R::State: Clone + Eq + Hash,
 {
+    materialize_indexed_condensed_intersection_with_pairs_controlled(
+        left,
+        right,
+        &ParseControl::new(),
+    )
+    .expect("a fresh parse control cannot be cancelled")
+}
+
+#[allow(clippy::type_complexity)]
+pub(crate) fn materialize_indexed_condensed_intersection_with_pairs_controlled<R>(
+    left: &Explicit,
+    right: &R,
+    control: &ParseControl,
+) -> Result<
+    (
+        Explicit,
+        Interner<R::State>,
+        Vec<(StateId, StateId)>,
+        IndexedCondensedIntersectionStats,
+    ),
+    ParseCancelled,
+>
+where
+    R: CondensedTa,
+    R::State: Clone + Eq + Hash,
+{
+    control.check()?;
     let left_rules: Vec<_> = left
         .rules()
         .map(|rule| OwnedRule {
@@ -663,9 +708,12 @@ where
         right,
         &mut right_interner,
         &mut stats,
+        Some(control),
         &mut |edge| nullary_edges.push(edge),
     );
+    control.check()?;
     for edge in nullary_edges {
+        control.check()?;
         let (parent, is_new) = get_or_create_product_id(
             edge.parent_left,
             edge.parent_right,
@@ -689,6 +737,7 @@ where
     }
 
     while let Some((left_state, right_state, current_product)) = queue.pop_front() {
+        control.check()?;
         stat_inc!(stats, queue_pops);
 
         // Collect candidate edges first, then apply them (avoids borrow conflicts on
@@ -706,9 +755,12 @@ where
             &mut right_interner,
             &mut right_by_child_cache,
             &mut stats,
+            Some(control),
             &mut |edge| candidate_edges.push(edge),
         );
+        control.check()?;
         for edge in candidate_edges {
+            control.check()?;
             if !current_product_is_latest(&edge.children, edge.trigger_position, current_product) {
                 continue;
             }
@@ -739,7 +791,7 @@ where
     stats.output_states = product_pairs.len();
     let explicit = builder.build_trusted();
     stats.output_rules = explicit.rules().count();
-    (explicit, right_interner, product_pairs, stats)
+    Ok((explicit, right_interner, product_pairs, stats))
 }
 
 /// Materialize the intersection using parent-indexed condensed right queries.
@@ -781,6 +833,33 @@ where
     R: CondensedTopDownTa,
     R::State: Clone + Eq + Hash,
 {
+    materialize_topdown_condensed_intersection_with_pairs_controlled(
+        left,
+        right,
+        &ParseControl::new(),
+    )
+    .expect("a fresh parse control cannot be cancelled")
+}
+
+#[allow(clippy::type_complexity)]
+pub(crate) fn materialize_topdown_condensed_intersection_with_pairs_controlled<R>(
+    left: &Explicit,
+    right: &R,
+    control: &ParseControl,
+) -> Result<
+    (
+        Explicit,
+        Interner<R::State>,
+        Vec<(StateId, StateId)>,
+        IndexedCondensedIntersectionStats,
+    ),
+    ParseCancelled,
+>
+where
+    R: CondensedTopDownTa,
+    R::State: Clone + Eq + Hash,
+{
+    control.check()?;
     let left_rules: Vec<_> = left
         .rules()
         .map(|rule| OwnedRule {
@@ -806,17 +885,22 @@ where
         visited: FixedBitSet::new(),
         matches_scratch: Vec::new(),
         stats: IndexedCondensedIntersectionStats::default(),
+        control,
     };
 
     right.condensed_initial_states(&mut |q| {
+        if control.is_cancelled() {
+            return;
+        }
         let q = ctx.intern_right(q);
         ctx.visit(q);
     });
+    control.check()?;
 
     ctx.stats.output_states = ctx.product_pairs.len();
     let explicit = ctx.builder.build_trusted();
     ctx.stats.output_rules = explicit.rules().count();
-    (explicit, ctx.right_interner, ctx.product_pairs, ctx.stats)
+    Ok((explicit, ctx.right_interner, ctx.product_pairs, ctx.stats))
 }
 
 struct TopDownIntersection<'a, R>
@@ -837,6 +921,7 @@ where
     visited: FixedBitSet,
     matches_scratch: Vec<usize>,
     stats: IndexedCondensedIntersectionStats,
+    control: &'a ParseControl,
 }
 
 impl<R> TopDownIntersection<'_, R>
@@ -857,6 +942,9 @@ where
     }
 
     fn visit(&mut self, q: StateId) {
+        if self.control.is_cancelled() {
+            return;
+        }
         if self.visited.contains(q.index()) {
             return;
         }
@@ -869,6 +957,9 @@ where
 
         self.right
             .condensed_rules_by_parent(&raw_parent, &mut |symbols, children| {
+                if self.control.is_cancelled() {
+                    return;
+                }
                 let children: SmallVec<[StateId; 2]> = children
                     .iter()
                     .cloned()
@@ -887,6 +978,9 @@ where
             });
 
         for right_rule in normal_rules {
+            if self.control.is_cancelled() {
+                return;
+            }
             for &child in &right_rule.children {
                 self.visit(child);
             }
@@ -894,6 +988,9 @@ where
         }
 
         for right_rule in &loop_rules {
+            if self.control.is_cancelled() {
+                return;
+            }
             for &child in &right_rule.children {
                 if child != q {
                     self.visit(child);
@@ -925,6 +1022,9 @@ where
         drop(child_sets);
         let matches = std::mem::take(&mut self.matches_scratch);
         for &rule_idx in &matches {
+            if self.control.is_cancelled() {
+                return;
+            }
             let left_rule = &self.left_rules[rule_idx];
             self.collect_pair(left_rule, right_rule);
         }
@@ -937,6 +1037,9 @@ where
         }
 
         for right_rule in loop_rules {
+            if self.control.is_cancelled() {
+                return;
+            }
             for loop_position in right_rule
                 .children
                 .iter()
@@ -950,6 +1053,9 @@ where
                 let mut seen = self.partners[q.index()].clone();
 
                 while let Some(left_at_loop) = agenda.pop_front() {
+                    if self.control.is_cancelled() {
+                        return;
+                    }
                     let mut child_sets = SmallVec::<[StateSetView<'_>; 4]>::new();
                     let mut missing = false;
                     for (position, &right_child) in right_rule.children.iter().enumerate() {
@@ -977,6 +1083,9 @@ where
 
                     let mut newly_added = SmallVec::<[StateId; 4]>::new();
                     for &rule_idx in &matches {
+                        if self.control.is_cancelled() {
+                            return;
+                        }
                         let left_rule = &self.left_rules[rule_idx];
                         if self.collect_pair(left_rule, right_rule) && seen.insert(left_rule.result)
                         {

@@ -15,7 +15,8 @@ mod product_state;
 
 use crate::{
     BottomUpTa, CondensedTa, DetBottomUpTa, Explicit, ExplicitBuilder, FxHashMap, Interner, InvHom,
-    ProbabilityScorer, Span, StateId, StringDecompositionAutomaton, Symbol, WeightScorer,
+    ParseControl, ProbabilityScorer, Span, StateId, StringDecompositionAutomaton, Symbol,
+    WeightScorer,
     algebras::{
         SpanAstarLeftIndex, SpanBinarySiblingGroup, SpanInterner, SpanProductSibling,
         SpanProductSiblingFinder, StringAstarSource, string_fallback_rules,
@@ -1079,6 +1080,7 @@ where
             self.right,
             &mut self.right_interner,
             &mut self.mat_stats,
+            None,
             &mut |edge| nullary_edges.push(edge),
         );
         for edge in nullary_edges {
@@ -1146,6 +1148,7 @@ where
         h: &H,
         scorer: &S,
         stop_at_first_goal: bool,
+        control: Option<&ParseControl>,
         mut on_finalize: OnFin,
     ) where
         H: IntersectionHeuristic<R>,
@@ -1155,7 +1158,13 @@ where
     {
         source.seed(self, h, scorer);
         loop {
+            if control.is_some_and(ParseControl::is_cancelled) {
+                break;
+            }
             source.prepare_next(self, h, scorer);
+            if control.is_some_and(ParseControl::is_cancelled) {
+                break;
+            }
             let Some(item) = self.pop_next_finalized() else {
                 break;
             };
@@ -1638,7 +1647,7 @@ where
     S: WeightScorer,
 {
     let (chart, states, _pairs, stats) =
-        materialize_astar_intersection_with_index(left, right, h, options, scorer);
+        materialize_astar_intersection_with_index(left, right, h, options, scorer, None);
     (chart, states, stats)
 }
 
@@ -1677,35 +1686,82 @@ where
 }
 
 /// Like [`materialize_astar_intersection_with`], retaining product-state identities.
+#[allow(clippy::type_complexity)]
 pub(crate) fn materialize_astar_intersection_with_pairs<R, H, S>(
     left: &Explicit,
     right: &R,
     h: &H,
     options: AstarOptions,
     scorer: &S,
-) -> (Explicit, Interner<R::State>, Vec<(StateId, StateId)>, AstarStats)
+) -> (
+    Explicit,
+    Interner<R::State>,
+    Vec<(StateId, StateId)>,
+    AstarStats,
+)
 where
     R: CondensedTa,
     R::State: Clone + Eq + Hash,
     H: IntersectionHeuristic<R>,
     S: WeightScorer,
 {
-    materialize_astar_intersection_with_index(left, right, h, options, scorer)
+    materialize_astar_intersection_with_index(left, right, h, options, scorer, None)
 }
 
-pub(crate) fn materialize_astar_string_intersection_with<'h, H, S>(
+#[allow(clippy::type_complexity)]
+pub(crate) fn materialize_astar_intersection_with_pairs_controlled<R, H, S>(
+    left: &Explicit,
+    right: &R,
+    h: &H,
+    options: AstarOptions,
+    scorer: &S,
+    control: &ParseControl,
+) -> (
+    Explicit,
+    Interner<R::State>,
+    Vec<(StateId, StateId)>,
+    AstarStats,
+)
+where
+    R: CondensedTa,
+    R::State: Clone + Eq + Hash,
+    H: IntersectionHeuristic<R>,
+    S: WeightScorer,
+{
+    materialize_astar_intersection_with_index(left, right, h, options, scorer, Some(control))
+}
+
+pub(crate) fn materialize_astar_string_intersection_with_controlled<'h, H, S>(
     left: &Explicit,
     right: &InvHom<'h, StringDecompositionAutomaton>,
     h: &H,
     options: AstarOptions,
     scorer: &S,
+    control: &ParseControl,
 ) -> (Explicit, Interner<Span>, AstarStats)
 where
     H: IntersectionHeuristic<InvHom<'h, StringDecompositionAutomaton>>,
     S: WeightScorer,
 {
     let prepared = PreparedAstarGrammar::new(left);
-    materialize_astar_string_intersection_with_prepared(left, &prepared, right, h, options, scorer)
+    prepared.assert_matches(left);
+    let fallback_rules = string_fallback_rules(
+        &prepared.left_rules,
+        right.homomorphism(),
+        right.inner().concat_symbol(),
+    );
+    materialize_astar_intersection_with_span_sibling(
+        left,
+        &prepared,
+        right,
+        h,
+        options,
+        scorer,
+        right.inner().len(),
+        Some(&fallback_rules),
+        false,
+        Some(control),
+    )
 }
 
 /// Materialize a string intersection while reusing prepared grammar indexes.
@@ -1737,6 +1793,7 @@ where
         right.inner().len(),
         Some(&fallback_rules),
         false,
+        None,
     )
 }
 
@@ -1751,6 +1808,7 @@ fn materialize_astar_intersection_with_span_sibling<R, H, S>(
     sentence_len: usize,
     fallback_rules: Option<&FixedBitSet>,
     lazy: bool,
+    control: Option<&ParseControl>,
 ) -> (Explicit, Interner<Span>, AstarStats)
 where
     R: CondensedTa<State = Span> + DetBottomUpTa<State = Span>,
@@ -1806,10 +1864,24 @@ where
         && !prepared.span_left_index.has_any_higher_arity();
     if use_lazy {
         let mut source = LazyStringAstarSource::new(&prepared.span_left_index);
-        ctx.run_with_source(&mut source, h, scorer, stop_at_first_goal, on_finalize);
+        ctx.run_with_source(
+            &mut source,
+            h,
+            scorer,
+            stop_at_first_goal,
+            control,
+            on_finalize,
+        );
     } else {
         let mut source = StringAstarSource::new(&prepared.span_left_index, fallback_rules);
-        ctx.run_with_source(&mut source, h, scorer, stop_at_first_goal, on_finalize);
+        ctx.run_with_source(
+            &mut source,
+            h,
+            scorer,
+            stop_at_first_goal,
+            control,
+            on_finalize,
+        );
     }
 
     ctx.stats.output_states = ctx.product_pairs.len();
@@ -1824,13 +1896,20 @@ where
     )
 }
 
+#[allow(clippy::type_complexity)]
 fn materialize_astar_intersection_with_index<R, H, S>(
     left: &Explicit,
     right: &R,
     h: &H,
     options: AstarOptions,
     scorer: &S,
-) -> (Explicit, Interner<R::State>, Vec<(StateId, StateId)>, AstarStats)
+    control: Option<&ParseControl>,
+) -> (
+    Explicit,
+    Interner<R::State>,
+    Vec<(StateId, StateId)>,
+    AstarStats,
+)
 where
     R: CondensedTa,
     R::State: Clone + Eq + Hash,
@@ -1867,6 +1946,7 @@ where
         h,
         scorer,
         stop_at_first_goal,
+        control,
         |ctx, _product, edge, _inside, merit| {
             // Emit a rule if in beam mode or one-best mode.
             let emit = stop_at_first_goal || beam.is_none_or(|threshold| merit >= threshold);
@@ -1893,12 +1973,7 @@ where
 
     let builder = ctx.builder.take().unwrap_or_default();
     let explicit = builder.build_trusted();
-    (
-        explicit,
-        ctx.right_interner,
-        ctx.product_pairs,
-        ctx.stats,
-    )
+    (explicit, ctx.right_interner, ctx.product_pairs, ctx.stats)
 }
 
 // ---------------------------------------------------------------------------
@@ -2091,10 +2166,10 @@ where
         && !prepared.span_left_index.has_any_higher_arity();
     if use_lazy {
         let mut source = LazyStringAstarSource::new(&prepared.span_left_index);
-        ctx.run_with_source(&mut source, h, scorer, true, on_finalize);
+        ctx.run_with_source(&mut source, h, scorer, true, None, on_finalize);
     } else {
         let mut source = StringAstarSource::new(&prepared.span_left_index, fallback_rules);
-        ctx.run_with_source(&mut source, h, scorer, true, on_finalize);
+        ctx.run_with_source(&mut source, h, scorer, true, None, on_finalize);
     }
     ctx.stats.output_states = ctx.product_pairs.len();
 
@@ -2156,6 +2231,7 @@ where
         h,
         scorer,
         true,
+        None,
         |ctx, product, _edge, inside, _merit| {
             if goal_state.is_none() && ctx.is_accepting_product(product) {
                 goal_state = Some((product, inside));
@@ -2730,6 +2806,7 @@ mod tests {
             n,
             None,
             false,
+            None,
         );
         let (lazy_chart, _, lazy_stats) = materialize_astar_intersection_with_span_sibling(
             &grammar,
@@ -2741,6 +2818,7 @@ mod tests {
             n,
             None,
             true,
+            None,
         );
 
         // Full chart: same finalized states, same emitted rules, same best tree.

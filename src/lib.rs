@@ -69,6 +69,7 @@ lalrpop_util::lalrpop_mod!(
 pub mod codec;
 pub mod codecs;
 pub mod combinators;
+pub mod control;
 pub mod corpus;
 pub mod explicit;
 pub mod heuristic;
@@ -93,11 +94,11 @@ pub use algebras::{
     Binarizing, CONC11, CONC12, CONC21, EvaluatingDecompositionAutomaton, FS_EMBED_PREFIX,
     FS_PROJECT_PREFIX, FS_REMAP_PREFIX, FS_UNIFY, FeatureStructure, FeatureStructureAlgebra,
     FeatureStructureAttribute, FeatureStructureFilter, FeatureStructureNode,
-    FeatureStructureNodeId, FeatureStructureParseError, SentenceSxHeuristic, Span,
-    StringAlgebra, StringDecompositionAutomaton, TAG_E, TAG_EE, TAG_HOLE, TAG_SUBSTITUTE,
-    TagSpan, TagStringAlgebra, TagStringDecompositionAutomaton, TagStringValue, TagTreeAlgebra,
-    TagTreeContext, TagTreeDecompositionAutomaton, TreeAlgebra, TreeValue,
-    UniversalSxHeuristic, WRAP21, WRAP22,
+    FeatureStructureNodeId, FeatureStructureParseError, SentenceSxHeuristic, Span, StringAlgebra,
+    StringDecompositionAutomaton, TAG_E, TAG_EE, TAG_HOLE, TAG_SUBSTITUTE, TagSpan,
+    TagStringAlgebra, TagStringDecompositionAutomaton, TagStringValue, TagTreeAlgebra,
+    TagTreeContext, TagTreeDecompositionAutomaton, TreeAlgebra, TreeValue, UniversalSxHeuristic,
+    WRAP21, WRAP22,
 };
 #[allow(deprecated)]
 pub use alto::{
@@ -123,6 +124,7 @@ pub use codec::{
 };
 pub use codecs::{TulipacError, TulipacInputCodec};
 pub use combinators::{Determinized, InvHom, Mapped, Product};
+pub use control::ParseControl;
 pub use corpus::{Corpus, CorpusError, CorpusWriter, Instance, read_corpus};
 pub use explicit::{Explicit, ExplicitBuildError, ExplicitBuilder, Rule};
 pub use heuristic::{

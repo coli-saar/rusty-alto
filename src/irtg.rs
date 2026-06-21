@@ -2,26 +2,26 @@
 
 use crate::{
     APPEND_SYMBOL, Algebra, BinarizedTagTreeDecompositionAutomaton, Binarizing, BottomUpTa,
-    CondensedTa, DisplayCodec, Explicit, ExplicitBuildError, ExplicitBuilder, FeatureStructure,
-    FeatureStructureAlgebra, FxHashMap, FxHashSet, Homomorphism, HomomorphismError,
-    IndexedCondensedIntersectionStats, Interner, InvHom, MinHeuristic, ObligatoryLeafTables,
-    CodecMetadata, OutputCodec, OutputCodecError, OutputCodecRegistry, OutsideHeuristic,
-    ScoredZeroHeuristic, Signature, SignatureError, SpaceJoinCodec, StateId, StateUniverse,
-    StringAlgebra, Symbol, TagStringAlgebra,
-    TagStringDecompositionAutomaton, TagStringValue, TagTreeAlgebra, TagTreeDecompositionAutomaton,
-    TopDownTa, TreeAlgebra, UniversalSxHeuristic, VisualRepresentation, ViterbiTree, WeightScorer,
-    ZeroHeuristic,
+    CodecMetadata, CondensedTa, DisplayCodec, Explicit, ExplicitBuildError, ExplicitBuilder,
+    FeatureStructure, FeatureStructureAlgebra, FxHashMap, FxHashSet, Homomorphism,
+    HomomorphismError, IndexedCondensedIntersectionStats, Interner, InvHom, MinHeuristic,
+    ObligatoryLeafTables, OutputCodec, OutputCodecError, OutputCodecRegistry, OutsideHeuristic,
+    ParseControl, ScoredZeroHeuristic, Signature, SignatureError, SpaceJoinCodec, StateId,
+    StateUniverse, StringAlgebra, Symbol, TagStringAlgebra, TagStringDecompositionAutomaton,
+    TagStringValue, TagTreeAlgebra, TagTreeDecompositionAutomaton, TopDownTa, TreeAlgebra,
+    UniversalSxHeuristic, VisualRepresentation, ViterbiTree, WeightScorer, ZeroHeuristic,
     alto_ast::{AstHomTerm, AstIrtg, AstState, LexError, Tok, lex},
     alto_grammar,
     astar::{
         AstarOptions, AstarStats, PreparedAstarGrammar, astar_one_best_with_stats,
         astar_string_one_best_with_stats, astar_string_one_best_with_stats_prepared,
-        materialize_astar_intersection_with_pairs, materialize_astar_string_intersection_with,
+        materialize_astar_intersection_with_pairs_controlled,
+        materialize_astar_string_intersection_with_controlled,
     },
     materialize::{
-        materialize_indexed_condensed_intersection_with_pairs,
+        materialize_indexed_condensed_intersection_with_pairs_controlled,
         materialize_topdown_condensed_intersection,
-        materialize_topdown_condensed_intersection_with_pairs,
+        materialize_topdown_condensed_intersection_with_pairs_controlled,
     },
 };
 use lalrpop_util::ParseError;
@@ -57,7 +57,9 @@ fn filter_feature_chart(
     chart: &Explicit,
     algebra: &FeatureStructureAlgebra,
     homomorphism: &Homomorphism,
-) -> NonNullFilteredChart {
+    control: &ParseControl,
+) -> Result<NonNullFilteredChart, IrtgError> {
+    control.check().map_err(|_| IrtgError::Cancelled)?;
     let filter = InvHom::new(algebra.filter(), homomorphism);
     let rules: Vec<_> = chart
         .rules()
@@ -101,10 +103,15 @@ fn filter_feature_chart(
 
     let mut changed = true;
     while changed {
+        control.check().map_err(|_| IrtgError::Cancelled)?;
         changed = false;
         for (symbol, children, result, weight) in &rules {
+            control.check().map_err(|_| IrtgError::Cancelled)?;
             if children.is_empty() {
                 filter.step(*symbol, &[], &mut |value| {
+                    if control.is_cancelled() {
+                        return;
+                    }
                     let (parent, is_new) = intern(
                         *result,
                         value,
@@ -133,10 +140,16 @@ fn filter_feature_chart(
                 .collect();
             let pools: Vec<_> = pool_storage.iter().map(Vec::as_slice).collect();
             crate::run::cartesian_product(&pools, |combination| {
+                if control.is_cancelled() {
+                    return;
+                }
                 let child_values: Vec<_> =
                     combination.iter().map(|(value, _)| value.clone()).collect();
                 let child_ids: Vec<_> = combination.iter().map(|(_, id)| *id).collect();
                 filter.step(*symbol, &child_values, &mut |value| {
+                    if control.is_cancelled() {
+                        return;
+                    }
                     let (parent, is_new) = intern(
                         *result,
                         value,
@@ -152,12 +165,13 @@ fn filter_feature_chart(
                     }
                 });
             });
+            control.check().map_err(|_| IrtgError::Cancelled)?;
         }
     }
-    NonNullFilteredChart {
+    Ok(NonNullFilteredChart {
         automaton: builder.build(),
         state_origins,
-    }
+    })
 }
 
 /// A chart filtered to terms whose interpretation evaluates successfully.
@@ -303,6 +317,20 @@ impl Irtg {
         chart: &Explicit,
         interpretation_name: &str,
     ) -> Result<NonNullFilteredChart, IrtgError> {
+        self.filter_non_null_with_state_origins_controlled(
+            chart,
+            interpretation_name,
+            &ParseControl::new(),
+        )
+    }
+
+    /// Filter a chart while allowing another thread to request cancellation.
+    pub fn filter_non_null_with_state_origins_controlled(
+        &self,
+        chart: &Explicit,
+        interpretation_name: &str,
+        control: &ParseControl,
+    ) -> Result<NonNullFilteredChart, IrtgError> {
         let interpretation = self
             .interpretations
             .get(interpretation_name)
@@ -318,11 +346,7 @@ impl Irtg {
             .as_ref()
             .downcast_ref::<FeatureStructureAlgebra>()
             .expect("non-null filter capability must match its algebra");
-        Ok(filter_feature_chart(
-            chart,
-            algebra,
-            &interpretation.homomorphism,
-        ))
+        filter_feature_chart(chart, algebra, &interpretation.homomorphism, control)
     }
 
     /// Iterate over all interpretations (in unspecified order).
@@ -378,6 +402,17 @@ impl Irtg {
         inputs: impl IntoIterator<Item = ParseInput<'a>>,
         strategy: &MaterializationStrategy<'_>,
     ) -> Result<ParseChart, IrtgError> {
+        self.parse_with_control(inputs, strategy, &ParseControl::new())
+    }
+
+    /// Parse with a strategy and a cooperative cancellation control.
+    pub fn parse_with_control<'a>(
+        &self,
+        inputs: impl IntoIterator<Item = ParseInput<'a>>,
+        strategy: &MaterializationStrategy<'_>,
+        control: &ParseControl,
+    ) -> Result<ParseChart, IrtgError> {
+        control.check().map_err(|_| IrtgError::Cancelled)?;
         // Guard: A* requires probability weights (≤ 1).
         if matches!(strategy, MaterializationStrategy::Astar { .. }) {
             self.check_astar_weight_precondition()?;
@@ -390,6 +425,7 @@ impl Irtg {
         let mut stats = Vec::new();
 
         for input in inputs {
+            control.check().map_err(|_| IrtgError::Cancelled)?;
             let interpretation = input.interpretation;
             match interpretation.kind {
                 InterpretationKind::String => {
@@ -403,9 +439,10 @@ impl Irtg {
                     let next_chart = match strategy {
                         MaterializationStrategy::TopDownCondensed => {
                             let (c, right_states, pairs, stat) =
-                                materialize_topdown_condensed_intersection_with_pairs(
-                                    &chart, &invhom,
-                                );
+                                materialize_topdown_condensed_intersection_with_pairs_controlled(
+                                    &chart, &invhom, control,
+                                )
+                                .map_err(|_| IrtgError::Cancelled)?;
                             state_names = pairs
                                 .into_iter()
                                 .map(|(left, right)| {
@@ -423,9 +460,10 @@ impl Irtg {
                         }
                         MaterializationStrategy::IndexedCondensed => {
                             let (c, right_states, pairs, stat) =
-                                materialize_indexed_condensed_intersection_with_pairs(
-                                    &chart, &invhom,
-                                );
+                                materialize_indexed_condensed_intersection_with_pairs_controlled(
+                                    &chart, &invhom, control,
+                                )
+                                .map_err(|_| IrtgError::Cancelled)?;
                             state_names = pairs
                                 .into_iter()
                                 .map(|(left, right)| {
@@ -448,7 +486,8 @@ impl Irtg {
                             // We need owned options — clone by rebuilding (AstarOptions is not Clone).
                             // Instead, call materialize_astar_intersection with a fresh options value.
                             // We route via a helper to avoid duplicating logic.
-                            let c = self.run_astar_chart(&chart, &invhom, heuristic, strategy)?;
+                            let c = self
+                                .run_astar_chart(&chart, &invhom, heuristic, strategy, control)?;
                             state_names = (0..c.num_states())
                                 .map(|state| format!("q{state}"))
                                 .collect();
@@ -474,6 +513,7 @@ impl Irtg {
                         &interpretation.homomorphism,
                         strategy,
                         &interpretation.name,
+                        control,
                     )?;
                     if let Some(stat) = stat {
                         stats.push(stat);
@@ -497,6 +537,7 @@ impl Irtg {
                         &interpretation.homomorphism,
                         strategy,
                         &interpretation.name,
+                        control,
                     )?;
                     if let Some(stat) = stat {
                         stats.push(stat);
@@ -520,6 +561,7 @@ impl Irtg {
                         &interpretation.homomorphism,
                         strategy,
                         &interpretation.name,
+                        control,
                     )?;
                     if let Some(stat) = stat {
                         stats.push(stat);
@@ -719,6 +761,7 @@ impl Irtg {
     // Private helpers
     // -----------------------------------------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     fn run_generic_chart<R>(
         &self,
         chart: &Explicit,
@@ -727,7 +770,15 @@ impl Irtg {
         homomorphism: &Homomorphism,
         strategy: &MaterializationStrategy<'_>,
         interpretation: &str,
-    ) -> Result<(Explicit, Vec<String>, Option<IndexedCondensedIntersectionStats>), IrtgError>
+        control: &ParseControl,
+    ) -> Result<
+        (
+            Explicit,
+            Vec<String>,
+            Option<IndexedCondensedIntersectionStats>,
+        ),
+        IrtgError,
+    >
     where
         R: CondensedTa + StateUniverse + TopDownTa,
         R::State: Clone + Eq + Hash + fmt::Display,
@@ -736,13 +787,19 @@ impl Irtg {
         match strategy {
             MaterializationStrategy::TopDownCondensed => {
                 let (chart, right_states, pairs, stats) =
-                    materialize_topdown_condensed_intersection_with_pairs(chart, &invhom);
+                    materialize_topdown_condensed_intersection_with_pairs_controlled(
+                        chart, &invhom, control,
+                    )
+                    .map_err(|_| IrtgError::Cancelled)?;
                 let names = product_state_names(left_state_names, &right_states, &pairs);
                 Ok((chart, names, Some(stats)))
             }
             MaterializationStrategy::IndexedCondensed => {
                 let (chart, right_states, pairs, stats) =
-                    materialize_indexed_condensed_intersection_with_pairs(chart, &invhom);
+                    materialize_indexed_condensed_intersection_with_pairs_controlled(
+                        chart, &invhom, control,
+                    )
+                    .map_err(|_| IrtgError::Cancelled)?;
                 let names = product_state_names(left_state_names, &right_states, &pairs);
                 Ok((chart, names, Some(stats)))
             }
@@ -754,23 +811,29 @@ impl Irtg {
                 let (chart, right_states, pairs) = match heuristic {
                     AstarHeuristic::Zero => {
                         let heuristic = ZeroHeuristic;
-                        let (chart, states, pairs, _) = materialize_astar_intersection_with_pairs(
-                            chart,
-                            &invhom,
-                            &heuristic,
-                            options,
-                            &crate::ProbabilityScorer,
-                        );
+                        let (chart, states, pairs, _) =
+                            materialize_astar_intersection_with_pairs_controlled(
+                                chart,
+                                &invhom,
+                                &heuristic,
+                                options,
+                                &crate::ProbabilityScorer,
+                                control,
+                            );
+                        control.check().map_err(|_| IrtgError::Cancelled)?;
                         (chart, states, pairs)
                     }
                     AstarHeuristic::Outside(heuristic) => {
-                        let (chart, states, pairs, _) = materialize_astar_intersection_with_pairs(
-                            chart,
-                            &invhom,
-                            *heuristic,
-                            options,
-                            &crate::ProbabilityScorer,
-                        );
+                        let (chart, states, pairs, _) =
+                            materialize_astar_intersection_with_pairs_controlled(
+                                chart,
+                                &invhom,
+                                *heuristic,
+                                options,
+                                &crate::ProbabilityScorer,
+                                control,
+                            );
+                        control.check().map_err(|_| IrtgError::Cancelled)?;
                         (chart, states, pairs)
                     }
                     AstarHeuristic::UniversalSx { .. } | AstarHeuristic::UniversalSxF { .. } => {
@@ -849,6 +912,7 @@ impl Irtg {
         invhom: &InvHom<'_, crate::algebras::StringDecompositionAutomaton>,
         heuristic: &AstarHeuristic<'_>,
         strategy: &MaterializationStrategy<'_>,
+        control: &ParseControl,
     ) -> Result<Explicit, IrtgError> {
         let options = match strategy {
             MaterializationStrategy::Astar { options, .. } => AstarOptions {
@@ -860,44 +924,49 @@ impl Irtg {
         let (new_chart, _, _) = match heuristic {
             AstarHeuristic::Zero => {
                 let h = ZeroHeuristic;
-                materialize_astar_string_intersection_with(
+                materialize_astar_string_intersection_with_controlled(
                     chart,
                     invhom,
                     &h,
                     options,
                     &crate::ProbabilityScorer,
+                    control,
                 )
             }
-            AstarHeuristic::Outside(h) => materialize_astar_string_intersection_with(
+            AstarHeuristic::Outside(h) => materialize_astar_string_intersection_with_controlled(
                 chart,
                 invhom,
                 *h,
                 options,
                 &crate::ProbabilityScorer,
+                control,
             ),
             AstarHeuristic::UniversalSx { table, n } => {
                 let h = table.for_sentence(*n);
-                materialize_astar_string_intersection_with(
+                materialize_astar_string_intersection_with_controlled(
                     chart,
                     invhom,
                     &h,
                     options,
                     &crate::ProbabilityScorer,
+                    control,
                 )
             }
             AstarHeuristic::UniversalSxF { table, oblig, n } => {
                 let sx = table.for_sentence(*n);
                 let f = oblig.for_sentence(invhom.inner().sentence(), &crate::ProbabilityScorer);
                 let h = MinHeuristic::new(sx, f);
-                materialize_astar_string_intersection_with(
+                materialize_astar_string_intersection_with_controlled(
                     chart,
                     invhom,
                     &h,
                     options,
                     &crate::ProbabilityScorer,
+                    control,
                 )
             }
         };
+        control.check().map_err(|_| IrtgError::Cancelled)?;
         Ok(new_chart)
     }
 
@@ -1585,6 +1654,9 @@ pub struct ParseChart {
 /// Errors returned by IRTG parsing, construction, and parsing.
 #[derive(Debug, Error)]
 pub enum IrtgError {
+    /// The caller requested cooperative cancellation.
+    #[error("parsing cancelled")]
+    Cancelled,
     /// Input bytes were not valid UTF-8.
     #[error("input is not valid UTF-8: {0}")]
     Utf8(#[from] std::string::FromUtf8Error),
