@@ -1637,7 +1637,9 @@ where
     H: IntersectionHeuristic<R>,
     S: WeightScorer,
 {
-    materialize_astar_intersection_with_index(left, right, h, options, scorer)
+    let (chart, states, _pairs, stats) =
+        materialize_astar_intersection_with_index(left, right, h, options, scorer);
+    (chart, states, stats)
 }
 
 /// Compatibility alias for [`materialize_astar_viterbi_forest`].
@@ -1669,7 +1671,26 @@ where
     H: IntersectionHeuristic<R>,
     S: WeightScorer,
 {
-    materialize_astar_viterbi_forest_with(left, right, h, options, scorer)
+    let (chart, states, _pairs, stats) =
+        materialize_astar_intersection_with_pairs(left, right, h, options, scorer);
+    (chart, states, stats)
+}
+
+/// Like [`materialize_astar_intersection_with`], retaining product-state identities.
+pub(crate) fn materialize_astar_intersection_with_pairs<R, H, S>(
+    left: &Explicit,
+    right: &R,
+    h: &H,
+    options: AstarOptions,
+    scorer: &S,
+) -> (Explicit, Interner<R::State>, Vec<(StateId, StateId)>, AstarStats)
+where
+    R: CondensedTa,
+    R::State: Clone + Eq + Hash,
+    H: IntersectionHeuristic<R>,
+    S: WeightScorer,
+{
+    materialize_astar_intersection_with_index(left, right, h, options, scorer)
 }
 
 pub(crate) fn materialize_astar_string_intersection_with<'h, H, S>(
@@ -1809,7 +1830,7 @@ fn materialize_astar_intersection_with_index<R, H, S>(
     h: &H,
     options: AstarOptions,
     scorer: &S,
-) -> (Explicit, Interner<R::State>, AstarStats)
+) -> (Explicit, Interner<R::State>, Vec<(StateId, StateId)>, AstarStats)
 where
     R: CondensedTa,
     R::State: Clone + Eq + Hash,
@@ -1872,7 +1893,12 @@ where
 
     let builder = ctx.builder.take().unwrap_or_default();
     let explicit = builder.build_trusted();
-    (explicit, ctx.right_interner, ctx.stats)
+    (
+        explicit,
+        ctx.right_interner,
+        ctx.product_pairs,
+        ctx.stats,
+    )
 }
 
 // ---------------------------------------------------------------------------

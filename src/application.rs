@@ -46,6 +46,8 @@ pub struct InterpretationInfo {
     pub class_name: String,
     /// Whether this interpretation can constrain parsing input.
     pub input_capable: bool,
+    /// Whether this interpretation can require evaluation to produce a value.
+    pub non_null_filter_capable: bool,
 }
 
 /// One resolved automaton rule suitable for tables and serialization.
@@ -308,6 +310,7 @@ impl Irtg {
                 name: interpretation.name().to_owned(),
                 class_name: interpretation.class_name().to_owned(),
                 input_capable: interpretation.is_inputable(),
+                non_null_filter_capable: interpretation.supports_non_null_filter(),
             })
             .collect();
         values.sort_by(|a, b| a.name.cmp(&b.name));
@@ -615,6 +618,40 @@ VP -> sleeps [1.0]
         ));
         assert_eq!(evaluated[0].value.codecs()[0].name, "display");
         assert!(evaluated[0].value.encode("display").unwrap().contains("case"));
+    }
+
+    #[test]
+    fn reports_opt_in_non_null_filter_capability() {
+        let irtg = parse_irtg(
+            br#"
+            interpretation ft: de.up.ling.irtg.algebra.FeatureStructureAlgebra
+            interpretation string: de.up.ling.irtg.algebra.StringAlgebra
+            S! -> value
+              [ft] "[case: nom]"
+              [string] word
+            "# as &[u8],
+        )
+        .unwrap();
+        let info = irtg.interpretation_info();
+        let ft = info.iter().find(|item| item.name == "ft").unwrap();
+        let string = info.iter().find(|item| item.name == "string").unwrap();
+        assert!(ft.non_null_filter_capable);
+        assert!(!string.non_null_filter_capable);
+        assert!(
+            irtg.interpretation_ref("ft")
+                .unwrap()
+                .supports_non_null_filter()
+        );
+        assert!(
+            !irtg
+                .interpretation_ref("string")
+                .unwrap()
+                .supports_non_null_filter()
+        );
+        assert!(matches!(
+            irtg.filter_non_null(irtg.grammar(), "string"),
+            Err(crate::IrtgError::NonNullFilterUnsupported { .. })
+        ));
     }
 
     #[test]

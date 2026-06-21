@@ -591,7 +591,7 @@ impl<'a> Parser<'a> {
             let placeholder = self.graph.add(WorkNode::Variable);
             self.indices.insert(name, placeholder);
             self.ws();
-            if self.peek() == Some('[') {
+            if self.peek().is_some_and(|next| !matches!(next, ']' | ',')) {
                 let value = self.value()?;
                 self.graph
                     .unify(placeholder, value)

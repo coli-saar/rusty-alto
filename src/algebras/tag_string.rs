@@ -239,6 +239,19 @@ pub enum TagSpan {
     Pair(Span, Span),
 }
 
+impl fmt::Display for TagSpan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::String(span) => write!(f, "{span}"),
+            Self::Pair(left, right) => write!(
+                f,
+                "[{}-{}, {}-{}]",
+                left.start, left.end, right.start, right.end
+            ),
+        }
+    }
+}
+
 impl TagSpan {
     fn valid(self, n: usize) -> bool {
         match self {
@@ -560,6 +573,15 @@ impl IndexedBottomUpTa for TagStringDecompositionAutomaton {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn displays_string_and_pair_spans_compactly() {
+        assert_eq!(TagSpan::String(Span::new(2, 5)).to_string(), "[2-5]");
+        assert_eq!(
+            TagSpan::Pair(Span::new(2, 3), Span::new(3, 4)).to_string(),
+            "[2-3, 3-4]"
+        );
+    }
 
     #[test]
     fn evaluates_all_operations() {

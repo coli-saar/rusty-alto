@@ -9,6 +9,7 @@ use crate::{
 use fixedbitset::FixedBitSet;
 use smallvec::SmallVec;
 use std::convert::Infallible;
+use std::fmt;
 
 /// Reserved concatenation operation name for [`StringAlgebra`].
 pub const CONCAT: &str = "*";
@@ -20,6 +21,12 @@ pub struct Span {
     pub start: usize,
     /// Exclusive end position.
     pub end: usize,
+}
+
+impl fmt::Display for Span {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "[{}-{}]", self.start, self.end)
+    }
 }
 
 impl Span {
@@ -1543,6 +1550,11 @@ fn enumerate_sibling_splits_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn displays_spans_with_dash_bounds() {
+        assert_eq!(Span::new(2, 5).to_string(), "[2-5]");
+    }
 
     #[test]
     fn span_product_sibling_finder_returns_adjacent_products_in_both_directions() {

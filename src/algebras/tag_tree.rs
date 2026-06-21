@@ -582,6 +582,15 @@ pub enum BinarizedTagTreeState {
     },
 }
 
+impl fmt::Display for BinarizedTagTreeState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Inner(state) => write!(f, "{state}"),
+            Self::Sequence { rule, start, end } => write!(f, "seq{rule}[{start},{end})"),
+        }
+    }
+}
+
 /// Lazy binarization of a TAG-tree decomposition automaton.
 #[derive(Clone, Debug)]
 pub struct BinarizedTagTreeDecompositionAutomaton {

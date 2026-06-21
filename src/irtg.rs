@@ -16,10 +16,9 @@ use crate::{
     astar::{
         AstarOptions, AstarStats, PreparedAstarGrammar, astar_one_best_with_stats,
         astar_string_one_best_with_stats, astar_string_one_best_with_stats_prepared,
-        materialize_astar_intersection_with, materialize_astar_string_intersection_with,
+        materialize_astar_intersection_with_pairs, materialize_astar_string_intersection_with,
     },
     materialize::{
-        materialize_indexed_condensed_intersection,
         materialize_indexed_condensed_intersection_with_pairs,
         materialize_topdown_condensed_intersection,
         materialize_topdown_condensed_intersection_with_pairs,
@@ -37,11 +36,28 @@ use std::{
 };
 use thiserror::Error;
 
+fn product_state_names<S: Clone + Eq + Hash + fmt::Display>(
+    left_names: &[String],
+    right_states: &Interner<S>,
+    pairs: &[(StateId, StateId)],
+) -> Vec<String> {
+    pairs
+        .iter()
+        .map(|&(left, right)| {
+            let left = left_names
+                .get(left.index())
+                .cloned()
+                .unwrap_or_else(|| format!("q{}", left.0));
+            format!("{left} × {}", right_states.resolve(right))
+        })
+        .collect()
+}
+
 fn filter_feature_chart(
     chart: &Explicit,
     algebra: &FeatureStructureAlgebra,
     homomorphism: &Homomorphism,
-) -> Explicit {
+) -> NonNullFilteredChart {
     let filter = InvHom::new(algebra.filter(), homomorphism);
     let rules: Vec<_> = chart
         .rules()
@@ -56,6 +72,8 @@ fn filter_feature_chart(
         .collect();
     let mut builder = ExplicitBuilder::new();
     let mut pair_ids = FxHashMap::<(StateId, FeatureStructure), StateId>::default();
+    let mut value_ids = FxHashMap::<FeatureStructure, usize>::default();
+    let mut state_origins = Vec::<(StateId, usize)>::new();
     let mut variants = vec![Vec::<(FeatureStructure, StateId)>::new(); chart.num_states() as usize];
     let mut emitted = FxHashSet::<(Symbol, Vec<StateId>, StateId)>::default();
 
@@ -63,15 +81,20 @@ fn filter_feature_chart(
                   value: FeatureStructure,
                   builder: &mut ExplicitBuilder,
                   pair_ids: &mut FxHashMap<(StateId, FeatureStructure), StateId>,
+                  value_ids: &mut FxHashMap<FeatureStructure, usize>,
+                  state_origins: &mut Vec<(StateId, usize)>,
                   variants: &mut [Vec<(FeatureStructure, StateId)>]| {
         if let Some(&id) = pair_ids.get(&(left, value.clone())) {
             return (id, false);
         }
+        let next_value_id = value_ids.len();
+        let value_id = *value_ids.entry(value.clone()).or_insert(next_value_id);
         let id = builder.new_state();
         if chart.is_accepting(&left) {
             builder.add_accepting(id);
         }
         pair_ids.insert((left, value.clone()), id);
+        state_origins.push((left, value_id));
         variants[left.index()].push((value, id));
         (id, true)
     };
@@ -82,8 +105,15 @@ fn filter_feature_chart(
         for (symbol, children, result, weight) in &rules {
             if children.is_empty() {
                 filter.step(*symbol, &[], &mut |value| {
-                    let (parent, is_new) =
-                        intern(*result, value, &mut builder, &mut pair_ids, &mut variants);
+                    let (parent, is_new) = intern(
+                        *result,
+                        value,
+                        &mut builder,
+                        &mut pair_ids,
+                        &mut value_ids,
+                        &mut state_origins,
+                        &mut variants,
+                    );
                     changed |= is_new;
                     if emitted.insert((*symbol, Vec::new(), parent)) {
                         builder.add_weighted_rule(*symbol, Vec::new(), parent, *weight);
@@ -107,8 +137,15 @@ fn filter_feature_chart(
                     combination.iter().map(|(value, _)| value.clone()).collect();
                 let child_ids: Vec<_> = combination.iter().map(|(_, id)| *id).collect();
                 filter.step(*symbol, &child_values, &mut |value| {
-                    let (parent, is_new) =
-                        intern(*result, value, &mut builder, &mut pair_ids, &mut variants);
+                    let (parent, is_new) = intern(
+                        *result,
+                        value,
+                        &mut builder,
+                        &mut pair_ids,
+                        &mut value_ids,
+                        &mut state_origins,
+                        &mut variants,
+                    );
                     changed |= is_new;
                     if emitted.insert((*symbol, child_ids.clone(), parent)) {
                         builder.add_weighted_rule(*symbol, child_ids.clone(), parent, *weight);
@@ -117,7 +154,19 @@ fn filter_feature_chart(
             });
         }
     }
-    builder.build()
+    NonNullFilteredChart {
+        automaton: builder.build(),
+        state_origins,
+    }
+}
+
+/// A chart filtered to terms whose interpretation evaluates successfully.
+#[derive(Debug)]
+pub struct NonNullFilteredChart {
+    /// Filtered automaton.
+    pub automaton: Explicit,
+    /// For each filtered state, its source-chart state and dense filter-state ID.
+    pub state_origins: Vec<(StateId, usize)>,
 }
 
 const STRING_ALGEBRA: &str = "de.up.ling.irtg.algebra.StringAlgebra";
@@ -243,19 +292,32 @@ impl Irtg {
         chart: &Explicit,
         interpretation_name: &str,
     ) -> Result<Explicit, IrtgError> {
+        Ok(self
+            .filter_non_null_with_state_origins(chart, interpretation_name)?
+            .automaton)
+    }
+
+    /// Filter a chart while retaining source-state provenance for display.
+    pub fn filter_non_null_with_state_origins(
+        &self,
+        chart: &Explicit,
+        interpretation_name: &str,
+    ) -> Result<NonNullFilteredChart, IrtgError> {
         let interpretation = self
             .interpretations
             .get(interpretation_name)
             .ok_or_else(|| IrtgError::UnknownInterpretation(interpretation_name.to_owned()))?;
+        if !interpretation.supports_non_null_filter() {
+            return Err(IrtgError::NonNullFilterUnsupported {
+                interpretation: interpretation_name.to_owned(),
+                class_name: interpretation.class_name.clone(),
+            });
+        }
         let algebra = interpretation.algebra.lock().unwrap();
         let algebra = algebra
             .as_ref()
             .downcast_ref::<FeatureStructureAlgebra>()
-            .ok_or_else(|| IrtgError::WrongAlgebraType {
-                interpretation: interpretation_name.to_owned(),
-                requested: std::any::type_name::<FeatureStructureAlgebra>(),
-                actual: interpretation.class_name.clone(),
-            })?;
+            .expect("non-null filter capability must match its algebra");
         Ok(filter_feature_chart(
             chart,
             algebra,
@@ -405,8 +467,9 @@ impl Irtg {
                                 interpretation: interpretation.name.clone(),
                             })?;
                     let decomp = interpretation.decompose_tag_string(value)?;
-                    let (next_chart, stat) = self.run_generic_chart(
+                    let (next_chart, next_names, stat) = self.run_generic_chart(
                         &chart,
+                        &state_names,
                         decomp,
                         &interpretation.homomorphism,
                         strategy,
@@ -416,9 +479,7 @@ impl Irtg {
                         stats.push(stat);
                     }
                     chart = next_chart;
-                    state_names = (0..chart.num_states())
-                        .map(|state| format!("q{state}"))
-                        .collect();
+                    state_names = next_names;
                 }
                 InterpretationKind::TagTree => {
                     let value =
@@ -429,8 +490,9 @@ impl Irtg {
                                 interpretation: interpretation.name.clone(),
                             })?;
                     let decomp = interpretation.decompose_tag_tree(value)?;
-                    let (next_chart, stat) = self.run_generic_chart(
+                    let (next_chart, next_names, stat) = self.run_generic_chart(
                         &chart,
+                        &state_names,
                         decomp,
                         &interpretation.homomorphism,
                         strategy,
@@ -440,9 +502,7 @@ impl Irtg {
                         stats.push(stat);
                     }
                     chart = next_chart;
-                    state_names = (0..chart.num_states())
-                        .map(|state| format!("q{state}"))
-                        .collect();
+                    state_names = next_names;
                 }
                 InterpretationKind::BinarizedTagTree => {
                     let value =
@@ -453,8 +513,9 @@ impl Irtg {
                                 interpretation: interpretation.name.clone(),
                             })?;
                     let decomp = interpretation.decompose_binarized_tag_tree(value)?;
-                    let (next_chart, stat) = self.run_generic_chart(
+                    let (next_chart, next_names, stat) = self.run_generic_chart(
                         &chart,
+                        &state_names,
                         decomp,
                         &interpretation.homomorphism,
                         strategy,
@@ -464,9 +525,7 @@ impl Irtg {
                         stats.push(stat);
                     }
                     chart = next_chart;
-                    state_names = (0..chart.num_states())
-                        .map(|state| format!("q{state}"))
-                        .collect();
+                    state_names = next_names;
                 }
                 InterpretationKind::OutputOnly => {
                     return Err(IrtgError::NotInputable {
@@ -663,51 +722,56 @@ impl Irtg {
     fn run_generic_chart<R>(
         &self,
         chart: &Explicit,
+        left_state_names: &[String],
         decomp: R,
         homomorphism: &Homomorphism,
         strategy: &MaterializationStrategy<'_>,
         interpretation: &str,
-    ) -> Result<(Explicit, Option<IndexedCondensedIntersectionStats>), IrtgError>
+    ) -> Result<(Explicit, Vec<String>, Option<IndexedCondensedIntersectionStats>), IrtgError>
     where
         R: CondensedTa + StateUniverse + TopDownTa,
-        R::State: Clone + Eq + Hash,
+        R::State: Clone + Eq + Hash + fmt::Display,
     {
         let invhom = InvHom::new(decomp, homomorphism);
         match strategy {
             MaterializationStrategy::TopDownCondensed => {
-                let (chart, _, stats) = materialize_topdown_condensed_intersection(chart, &invhom);
-                Ok((chart, Some(stats)))
+                let (chart, right_states, pairs, stats) =
+                    materialize_topdown_condensed_intersection_with_pairs(chart, &invhom);
+                let names = product_state_names(left_state_names, &right_states, &pairs);
+                Ok((chart, names, Some(stats)))
             }
             MaterializationStrategy::IndexedCondensed => {
-                let (chart, _, stats) = materialize_indexed_condensed_intersection(chart, &invhom);
-                Ok((chart, Some(stats)))
+                let (chart, right_states, pairs, stats) =
+                    materialize_indexed_condensed_intersection_with_pairs(chart, &invhom);
+                let names = product_state_names(left_state_names, &right_states, &pairs);
+                Ok((chart, names, Some(stats)))
             }
             MaterializationStrategy::Astar { heuristic, options } => {
                 let options = AstarOptions {
                     stop_at_first_goal: options.stop_at_first_goal,
                     beam: options.beam,
                 };
-                let chart = match heuristic {
+                let (chart, right_states, pairs) = match heuristic {
                     AstarHeuristic::Zero => {
                         let heuristic = ZeroHeuristic;
-                        materialize_astar_intersection_with(
+                        let (chart, states, pairs, _) = materialize_astar_intersection_with_pairs(
                             chart,
                             &invhom,
                             &heuristic,
                             options,
                             &crate::ProbabilityScorer,
-                        )
-                        .0
+                        );
+                        (chart, states, pairs)
                     }
                     AstarHeuristic::Outside(heuristic) => {
-                        materialize_astar_intersection_with(
+                        let (chart, states, pairs, _) = materialize_astar_intersection_with_pairs(
                             chart,
                             &invhom,
                             *heuristic,
                             options,
                             &crate::ProbabilityScorer,
-                        )
-                        .0
+                        );
+                        (chart, states, pairs)
                     }
                     AstarHeuristic::UniversalSx { .. } | AstarHeuristic::UniversalSxF { .. } => {
                         return Err(IrtgError::IncompatibleHeuristic {
@@ -717,7 +781,8 @@ impl Irtg {
                         });
                     }
                 };
-                Ok((chart, None))
+                let names = product_state_names(left_state_names, &right_states, &pairs);
+                Ok((chart, names, None))
             }
         }
     }
@@ -1277,6 +1342,15 @@ impl Interpretation {
         !matches!(self.kind, InterpretationKind::OutputOnly)
     }
 
+    /// Return whether this interpretation can constrain parsing to defined values.
+    pub fn supports_non_null_filter(&self) -> bool {
+        self.algebra
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is::<FeatureStructureAlgebra>()
+    }
+
     /// Return whether interpreted values use the tree textual representation.
     pub fn is_tree_valued(&self) -> bool {
         matches!(
@@ -1553,6 +1627,16 @@ pub enum IrtgError {
     NotInputable {
         /// Interpretation name.
         interpretation: String,
+    },
+    /// An interpretation's algebra does not provide an all-defined-values filter.
+    #[error(
+        "interpretation {interpretation:?} with algebra {class_name} does not support non-null filtering"
+    )]
+    NonNullFilterUnsupported {
+        /// Interpretation name.
+        interpretation: String,
+        /// Alto algebra class name.
+        class_name: String,
     },
     /// A parse strategy selected a heuristic that is not defined for this algebra.
     #[error("heuristic is incompatible with interpretation {interpretation:?}: {message}")]

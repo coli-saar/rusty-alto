@@ -133,7 +133,8 @@ pub use ids::{Arity, StateId, Symbol};
 pub use interner::Interner;
 pub use irtg::{
     AstarHeuristic, EvaluatedAlgebraValue, Interpretation, Irtg, IrtgError,
-    MaterializationStrategy, ParseChart, ParseInput, TypedInterpretation, parse_irtg,
+    MaterializationStrategy, NonNullFilteredChart, ParseChart, ParseInput, TypedInterpretation,
+    parse_irtg,
 };
 pub use materialize::{
     IndexedCondensedIntersectionStats, materialize, materialize_indexed_condensed_intersection,
