@@ -255,5 +255,6 @@ mod tests {
 }
 pub use feature::{
     FS_EMBED_PREFIX, FS_PROJECT_PREFIX, FS_REMAP_PREFIX, FS_UNIFY, FeatureStructure,
-    FeatureStructureAlgebra, FeatureStructureFilter, FeatureStructureParseError,
+    FeatureStructureAlgebra, FeatureStructureAttribute, FeatureStructureFilter,
+    FeatureStructureNode, FeatureStructureNodeId, FeatureStructureParseError,
 };

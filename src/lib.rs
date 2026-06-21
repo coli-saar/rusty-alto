@@ -92,11 +92,12 @@ pub use algebras::{
     APPEND_SYMBOL, Algebra, BinarizedTagTreeDecompositionAutomaton, BinarizedTagTreeState,
     Binarizing, CONC11, CONC12, CONC21, EvaluatingDecompositionAutomaton, FS_EMBED_PREFIX,
     FS_PROJECT_PREFIX, FS_REMAP_PREFIX, FS_UNIFY, FeatureStructure, FeatureStructureAlgebra,
-    FeatureStructureFilter, FeatureStructureParseError, SentenceSxHeuristic, Span, StringAlgebra,
-    StringDecompositionAutomaton, TAG_E, TAG_EE, TAG_HOLE, TAG_SUBSTITUTE, TagSpan,
-    TagStringAlgebra, TagStringDecompositionAutomaton, TagStringValue, TagTreeAlgebra,
-    TagTreeContext, TagTreeDecompositionAutomaton, TreeAlgebra, TreeValue, UniversalSxHeuristic,
-    WRAP21, WRAP22,
+    FeatureStructureAttribute, FeatureStructureFilter, FeatureStructureNode,
+    FeatureStructureNodeId, FeatureStructureParseError, SentenceSxHeuristic, Span,
+    StringAlgebra, StringDecompositionAutomaton, TAG_E, TAG_EE, TAG_HOLE, TAG_SUBSTITUTE,
+    TagSpan, TagStringAlgebra, TagStringDecompositionAutomaton, TagStringValue, TagTreeAlgebra,
+    TagTreeContext, TagTreeDecompositionAutomaton, TreeAlgebra, TreeValue,
+    UniversalSxHeuristic, WRAP21, WRAP22,
 };
 #[allow(deprecated)]
 pub use alto::{
@@ -104,8 +105,8 @@ pub use alto::{
     parse_alto_with_signature,
 };
 pub use application::{
-    AutomatonSummary, InterpretationInfo, LanguageCardinality, ParseStrategy,
-    RenderedInterpretation, RenderedValue, ResolvedRule,
+    AutomatonSummary, EvaluatedInterpretation, InterpretationInfo, LanguageCardinality,
+    ParseStrategy, RenderedInterpretation, RenderedValue, ResolvedRule,
 };
 pub use astar::{
     AstarOptions, AstarStats, PreparedAstarGrammar, astar_one_best, astar_one_best_with,
@@ -117,8 +118,8 @@ pub use astar::{
 pub use codec::{
     AltoTreeAutomatonInputCodec, CodecMetadata, DisplayCodec, FeatureStructureVisualizationCodec,
     InputCodec, InputCodecError, InputCodecRegistry, InputCodecRegistryError, IrtgInputCodec,
-    OutputCodec, OutputCodecRegistry, RegisteredInputCodec, SpaceJoinCodec, TextOutputCodec,
-    TextVisualizationCodec, TreeVisualizationCodec, VisualRepresentation,
+    OutputCodec, OutputCodecError, OutputCodecRegistry, RegisteredInputCodec, SpaceJoinCodec,
+    TextOutputCodec, TextVisualizationCodec, TreeVisualizationCodec, VisualRepresentation,
 };
 pub use codecs::{TulipacError, TulipacInputCodec};
 pub use combinators::{Determinized, InvHom, Mapped, Product};
@@ -131,8 +132,8 @@ pub use homomorphism::{HomLabel, HomTerm, Homomorphism, HomomorphismError};
 pub use ids::{Arity, StateId, Symbol};
 pub use interner::Interner;
 pub use irtg::{
-    AstarHeuristic, Interpretation, Irtg, IrtgError, MaterializationStrategy, ParseChart,
-    ParseInput, TypedInterpretation, parse_irtg,
+    AstarHeuristic, EvaluatedAlgebraValue, Interpretation, Irtg, IrtgError,
+    MaterializationStrategy, ParseChart, ParseInput, TypedInterpretation, parse_irtg,
 };
 pub use materialize::{
     IndexedCondensedIntersectionStats, materialize, materialize_indexed_condensed_intersection,

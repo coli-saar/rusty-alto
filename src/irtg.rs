@@ -5,10 +5,12 @@ use crate::{
     CondensedTa, DisplayCodec, Explicit, ExplicitBuildError, ExplicitBuilder, FeatureStructure,
     FeatureStructureAlgebra, FxHashMap, FxHashSet, Homomorphism, HomomorphismError,
     IndexedCondensedIntersectionStats, Interner, InvHom, MinHeuristic, ObligatoryLeafTables,
-    OutputCodec, OutsideHeuristic, ScoredZeroHeuristic, Signature, SignatureError, SpaceJoinCodec,
-    StateId, StateUniverse, StringAlgebra, Symbol, TagStringAlgebra,
+    CodecMetadata, OutputCodec, OutputCodecError, OutputCodecRegistry, OutsideHeuristic,
+    ScoredZeroHeuristic, Signature, SignatureError, SpaceJoinCodec, StateId, StateUniverse,
+    StringAlgebra, Symbol, TagStringAlgebra,
     TagStringDecompositionAutomaton, TagStringValue, TagTreeAlgebra, TagTreeDecompositionAutomaton,
-    TopDownTa, TreeAlgebra, UniversalSxHeuristic, ViterbiTree, WeightScorer, ZeroHeuristic,
+    TopDownTa, TreeAlgebra, UniversalSxHeuristic, VisualRepresentation, ViterbiTree, WeightScorer,
+    ZeroHeuristic,
     alto_ast::{AstHomTerm, AstIrtg, AstState, LexError, Tok, lex},
     alto_grammar,
     astar::{
@@ -25,7 +27,14 @@ use crate::{
 };
 use lalrpop_util::ParseError;
 use packed_term_arena::tree::{Tree, TreeArena};
-use std::{any::Any, fmt, hash::Hash, io::Read, marker::PhantomData, sync::Mutex};
+use std::{
+    any::Any,
+    fmt,
+    hash::Hash,
+    io::Read,
+    marker::PhantomData,
+    sync::{Arc, Mutex},
+};
 use thiserror::Error;
 
 fn filter_feature_chart(
@@ -995,11 +1004,21 @@ trait DerivationRenderer: fmt::Debug + Send + Sync {
         root: Tree,
         name: &str,
     ) -> Result<String, IrtgError>;
+
+    fn evaluate(
+        &self,
+        algebra: &dyn Any,
+        homomorphism: &Homomorphism,
+        arena: &TreeArena<Symbol>,
+        root: Tree,
+        name: &str,
+    ) -> Result<EvaluatedAlgebraValue, IrtgError>;
 }
 
 /// [`DerivationRenderer`] for a concrete algebra `A` paired with codec `C`.
 struct TypedDerivationCodec<A, C> {
     codec: C,
+    output_codecs: Arc<OutputCodecRegistry>,
     _algebra: PhantomData<fn() -> A>,
 }
 
@@ -1007,6 +1026,7 @@ impl<A, C> TypedDerivationCodec<A, C> {
     fn new(codec: C) -> Self {
         Self {
             codec,
+            output_codecs: Arc::new(OutputCodecRegistry::standard()),
             _algebra: PhantomData,
         }
     }
@@ -1025,6 +1045,7 @@ impl<A, C> DerivationRenderer for TypedDerivationCodec<A, C>
 where
     A: Algebra + 'static,
     A: Send,
+    A::Value: Send + Sync + 'static,
     C: OutputCodec<A::Value, Output = String> + fmt::Debug + Send + Sync,
 {
     fn render(
@@ -1051,6 +1072,102 @@ where
                     message: "derivation tree did not evaluate in the algebra".to_owned(),
                 })?;
         Ok(self.codec.encode(&value))
+    }
+
+    fn evaluate(
+        &self,
+        algebra: &dyn Any,
+        homomorphism: &Homomorphism,
+        arena: &TreeArena<Symbol>,
+        root: Tree,
+        name: &str,
+    ) -> Result<EvaluatedAlgebraValue, IrtgError> {
+        let algebra = algebra
+            .downcast_ref::<A>()
+            .ok_or_else(|| IrtgError::WrongInputType {
+                interpretation: name.to_owned(),
+            })?;
+        let mut image = TreeArena::new();
+        let image_root = homomorphism.apply(arena, root, &mut image)?;
+        let value =
+            algebra
+                .evaluate_term(&image, image_root)
+                .ok_or_else(|| IrtgError::ObjectParse {
+                    interpretation: name.to_owned(),
+                    message: "derivation tree did not evaluate in the algebra".to_owned(),
+                })?;
+        let visual = algebra.visualize(&value);
+        Ok(EvaluatedAlgebraValue {
+            inner: Box::new(TypedEvaluatedAlgebraValue {
+                value,
+                visual,
+                output_codecs: self.output_codecs.clone(),
+            }),
+        })
+    }
+}
+
+trait ErasedEvaluatedAlgebraValue: fmt::Debug + Send + Sync {
+    fn visual(&self) -> &VisualRepresentation;
+    fn codecs(&self) -> Vec<CodecMetadata>;
+    fn encode(&self, codec_name: &str) -> Result<String, OutputCodecError>;
+}
+
+struct TypedEvaluatedAlgebraValue<V> {
+    value: V,
+    visual: VisualRepresentation,
+    output_codecs: Arc<OutputCodecRegistry>,
+}
+
+impl<V> fmt::Debug for TypedEvaluatedAlgebraValue<V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TypedEvaluatedAlgebraValue")
+            .field("visual", &self.visual)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<V: Send + Sync + 'static> ErasedEvaluatedAlgebraValue for TypedEvaluatedAlgebraValue<V> {
+    fn visual(&self) -> &VisualRepresentation {
+        &self.visual
+    }
+
+    fn codecs(&self) -> Vec<CodecMetadata> {
+        self.output_codecs
+            .codecs_for::<V>()
+            .iter()
+            .map(|codec| *codec.metadata())
+            .collect()
+    }
+
+    fn encode(&self, codec_name: &str) -> Result<String, OutputCodecError> {
+        Ok(self
+            .output_codecs
+            .codec_for_name::<V>(codec_name)?
+            .encode(&self.value))
+    }
+}
+
+/// An evaluated algebra value whose concrete Rust type remains available to codec dispatch.
+#[derive(Debug)]
+pub struct EvaluatedAlgebraValue {
+    inner: Box<dyn ErasedEvaluatedAlgebraValue>,
+}
+
+impl EvaluatedAlgebraValue {
+    /// Return the algebra's preferred GUI-neutral visualization.
+    pub fn visual(&self) -> &VisualRepresentation {
+        self.inner.visual()
+    }
+
+    /// List textual codecs registered for this value's exact public type.
+    pub fn codecs(&self) -> Vec<CodecMetadata> {
+        self.inner.codecs()
+    }
+
+    /// Encode the value with a registered textual codec.
+    pub fn encode(&self, codec_name: &str) -> Result<String, OutputCodecError> {
+        self.inner.encode(codec_name)
     }
 }
 
@@ -1264,6 +1381,17 @@ impl Interpretation {
         let algebra = self.algebra.lock().unwrap();
         self.renderer
             .render(&**algebra, &self.homomorphism, arena, root, &self.name)
+    }
+
+    /// Evaluate a derivation while retaining its typed value for visualization and codecs.
+    pub fn evaluate_derivation(
+        &self,
+        arena: &TreeArena<Symbol>,
+        root: Tree,
+    ) -> Result<EvaluatedAlgebraValue, IrtgError> {
+        let algebra = self.algebra.lock().unwrap();
+        self.renderer
+            .evaluate(&**algebra, &self.homomorphism, arena, root, &self.name)
     }
 }
 

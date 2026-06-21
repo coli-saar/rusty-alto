@@ -1369,6 +1369,33 @@ mod tests {
         word 'a': copy
     "#;
 
+    const SHIEBER: &str = r#"
+        family vinf_tv: { vinf_tv, vinf_tv_aux }
+        tree vinf_tv:
+          S @NA {
+            np! [case=nom][]
+            S { np! [case=?o] [] }
+            v+ [objcase=?o] []
+          }
+        tree vinf_tv_aux:
+          S @NA {
+            S { S @NA { np! [case=?o] [] S* } }
+            v+ [objcase=?o][]
+          }
+        family np_n: { np_n }
+        tree np_n:
+          np [] [case=?c] { n+ [case=?c] [] }
+        tree adj_det:
+          np [] [case=?c] {
+            det+ [case=?c] []
+            np* [case=?c] []
+          }
+        word 'de': adj_det[case=acc]
+        word 'huus': np_n
+        word 'aastriiche': <vinf_tv>[objcase=acc]
+        word 'laa': <vinf_tv>[objcase=acc]
+    "#;
+
     fn best_derivation(irtg: &Irtg, sentence: &str) -> String {
         let string = irtg.interpretation::<TagStringAlgebra>("string").unwrap();
         let value = string.parse_object(sentence).unwrap();
@@ -1503,6 +1530,43 @@ mod tests {
                 .viterbi()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn shieber_subject_adjunction_clashes_and_feature_filter_removes_it() {
+        let irtg = TulipacInputCodec.decode(SHIEBER).unwrap();
+        let mut language = irtg.grammar().sorted_language();
+        let mut successful = 0;
+        let mut failed = 0;
+        for _ in 0..12 {
+            let weighted = language.next().unwrap();
+            let (arena, root) = language.clone_tree(weighted.tree());
+            if irtg
+                .interpretation_ref("ft")
+                .unwrap()
+                .evaluate_derivation(&arena, root)
+                .is_ok()
+            {
+                successful += 1;
+            } else {
+                failed += 1;
+            }
+        }
+        assert!(successful > 0);
+        assert!(failed > 0);
+
+        let filtered = irtg.filter_non_null(irtg.grammar(), "ft").unwrap();
+        let mut filtered_language = filtered.sorted_language();
+        for _ in 0..3 {
+            let weighted = filtered_language.next().unwrap();
+            let (arena, root) = filtered_language.clone_tree(weighted.tree());
+            assert!(
+                irtg.interpretation_ref("ft")
+                    .unwrap()
+                    .evaluate_derivation(&arena, root)
+                    .is_ok()
+            );
+        }
     }
 
     #[test]

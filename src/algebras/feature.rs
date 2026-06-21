@@ -42,7 +42,59 @@ pub struct FeatureStructure {
     nodes: Vec<Node>,
 }
 
+/// Stable identifier for a node in a [`FeatureStructure`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FeatureStructureNodeId(usize);
+
+/// Read-only kind of a feature-structure node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeatureStructureNode<'a> {
+    /// An unconstrained variable.
+    Variable,
+    /// An atomic value.
+    Atom(&'a str),
+    /// An attribute-value map. Use [`FeatureStructure::attributes`] to inspect its entries.
+    Map,
+}
+
+/// One read-only attribute edge in a feature structure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FeatureStructureAttribute<'a> {
+    /// Attribute name.
+    pub name: &'a str,
+    /// Node containing the attribute value.
+    pub value: FeatureStructureNodeId,
+}
+
 impl FeatureStructure {
+    /// Return the root node.
+    pub fn root(&self) -> FeatureStructureNodeId {
+        FeatureStructureNodeId(0)
+    }
+
+    /// Inspect a node without exposing the mutable graph representation.
+    pub fn node(&self, id: FeatureStructureNodeId) -> Option<FeatureStructureNode<'_>> {
+        self.nodes.get(id.0).map(|node| match node {
+            Node::Variable => FeatureStructureNode::Variable,
+            Node::Atom(atom) => FeatureStructureNode::Atom(atom),
+            Node::Map(_) => FeatureStructureNode::Map,
+        })
+    }
+
+    /// Return the ordered attributes of a map node.
+    pub fn attributes(
+        &self,
+        id: FeatureStructureNodeId,
+    ) -> Option<impl ExactSizeIterator<Item = FeatureStructureAttribute<'_>> + '_> {
+        let Node::Map(attributes) = self.nodes.get(id.0)? else {
+            return None;
+        };
+        Some(attributes.iter().map(|(name, value)| FeatureStructureAttribute {
+            name,
+            value: FeatureStructureNodeId(*value),
+        }))
+    }
+
     /// Construct an empty attribute-value matrix.
     pub fn empty() -> Self {
         Self {
@@ -626,6 +678,33 @@ impl<'a> Parser<'a> {
 mod tests {
     use super::*;
 
+    // Ported from Alto's FeatureStructureAlgebraTest.testProj.
+    #[test]
+    fn alto_projection_test() {
+        let source = FeatureStructure::parse("[root: [num: sg]]").unwrap();
+        assert_eq!(
+            source.project("root").unwrap(),
+            FeatureStructure::parse("[num: sg]").unwrap()
+        );
+    }
+
+    // Ported from Alto's FeatureStructureTest equality cases.
+    #[test]
+    fn alto_equality_is_order_independent_and_reentrancy_sensitive() {
+        assert_eq!(
+            FeatureStructure::parse("[num: sg, gen: masc]").unwrap(),
+            FeatureStructure::parse("[gen: masc, num: sg]").unwrap()
+        );
+        assert_ne!(
+            FeatureStructure::parse("[num: #1 sg, gen: #1]").unwrap(),
+            FeatureStructure::parse("[num: sg, gen: sg]").unwrap()
+        );
+        assert_ne!(
+            FeatureStructure::parse("[num: [foo: sg], gen: masc]").unwrap(),
+            FeatureStructure::parse("[gen: masc, num: sg]").unwrap()
+        );
+    }
+
     #[test]
     fn unification_detects_clashes() {
         let nom = FeatureStructure::parse("[case: nom]").unwrap();
@@ -658,6 +737,33 @@ mod tests {
             source
                 .remap(&[("left", "same"), ("right", "same")])
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn public_graph_access_preserves_nesting_and_reentrancy() {
+        let value =
+            FeatureStructure::parse("[left: #x [case: nom], right: #x, open: #y]").unwrap();
+        let root = value.root();
+        assert_eq!(value.node(root), Some(FeatureStructureNode::Map));
+        let attributes = value.attributes(root).unwrap().collect::<Vec<_>>();
+        assert_eq!(
+            attributes.iter().map(|attribute| attribute.name).collect::<Vec<_>>(),
+            vec!["left", "open", "right"]
+        );
+        assert_eq!(attributes[0].value, attributes[2].value);
+        assert_eq!(
+            value.node(attributes[1].value),
+            Some(FeatureStructureNode::Variable)
+        );
+        let nested = value
+            .attributes(attributes[0].value)
+            .unwrap()
+            .collect::<Vec<_>>();
+        assert_eq!(nested[0].name, "case");
+        assert_eq!(
+            value.node(nested[0].value),
+            Some(FeatureStructureNode::Atom("nom"))
         );
     }
 }

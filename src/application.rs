@@ -5,8 +5,8 @@
 //! values that can safely cross worker-thread and event-loop boundaries.
 
 use crate::{
-    AstarHeuristic, AstarOptions, BottomUpTa, Explicit, Irtg, IrtgError, MaterializationStrategy,
-    StateId, Symbol, TreeValue,
+    AstarHeuristic, AstarOptions, BottomUpTa, EvaluatedAlgebraValue, Explicit, Irtg, IrtgError,
+    MaterializationStrategy, StateId, Symbol, TreeValue,
 };
 use packed_term_arena::{
     parser::parse_tree,
@@ -81,6 +81,15 @@ pub struct RenderedInterpretation {
     pub name: String,
     /// Evaluated value.
     pub value: RenderedValue,
+}
+
+/// One named, evaluated interpretation retaining visualization and codec dispatch.
+#[derive(Debug)]
+pub struct EvaluatedInterpretation {
+    /// Interpretation name.
+    pub name: String,
+    /// Evaluated algebra value.
+    pub value: EvaluatedAlgebraValue,
 }
 
 /// Frontend-friendly parsing strategy without borrowed heuristic tables.
@@ -429,6 +438,25 @@ impl Irtg {
             })
             .collect()
     }
+
+    /// Evaluate every interpretation without flattening its public value type.
+    pub fn evaluate_derivation(
+        &self,
+        arena: &TreeArena<Symbol>,
+        root: Tree,
+    ) -> Result<Vec<EvaluatedInterpretation>, IrtgError> {
+        let mut interpretations: Vec<_> = self.interpretations().collect();
+        interpretations.sort_by_key(|interpretation| interpretation.name());
+        interpretations
+            .into_iter()
+            .map(|interpretation| {
+                Ok(EvaluatedInterpretation {
+                    name: interpretation.name().to_owned(),
+                    value: interpretation.evaluate_derivation(arena, root)?,
+                })
+            })
+            .collect()
+    }
 }
 
 fn format_hom_term(
@@ -550,6 +578,43 @@ VP -> sleeps [1.0]
         let rendered = irtg.render_derivation(best.arena(), best.root()).unwrap();
         assert!(matches!(rendered[0].value, RenderedValue::Text(_)));
         assert!(matches!(rendered[1].value, RenderedValue::Tree(_)));
+
+        let evaluated = irtg
+            .evaluate_derivation(best.arena(), best.root())
+            .unwrap();
+        assert!(matches!(
+            evaluated[0].value.visual(),
+            crate::VisualRepresentation::Text(text) if text == "john sleeps"
+        ));
+        assert!(matches!(
+            evaluated[1].value.visual(),
+            crate::VisualRepresentation::Tree(_)
+        ));
+        assert_eq!(evaluated[0].value.codecs()[0].name, "string");
+        assert_eq!(evaluated[0].value.encode("STRING").unwrap(), "john sleeps");
+        assert_eq!(evaluated[1].value.codecs()[0].name, "display");
+    }
+
+    #[test]
+    fn evaluates_feature_structures_without_flattening_them() {
+        let irtg = parse_irtg(
+            br#"
+            interpretation ft: de.up.ling.irtg.algebra.FeatureStructureAlgebra
+            S! -> value
+              [ft] "[left: #x [case: nom], right: #x]"
+            "# as &[u8],
+        )
+        .unwrap();
+        let best = irtg.grammar().viterbi().unwrap();
+        let evaluated = irtg
+            .evaluate_derivation(best.arena(), best.root())
+            .unwrap();
+        assert!(matches!(
+            evaluated[0].value.visual(),
+            crate::VisualRepresentation::FeatureStructure(_)
+        ));
+        assert_eq!(evaluated[0].value.codecs()[0].name, "display");
+        assert!(evaluated[0].value.encode("display").unwrap().contains("case"));
     }
 
     #[test]

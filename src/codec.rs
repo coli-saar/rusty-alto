@@ -468,6 +468,23 @@ impl OutputCodec<FeatureStructure> for FeatureStructureVisualizationCodec {
 /// Thread-safe textual codec trait object stored by [`OutputCodecRegistry`].
 pub type TextOutputCodec<V> = dyn OutputCodec<V, Output = String> + Send + Sync;
 
+/// Failure while selecting a textual output codec.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OutputCodecError {
+    /// No codec for the value's exact public type has this name.
+    UnknownCodec(String),
+}
+
+impl fmt::Display for OutputCodecError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownCodec(name) => write!(f, "no output codec registered with name {name:?}"),
+        }
+    }
+}
+
+impl Error for OutputCodecError {}
+
 /// Registry of independent textual output codecs, keyed by exact public value type.
 ///
 /// The registry's `Any` storage is only a heterogeneous type map. After lookup,
@@ -514,6 +531,19 @@ impl OutputCodecRegistry {
             .get(&TypeId::of::<V>())
             .and_then(|codecs| codecs.downcast_ref::<Vec<Box<TextOutputCodec<V>>>>())
             .map_or(&[], Vec::as_slice)
+    }
+
+    /// Find a textual codec by its case-insensitive metadata name.
+    pub fn codec_for_name<V: 'static>(
+        &self,
+        name: &str,
+    ) -> Result<&TextOutputCodec<V>, OutputCodecError> {
+        let normalized = normalize_name(name);
+        self.codecs_for::<V>()
+            .iter()
+            .find(|codec| normalize_name(codec.metadata().name) == normalized)
+            .map(Box::as_ref)
+            .ok_or_else(|| OutputCodecError::UnknownCodec(name.to_owned()))
     }
 }
 
@@ -762,7 +792,11 @@ mod tests {
         assert!(registry.codecs_for::<u64>().is_empty());
         assert_eq!(calls.load(Ordering::Relaxed), 0);
 
-        assert_eq!(codecs[0].encode(&7), "7");
+        assert_eq!(registry.codec_for_name::<u32>("COUNTING").unwrap().encode(&7), "7");
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            registry.codec_for_name::<u64>("counting"),
+            Err(OutputCodecError::UnknownCodec(_))
+        ));
     }
 }

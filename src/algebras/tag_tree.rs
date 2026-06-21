@@ -834,4 +834,51 @@ mod tests {
         };
         assert!(decomp.is_accepting(&root));
     }
+
+    // Ported from Alto's TagAlgebrasTest.testNessonShieberPrePos.
+    #[test]
+    fn alto_nesson_shieber_substitution_example() {
+        let signature = signature(&[
+            ("s", 2),
+            ("np", 1),
+            ("john", 0),
+            ("mary", 0),
+            ("vp", 2),
+            ("adv", 1),
+            ("apparently", 0),
+            ("v", 1),
+            ("likes", 0),
+        ]);
+        let s = signature.get("s").unwrap();
+        let np = signature.get("np").unwrap();
+        let john = signature.get("john").unwrap();
+        let mary = signature.get("mary").unwrap();
+        let vp = signature.get("vp").unwrap();
+        let adv = signature.get("adv").unwrap();
+        let apparently = signature.get("apparently").unwrap();
+        let v = signature.get("v").unwrap();
+        let likes = signature.get("likes").unwrap();
+        let algebra = TagTreeAlgebra::tree(signature);
+
+        let john = algebra.evaluate(john, &[]).unwrap();
+        let john = algebra.evaluate(np, &[john]).unwrap();
+        let mary = algebra.evaluate(mary, &[]).unwrap();
+        let mary = algebra.evaluate(np, &[mary]).unwrap();
+        let likes = algebra.evaluate(likes, &[]).unwrap();
+        let likes = algebra.evaluate(v, &[likes]).unwrap();
+        let inner_vp = algebra.evaluate(vp, &[likes, mary]).unwrap();
+        let apparently = algebra.evaluate(apparently, &[]).unwrap();
+        let apparently = algebra.evaluate(adv, &[apparently]).unwrap();
+        let hole = algebra.evaluate(algebra.hole_symbol(), &[]).unwrap();
+        let context = algebra.evaluate(vp, &[apparently, hole]).unwrap();
+        let derived_vp = algebra
+            .evaluate(algebra.substitute_symbol(), &[context, inner_vp])
+            .unwrap();
+        let result = algebra.evaluate(s, &[john, derived_vp]).unwrap();
+
+        assert_eq!(
+            algebra.to_external(&result).to_string(),
+            "s(np(john), vp(adv(apparently), vp(v(likes), np(mary))))"
+        );
+    }
 }
