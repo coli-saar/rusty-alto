@@ -53,6 +53,41 @@ fn product_state_names<S: Clone + Eq + Hash + fmt::Display>(
         .collect()
 }
 
+fn product_state_parts<S: Clone + Eq + Hash + fmt::Display>(
+    left_parts: &[Vec<String>],
+    right_states: &Interner<S>,
+    pairs: &[(StateId, StateId)],
+) -> Vec<Vec<String>> {
+    pairs
+        .iter()
+        .map(|&(left, right)| {
+            let mut parts = left_parts
+                .get(left.index())
+                .cloned()
+                .unwrap_or_else(|| vec![format!("q{}", left.0)]);
+            parts.push(right_states.resolve(right).to_string());
+            parts
+        })
+        .collect()
+}
+
+fn string_product_state_names(
+    left_names: &[String],
+    right_states: &Interner<crate::algebras::Span>,
+    pairs: &[(StateId, StateId)],
+) -> Vec<String> {
+    pairs
+        .iter()
+        .map(|&(left, right)| {
+            let left = left_names
+                .get(left.index())
+                .cloned()
+                .unwrap_or_else(|| format!("q{}", left.0));
+            format!("{left}{}", right_states.resolve(right))
+        })
+        .collect()
+}
+
 fn filter_feature_chart(
     chart: &Explicit,
     algebra: &FeatureStructureAlgebra,
@@ -476,6 +511,11 @@ impl Irtg {
         let mut state_names = (0..chart.num_states())
             .map(|state| self.states.resolve(StateId(state)).clone())
             .collect::<Vec<_>>();
+        let mut state_parts = state_names
+            .iter()
+            .cloned()
+            .map(|name| vec![name])
+            .collect::<Vec<_>>();
         let mut stats = Vec::new();
 
         for input in inputs {
@@ -497,18 +537,9 @@ impl Irtg {
                                     &chart, &invhom, control,
                                 )
                                 .map_err(|_| IrtgError::Cancelled)?;
-                            state_names = pairs
-                                .into_iter()
-                                .map(|(left, right)| {
-                                    let span = right_states.resolve(right);
-                                    format!(
-                                        "{}[{},{}]",
-                                        state_names[left.index()],
-                                        span.start,
-                                        span.end
-                                    )
-                                })
-                                .collect();
+                            state_names =
+                                string_product_state_names(&state_names, &right_states, &pairs);
+                            state_parts = product_state_parts(&state_parts, &right_states, &pairs);
                             stats.push(stat);
                             c
                         }
@@ -518,18 +549,9 @@ impl Irtg {
                                     &chart, &invhom, control,
                                 )
                                 .map_err(|_| IrtgError::Cancelled)?;
-                            state_names = pairs
-                                .into_iter()
-                                .map(|(left, right)| {
-                                    let span = right_states.resolve(right);
-                                    format!(
-                                        "{}[{},{}]",
-                                        state_names[left.index()],
-                                        span.start,
-                                        span.end
-                                    )
-                                })
-                                .collect();
+                            state_names =
+                                string_product_state_names(&state_names, &right_states, &pairs);
+                            state_parts = product_state_parts(&state_parts, &right_states, &pairs);
                             stats.push(stat);
                             c
                         }
@@ -540,11 +562,11 @@ impl Irtg {
                             // We need owned options — clone by rebuilding (AstarOptions is not Clone).
                             // Instead, call materialize_astar_intersection with a fresh options value.
                             // We route via a helper to avoid duplicating logic.
-                            let c = self
+                            let (c, right_states, pairs) = self
                                 .run_astar_chart(&chart, &invhom, heuristic, strategy, control)?;
-                            state_names = (0..c.num_states())
-                                .map(|state| format!("q{state}"))
-                                .collect();
+                            state_names =
+                                string_product_state_names(&state_names, &right_states, &pairs);
+                            state_parts = product_state_parts(&state_parts, &right_states, &pairs);
                             // A* produces no IndexedCondensedIntersectionStats; we push nothing.
                             c
                         }
@@ -560,9 +582,10 @@ impl Irtg {
                                 interpretation: interpretation.name.clone(),
                             })?;
                     let decomp = interpretation.decompose_tag_string(value)?;
-                    let (next_chart, next_names, stat) = self.run_generic_chart(
+                    let (next_chart, next_names, next_parts, stat) = self.run_generic_chart(
                         &chart,
                         &state_names,
+                        &state_parts,
                         decomp,
                         &interpretation.homomorphism,
                         strategy,
@@ -574,6 +597,7 @@ impl Irtg {
                     }
                     chart = next_chart;
                     state_names = next_names;
+                    state_parts = next_parts;
                 }
                 InterpretationKind::TagTree => {
                     let value =
@@ -584,9 +608,10 @@ impl Irtg {
                                 interpretation: interpretation.name.clone(),
                             })?;
                     let decomp = interpretation.decompose_tag_tree(value)?;
-                    let (next_chart, next_names, stat) = self.run_generic_chart(
+                    let (next_chart, next_names, next_parts, stat) = self.run_generic_chart(
                         &chart,
                         &state_names,
+                        &state_parts,
                         decomp,
                         &interpretation.homomorphism,
                         strategy,
@@ -598,6 +623,7 @@ impl Irtg {
                     }
                     chart = next_chart;
                     state_names = next_names;
+                    state_parts = next_parts;
                 }
                 InterpretationKind::BinarizedTagTree => {
                     let value =
@@ -608,9 +634,10 @@ impl Irtg {
                                 interpretation: interpretation.name.clone(),
                             })?;
                     let decomp = interpretation.decompose_binarized_tag_tree(value)?;
-                    let (next_chart, next_names, stat) = self.run_generic_chart(
+                    let (next_chart, next_names, next_parts, stat) = self.run_generic_chart(
                         &chart,
                         &state_names,
+                        &state_parts,
                         decomp,
                         &interpretation.homomorphism,
                         strategy,
@@ -622,6 +649,7 @@ impl Irtg {
                     }
                     chart = next_chart;
                     state_names = next_names;
+                    state_parts = next_parts;
                 }
                 InterpretationKind::OutputOnly => {
                     return Err(IrtgError::NotInputable {
@@ -634,6 +662,7 @@ impl Irtg {
         Ok(ParseChart {
             automaton: chart,
             state_names,
+            state_parts,
             stats,
         })
     }
@@ -820,6 +849,7 @@ impl Irtg {
         &self,
         chart: &Explicit,
         left_state_names: &[String],
+        left_state_parts: &[Vec<String>],
         decomp: R,
         homomorphism: &Homomorphism,
         strategy: &MaterializationStrategy<'_>,
@@ -829,6 +859,7 @@ impl Irtg {
         (
             Explicit,
             Vec<String>,
+            Vec<Vec<String>>,
             Option<IndexedCondensedIntersectionStats>,
         ),
         IrtgError,
@@ -846,7 +877,8 @@ impl Irtg {
                     )
                     .map_err(|_| IrtgError::Cancelled)?;
                 let names = product_state_names(left_state_names, &right_states, &pairs);
-                Ok((chart, names, Some(stats)))
+                let parts = product_state_parts(left_state_parts, &right_states, &pairs);
+                Ok((chart, names, parts, Some(stats)))
             }
             MaterializationStrategy::IndexedCondensed => {
                 let (chart, right_states, pairs, stats) =
@@ -855,7 +887,8 @@ impl Irtg {
                     )
                     .map_err(|_| IrtgError::Cancelled)?;
                 let names = product_state_names(left_state_names, &right_states, &pairs);
-                Ok((chart, names, Some(stats)))
+                let parts = product_state_parts(left_state_parts, &right_states, &pairs);
+                Ok((chart, names, parts, Some(stats)))
             }
             MaterializationStrategy::Astar { heuristic, options } => {
                 let options = AstarOptions {
@@ -899,7 +932,8 @@ impl Irtg {
                     }
                 };
                 let names = product_state_names(left_state_names, &right_states, &pairs);
-                Ok((chart, names, None))
+                let parts = product_state_parts(left_state_parts, &right_states, &pairs);
+                Ok((chart, names, parts, None))
             }
         }
     }
@@ -967,7 +1001,14 @@ impl Irtg {
         heuristic: &AstarHeuristic<'_>,
         strategy: &MaterializationStrategy<'_>,
         control: &ParseControl,
-    ) -> Result<Explicit, IrtgError> {
+    ) -> Result<
+        (
+            Explicit,
+            Interner<crate::algebras::Span>,
+            Vec<(StateId, StateId)>,
+        ),
+        IrtgError,
+    > {
         let options = match strategy {
             MaterializationStrategy::Astar { options, .. } => AstarOptions {
                 stop_at_first_goal: options.stop_at_first_goal,
@@ -975,7 +1016,7 @@ impl Irtg {
             },
             _ => unreachable!(),
         };
-        let (new_chart, _, _) = match heuristic {
+        let (new_chart, right_states, pairs, _) = match heuristic {
             AstarHeuristic::Zero => {
                 let h = ZeroHeuristic;
                 materialize_astar_string_intersection_with_controlled(
@@ -1021,7 +1062,7 @@ impl Irtg {
             }
         };
         control.check().map_err(|_| IrtgError::Cancelled)?;
-        Ok(new_chart)
+        Ok((new_chart, right_states, pairs))
     }
 
     /// Run `astar_one_best` for a single `InvHom<StringDecompositionAutomaton>`.
@@ -1701,6 +1742,20 @@ pub struct ParseChart {
     pub automaton: Explicit,
     /// Human-readable state labels in dense state-ID order.
     pub state_names: Vec<String>,
+    /// State-label components in dense state-ID order.
+    ///
+    /// The first component is the grammar state. Each subsequent component is
+    /// the state contributed by one decomposition automaton, in intersection
+    /// order. Frontends can use these components for styling or inspection
+    /// without parsing [`Self::state_names`].
+    ///
+    /// A decomposition automaton makes its states meaningful here by giving
+    /// its `State` type a concise, deterministic [`std::fmt::Display`]
+    /// implementation. Display output should identify the state to a user,
+    /// avoid debug-only details and unstable IDs, and be unambiguous within
+    /// that automaton. For example, string and TAG-string decomposition states
+    /// display as `[0-2]` and `[0-2, 3-5]`.
+    pub state_parts: Vec<Vec<String>>,
     /// Per-intersection materialization statistics.
     pub stats: Vec<IndexedCondensedIntersectionStats>,
 }
@@ -2384,6 +2439,32 @@ mod tests {
     }
 
     #[test]
+    fn string_chart_state_names_are_consistent_across_strategies() {
+        let irtg = parse_irtg(tiny_irtg_bytes()).unwrap();
+        let english = irtg.interpretation::<StringAlgebra>("english").unwrap();
+        let strategies = [
+            MaterializationStrategy::TopDownCondensed,
+            MaterializationStrategy::IndexedCondensed,
+            MaterializationStrategy::Astar {
+                heuristic: AstarHeuristic::Zero,
+                options: AstarOptions {
+                    stop_at_first_goal: false,
+                    beam: None,
+                },
+            },
+        ];
+
+        for strategy in strategies {
+            let value = english.parse_object("john watches").unwrap();
+            let chart = irtg.parse_with([english.input(value)], &strategy).unwrap();
+            assert!(chart.state_names.iter().any(|name| name == "NP[0-1]"));
+            assert!(chart.state_names.iter().any(|name| name == "VP[1-2]"));
+            assert!(chart.state_names.iter().any(|name| name == "S[0-2]"));
+            assert!(chart.state_names.iter().all(|name| !name.starts_with('q')));
+        }
+    }
+
+    #[test]
     fn astar_strategy_rejects_grammar_with_weight_greater_than_one() {
         let irtg = parse_irtg(
             br#"
@@ -2540,6 +2621,65 @@ mod tests {
             )
             .unwrap();
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn generic_algebra_state_names_are_consistent_across_strategies() {
+        let irtg = parse_irtg(tiny_tag_irtg()).unwrap();
+
+        for interpretation in ["string", "tree"] {
+            let mut expected_names = None;
+            let strategies = [
+                MaterializationStrategy::TopDownCondensed,
+                MaterializationStrategy::IndexedCondensed,
+                MaterializationStrategy::Astar {
+                    heuristic: AstarHeuristic::Zero,
+                    options: AstarOptions {
+                        stop_at_first_goal: false,
+                        beam: None,
+                    },
+                },
+            ];
+
+            for strategy in strategies {
+                let input = irtg
+                    .interpretation_ref(interpretation)
+                    .unwrap()
+                    .parse_object_erased(if interpretation == "string" {
+                        "a b"
+                    } else {
+                        "f(a)"
+                    })
+                    .unwrap();
+                let chart = irtg
+                    .parse_with(
+                        [irtg
+                            .interpretation_ref(interpretation)
+                            .unwrap()
+                            .input_erased(input)],
+                        &strategy,
+                    )
+                    .unwrap();
+                let mut names = chart.state_names;
+                names.sort();
+                assert!(names.iter().all(|name| !name.starts_with('q')));
+                assert!(names.iter().all(|name| name.contains(" × ")));
+                assert!(chart.state_parts.iter().all(|parts| parts.len() == 2));
+                if interpretation == "string" {
+                    assert!(
+                        chart
+                            .state_parts
+                            .iter()
+                            .any(|parts| { parts[1] == "[0-2]" || parts[1] == "[0-1, 1-2]" })
+                    );
+                }
+                if let Some(expected) = &expected_names {
+                    assert_eq!(&names, expected);
+                } else {
+                    expected_names = Some(names);
+                }
+            }
+        }
     }
 
     #[test]

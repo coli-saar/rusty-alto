@@ -574,9 +574,9 @@ VP -> sleeps [1.0]
                 .unwrap()
                 .input_erased(string)])
             .unwrap();
-        assert!(chart.state_names.iter().any(|name| name == "NP[0,1]"));
-        assert!(chart.state_names.iter().any(|name| name == "VP[1,2]"));
-        assert!(chart.state_names.iter().any(|name| name == "S[0,2]"));
+        assert!(chart.state_names.iter().any(|name| name == "NP[0-1]"));
+        assert!(chart.state_names.iter().any(|name| name == "VP[1-2]"));
+        assert!(chart.state_names.iter().any(|name| name == "S[0-2]"));
         let best = chart.automaton.viterbi().unwrap();
         let rendered = irtg.render_derivation(best.arena(), best.root()).unwrap();
         assert!(matches!(rendered[0].value, RenderedValue::Text(_)));

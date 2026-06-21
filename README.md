@@ -165,6 +165,22 @@ decomposition automata, and composed automata share this interface. Optional
 refinement traits expose indexed, condensed, deterministic, and top-down views
 when an algorithm can use them efficiently.
 
+### Displaying chart states
+
+`ParseChart::state_names` contains complete labels for textual output.
+`ParseChart::state_parts` contains the same states split by provenance: the
+grammar state first, followed by one component for every decomposition
+automaton intersected into the chart. Frontends should use `state_parts` when
+they want to style, inspect, or otherwise distinguish those components.
+
+An algebra whose decomposition automaton participates in chart construction
+must implement `Display` for its state type. That display should be concise,
+deterministic, meaningful to a user, unambiguous within the automaton, and
+should not expose unstable internal IDs. For example, string states display as
+`[0-2]`, while TAG-string states may display as `[0-2, 3-5]`. The parser
+preserves each displayed decomposition state as one component even after
+further intersections.
+
 Input codecs implement `InputCodec<T>` and are collected in an
 `InputCodecRegistry` by their exact result type. The standard registry maps
 both `.irtg` and `.tag` to `Irtg`; `.auto` maps to

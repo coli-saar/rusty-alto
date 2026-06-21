@@ -1738,7 +1738,12 @@ pub(crate) fn materialize_astar_string_intersection_with_controlled<'h, H, S>(
     options: AstarOptions,
     scorer: &S,
     control: &ParseControl,
-) -> (Explicit, Interner<Span>, AstarStats)
+) -> (
+    Explicit,
+    Interner<Span>,
+    Vec<(StateId, StateId)>,
+    AstarStats,
+)
 where
     H: IntersectionHeuristic<InvHom<'h, StringDecompositionAutomaton>>,
     S: WeightScorer,
@@ -1783,7 +1788,7 @@ where
         right.homomorphism(),
         right.inner().concat_symbol(),
     );
-    materialize_astar_intersection_with_span_sibling(
+    let (chart, states, _, stats) = materialize_astar_intersection_with_span_sibling(
         left,
         prepared,
         right,
@@ -1794,7 +1799,8 @@ where
         Some(&fallback_rules),
         false,
         None,
-    )
+    );
+    (chart, states, stats)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1809,7 +1815,12 @@ fn materialize_astar_intersection_with_span_sibling<R, H, S>(
     fallback_rules: Option<&FixedBitSet>,
     lazy: bool,
     control: Option<&ParseControl>,
-) -> (Explicit, Interner<Span>, AstarStats)
+) -> (
+    Explicit,
+    Interner<Span>,
+    Vec<(StateId, StateId)>,
+    AstarStats,
+)
 where
     R: CondensedTa<State = Span> + DetBottomUpTa<State = Span>,
     H: IntersectionHeuristic<R>,
@@ -1892,6 +1903,7 @@ where
     (
         explicit,
         ctx.right_interner.into_generic_interner(),
+        ctx.product_pairs,
         ctx.stats,
     )
 }
@@ -2796,7 +2808,7 @@ mod tests {
             beam: None,
         };
 
-        let (eager_chart, _, eager_stats) = materialize_astar_intersection_with_span_sibling(
+        let (eager_chart, _, _, eager_stats) = materialize_astar_intersection_with_span_sibling(
             &grammar,
             &prepared,
             &right,
@@ -2808,7 +2820,7 @@ mod tests {
             false,
             None,
         );
-        let (lazy_chart, _, lazy_stats) = materialize_astar_intersection_with_span_sibling(
+        let (lazy_chart, _, _, lazy_stats) = materialize_astar_intersection_with_span_sibling(
             &grammar,
             &prepared,
             &right,

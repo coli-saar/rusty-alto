@@ -20,7 +20,11 @@ pub trait BottomUpTa {
     ///
     /// Rich implicit automata can use application-level states here. Wrap them
     /// in [`crate::Memo`] when a dense [`crate::StateId`] representation is
-    /// needed.
+    /// needed. Decomposition automata used for IRTG chart construction should
+    /// also implement [`std::fmt::Display`] for this type. The display form is
+    /// exposed as one structured component of
+    /// [`crate::ParseChart::state_parts`], so it should be concise,
+    /// deterministic, meaningful to users, and free of unstable internal IDs.
     type State: Clone + Eq + Hash;
 
     /// Report all possible parent states for `f(children...)`.
