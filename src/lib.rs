@@ -35,6 +35,21 @@
 //! Codec metadata lookup is lazy: listing available formats does not read,
 //! evaluate, or encode anything.
 //!
+//! # Parsing strategies and cancellation
+//!
+//! [`Irtg::parse`] uses [`MaterializationStrategy::TopDownCondensed`], the
+//! recommended general default for complete chart construction.
+//! [`Irtg::parse_with`] selects another strategy without changing the input
+//! API. Interactive and service applications can use
+//! [`Irtg::parse_with_control`] with a clonable [`ParseControl`] to request
+//! cooperative cancellation from another thread; cancellation returns
+//! [`IrtgError::Cancelled`] and never exposes a partial chart.
+//!
+//! Algorithm performance depends on the loaded IRTG and input decomposition,
+//! not on the source filename. See the
+//! [parsing-algorithm guide](https://github.com/coli-saar/rusty-alto/wiki/Parsing-Algorithms)
+//! for selection advice and known trade-offs.
+//!
 //! ```
 //! use rusty_alto::*;
 //! use packed_term_arena::tree::TreeArena;

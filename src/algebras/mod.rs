@@ -155,6 +155,12 @@ impl<A: Algebra> DetBottomUpTa for EvaluatingDecompositionAutomaton<'_, A> {
     }
 }
 
+pub use feature::{
+    FS_EMBED_PREFIX, FS_PROJECT_PREFIX, FS_REMAP_PREFIX, FS_UNIFY, FeatureStructure,
+    FeatureStructureAlgebra, FeatureStructureAttribute, FeatureStructureFilter,
+    FeatureStructureNode, FeatureStructureNodeId, FeatureStructureParseError,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,8 +259,3 @@ mod tests {
         ));
     }
 }
-pub use feature::{
-    FS_EMBED_PREFIX, FS_PROJECT_PREFIX, FS_REMAP_PREFIX, FS_UNIFY, FeatureStructure,
-    FeatureStructureAlgebra, FeatureStructureAttribute, FeatureStructureFilter,
-    FeatureStructureNode, FeatureStructureNodeId, FeatureStructureParseError,
-};

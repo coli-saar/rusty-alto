@@ -53,44 +53,10 @@ intersecting the current chart with each additional interpretation.
 
 ## 5. Choose an execution strategy
 
-`MaterializationStrategy` controls how the intersection is explored.
-
-### Top-down condensed materialization
-
-This is the default chart-building strategy. It starts from accepting state
-pairs and follows compatible rules downward. Condensed inverse-homomorphism
-rules allow one transition computation to cover many grammar symbols with the
-same image.
-
-The result is a complete explicit parse chart suitable for Viterbi extraction,
-language enumeration, or further automaton processing.
-
-### Indexed condensed materialization
-
-This strategy grows reachable product states using partial-child indexes,
-joining rules only when they share an already known child. It exposes detailed
-intersection statistics and remains useful for algorithm comparison.
-
-### A* one-best parsing
-
-A* searches product states in best-first order and can stop after proving the
-best accepting derivation. It avoids building parts of the chart that cannot
-affect the one-best result.
-
-Available heuristics are:
-
-| Heuristic | Information used |
-| --- | --- |
-| `zero` | No estimate beyond accumulated weight. |
-| `outside` | Grammar-only outside weights. |
-| `sx` | A sentence-length-aware universal string bound. |
-| `sxf` | SX combined with obligatory-terminal feasibility filtering. |
-
-A* is exact when its heuristic is admissible. The current implementation
-requires grammar rule weights no greater than one.
-
-String parsing has a product-aware span sibling finder for common unary and
-binary rules. Higher arities use the general indexed fallback.
+`MaterializationStrategy` controls how the intersection is explored. See
+[Choosing a parsing algorithm](Parsing-Algorithms) for the single
+user-facing comparison of top-down condensed, indexed condensed, and A*,
+including performance guidance and cooperative cancellation.
 
 ## 6. Extract and interpret a derivation
 

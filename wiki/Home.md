@@ -21,6 +21,8 @@ Start here:
 - [Architecture](Architecture) follows data through the main modules.
 - [Parsing pipeline](Parsing-Pipeline) explains how an IRTG and an input
   sentence become a derivation.
+- [Choosing a parsing algorithm](Parsing-Algorithms) compares the user-facing
+  strategies, their trade-offs, and cooperative cancellation.
 - [Codec infrastructure](Codec-Infrastructure) explains format discovery,
   algebra value visualization, and the GUI integration boundary.
 - [Design decisions](Design-Decisions) records the abstractions and

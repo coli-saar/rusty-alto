@@ -199,17 +199,55 @@ const BINARIZING_TREE_WITH_ARITIES_ALGEBRA: &str =
 // Materialization strategy
 // ---------------------------------------------------------------------------
 
-/// Which algorithm to use when materializing an intersection inside [`Irtg::parse_with`].
+/// Which algorithm to use when materializing an intersection.
+///
+/// The strategies recognize the same derivations but explore the product
+/// automaton differently:
+///
+/// - [`TopDownCondensed`](Self::TopDownCondensed) is the recommended default
+///   when a complete chart is needed.
+/// - [`IndexedCondensed`](Self::IndexedCondensed) is primarily useful for
+///   algorithm comparison, statistics, or workloads where benchmarking shows
+///   it is advantageous. It can generate very large candidate sets for some
+///   ambiguous or discontinuous decompositions.
+/// - [`Astar`](Self::Astar) is intended for weight-directed search and can stop
+///   early when only the best derivation is needed.
+///
+/// Strategy choice depends on the resulting IRTG, its decomposition automata,
+/// and representative inputs—not on the grammar's source filename or codec.
+/// See the
+/// [parsing-algorithm guide](https://github.com/coli-saar/rusty-alto/wiki/Parsing-Algorithms)
+/// for a user-facing comparison.
 pub enum MaterializationStrategy<'h> {
-    /// Top-down condensed intersection (default, matches [`Irtg::parse`]).
+    /// Top-down condensed intersection.
+    ///
+    /// This is the default used by [`Irtg::parse`]. It starts from accepting
+    /// product states and follows compatible condensed rules downward,
+    /// producing a complete explicit parse chart.
+    ///
+    /// Prefer this as the general chart-building default unless measurements
+    /// on the intended workload support another choice.
     TopDownCondensed,
-    /// Indexed condensed intersection.
+    /// Bottom-up indexed condensed intersection.
+    ///
+    /// This grows reachable product states through partial-child indexes and
+    /// returns detailed intersection statistics. It also produces a complete
+    /// chart; it is not an early-exit one-best parser.
+    ///
+    /// Candidate generation can become substantially more expensive than the
+    /// top-down strategy for some workloads, including some TAG-derived IRTGs.
+    /// This is a property of the automata and inputs, not of a `.tag` filename.
     IndexedCondensed,
     /// A* intersection with a configurable heuristic.
     ///
     /// **Precondition**: all grammar rule weights must be ≤ 1 (probability
     /// weights).  If any weight exceeds 1 the strategy is rejected at
     /// parse time with [`IrtgError::AstarWeightPrecondition`].
+    ///
+    /// Use this when weight-directed search or early one-best termination is
+    /// more important than constructing the complete parse chart. Heuristic
+    /// compatibility depends on the input algebra; SX-family heuristics are
+    /// specific to compatible string interpretations.
     Astar {
         /// Heuristic to guide the A* search.
         heuristic: AstarHeuristic<'h>,
@@ -325,6 +363,14 @@ impl Irtg {
     }
 
     /// Filter a chart while allowing another thread to request cancellation.
+    ///
+    /// This is the cancellable counterpart of
+    /// [`Self::filter_non_null_with_state_origins`]. Clones of `control` may be
+    /// held by another thread. If cancellation is observed, the method returns
+    /// [`IrtgError::Cancelled`] and discards the partial filtered chart.
+    ///
+    /// Cancellation is cooperative and is checked at safe points during the
+    /// feature-structure fixpoint computation.
     pub fn filter_non_null_with_state_origins_controlled(
         &self,
         chart: &Explicit,
@@ -406,6 +452,14 @@ impl Irtg {
     }
 
     /// Parse with a strategy and a cooperative cancellation control.
+    ///
+    /// The control may be cloned and canceled from another thread. On
+    /// cancellation this method returns [`IrtgError::Cancelled`] and discards
+    /// any partial chart. Cancellation is checked at safe points and therefore
+    /// does not forcibly terminate the parsing thread.
+    ///
+    /// Use [`Self::parse`] or [`Self::parse_with`] when cancellation is not
+    /// needed.
     pub fn parse_with_control<'a>(
         &self,
         inputs: impl IntoIterator<Item = ParseInput<'a>>,
@@ -1655,6 +1709,10 @@ pub struct ParseChart {
 #[derive(Debug, Error)]
 pub enum IrtgError {
     /// The caller requested cooperative cancellation.
+    ///
+    /// No partial parse chart or filtered chart is returned. Because
+    /// cancellation is cooperative, the operation may finish its current
+    /// indivisible automaton or algebra callback before returning this error.
     #[error("parsing cancelled")]
     Cancelled,
     /// Input bytes were not valid UTF-8.

@@ -1281,11 +1281,8 @@ fn feature_map_literal(features: &FeatureMap, defined: &mut HashSet<String>) -> 
             let value = match value {
                 FeatureAtom::Constant(value) => value.clone(),
                 FeatureAtom::Variable(variable) => {
-                    if defined.insert(variable.clone()) {
-                        format!("#{variable}")
-                    } else {
-                        format!("#{variable}")
-                    }
+                    defined.insert(variable.clone());
+                    format!("#{variable}")
                 }
             };
             format!("{attribute}: {value}")

@@ -514,13 +514,13 @@ VP -> sleeps [1.0]
             |s| format!("q{}", s.index()),
             |sym| irtg.grammar_signature().resolve(sym).to_owned(),
         );
-        for i in 0..g.num_rules() {
+        for (i, expected) in all.iter().enumerate() {
             let one = g.resolved_rule(
                 i,
                 |s| format!("q{}", s.index()),
                 |sym| irtg.grammar_signature().resolve(sym).to_owned(),
             );
-            assert_eq!(one, all[i]);
+            assert_eq!(&one, expected);
         }
     }
 
@@ -555,8 +555,8 @@ VP -> sleeps [1.0]
         let irtg = parse_irtg(GRAMMAR.as_bytes()).unwrap();
         let all = irtg.resolved_grammar_rules();
         assert_eq!(irtg.num_grammar_rules(), all.len());
-        for i in 0..irtg.num_grammar_rules() {
-            assert_eq!(irtg.resolved_grammar_rule(i), all[i]);
+        for (i, expected) in all.iter().enumerate() {
+            assert_eq!(&irtg.resolved_grammar_rule(i), expected);
         }
     }
 
@@ -582,9 +582,7 @@ VP -> sleeps [1.0]
         assert!(matches!(rendered[0].value, RenderedValue::Text(_)));
         assert!(matches!(rendered[1].value, RenderedValue::Tree(_)));
 
-        let evaluated = irtg
-            .evaluate_derivation(best.arena(), best.root())
-            .unwrap();
+        let evaluated = irtg.evaluate_derivation(best.arena(), best.root()).unwrap();
         assert!(matches!(
             evaluated[0].value.visual(),
             crate::VisualRepresentation::Text(text) if text == "john sleeps"
@@ -609,15 +607,19 @@ VP -> sleeps [1.0]
         )
         .unwrap();
         let best = irtg.grammar().viterbi().unwrap();
-        let evaluated = irtg
-            .evaluate_derivation(best.arena(), best.root())
-            .unwrap();
+        let evaluated = irtg.evaluate_derivation(best.arena(), best.root()).unwrap();
         assert!(matches!(
             evaluated[0].value.visual(),
             crate::VisualRepresentation::FeatureStructure(_)
         ));
         assert_eq!(evaluated[0].value.codecs()[0].name, "display");
-        assert!(evaluated[0].value.encode("display").unwrap().contains("case"));
+        assert!(
+            evaluated[0]
+                .value
+                .encode("display")
+                .unwrap()
+                .contains("case")
+        );
     }
 
     #[test]
