@@ -1,0 +1,27 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "rusty-alto"
+version = "0.2.0"
+description = "Fast weighted tree automata and interpreted regular tree grammars"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "rusty-alto contributors" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[tool.maturin]
+manifest-path = "bindings/python/Cargo.toml"
+python-source = "python"
+module-name = "rusty_alto._rusty_alto"
+features = ["pyo3/extension-module"]
+
+[tool.pytest.ini_options]
+testpaths = ["bindings/python/tests"]
