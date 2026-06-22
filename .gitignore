@@ -1,1 +1,6 @@
 /target/
+__pycache__/
+*.py[cod]
+python/rusty_alto/*.so
+python/rusty_alto/*.pyd
+python/rusty_alto/*.dylib

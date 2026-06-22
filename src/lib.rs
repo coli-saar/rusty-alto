@@ -149,7 +149,7 @@ pub use homomorphism::{HomLabel, HomTerm, Homomorphism, HomomorphismError};
 pub use ids::{Arity, StateId, Symbol};
 pub use interner::Interner;
 pub use irtg::{
-    AstarHeuristic, EvaluatedAlgebraValue, Interpretation, Irtg, IrtgError,
+    AstarHeuristic, DecompositionAutomaton, EvaluatedAlgebraValue, Interpretation, Irtg, IrtgError,
     MaterializationStrategy, NonNullFilteredChart, ParseChart, ParseInput, TypedInterpretation,
     parse_irtg,
 };

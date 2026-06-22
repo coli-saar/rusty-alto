@@ -56,6 +56,28 @@ cargo build
 cargo test
 ```
 
+### Python
+
+The `rusty_alto` package exposes explicit automata, lazy decomposition
+automata, native combinators, and IRTG parsing through PyO3:
+
+```sh
+python -m venv .venv
+source .venv/bin/activate
+pip install maturin pytest
+maturin develop --release
+pytest bindings/python/tests
+```
+
+```python
+import rusty_alto as ra
+
+decomposition = ra.StringAlgebra().decompose("john sleeps")
+chart, source_states = decomposition.materialize()
+```
+
+See [`docs/python-bindings.md`](docs/python-bindings.md) for the API overview.
+
 Use a release build for real grammars:
 
 ```sh

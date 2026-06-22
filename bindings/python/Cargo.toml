@@ -1,0 +1,15 @@
+[package]
+name = "rusty-alto-python"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[lib]
+name = "_rusty_alto"
+crate-type = ["cdylib"]
+
+[dependencies]
+packed-term-arena = "0.1.0"
+rusty-alto = { path = "../.." }
+pyo3 = { version = "0.29", features = ["abi3-py39", "extension-module"] }

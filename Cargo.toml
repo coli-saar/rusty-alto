@@ -24,6 +24,10 @@ include = [
     "/docs/**",
 ]
 
+[workspace]
+members = [".", "bindings/python"]
+resolver = "2"
+
 [dependencies]
 fixedbitset = "0.5"
 hashbrown = { version = "0.15", features = ["raw-entry"] }

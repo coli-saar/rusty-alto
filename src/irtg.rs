@@ -1412,6 +1412,23 @@ pub struct Interpretation {
     renderer: Box<dyn DerivationRenderer>,
 }
 
+/// One owned built-in decomposition automaton created by an interpretation.
+///
+/// This enum is useful to dynamic frontends which cannot name the concrete
+/// algebra type at compile time but still want to retain the lazy automaton
+/// rather than immediately materializing it.
+#[derive(Clone, Debug)]
+pub enum DecompositionAutomaton {
+    /// String-algebra span decomposition.
+    String(crate::StringDecompositionAutomaton),
+    /// TAG string decomposition.
+    TagString(TagStringDecompositionAutomaton),
+    /// TAG tree decomposition.
+    TagTree(TagTreeDecompositionAutomaton),
+    /// Binarized TAG tree decomposition.
+    BinarizedTagTree(BinarizedTagTreeDecompositionAutomaton),
+}
+
 impl Interpretation {
     fn decompose_string(
         &self,
@@ -1596,6 +1613,59 @@ impl Interpretation {
                 interpretation: self.name.clone(),
                 message: "interpretation is output-only and cannot be parsed as a parse input"
                     .to_owned(),
+            }),
+        }
+    }
+
+    /// Parse a textual object and retain its optimized lazy decomposition
+    /// automaton behind an owned dynamic enum.
+    pub fn decompose_object(&self, input: &str) -> Result<DecompositionAutomaton, IrtgError> {
+        let value = self.parse_object_erased(input)?;
+        match self.kind {
+            InterpretationKind::String => {
+                let value = *value.downcast::<Vec<Symbol>>().map_err(|_| {
+                    IrtgError::WrongInputType {
+                        interpretation: self.name.clone(),
+                    }
+                })?;
+                Ok(DecompositionAutomaton::String(
+                    self.decompose_string(value)?,
+                ))
+            }
+            InterpretationKind::TagString => {
+                let value = *value
+                    .downcast::<TagStringValue<Symbol>>()
+                    .map_err(|_| IrtgError::WrongInputType {
+                        interpretation: self.name.clone(),
+                    })?;
+                Ok(DecompositionAutomaton::TagString(
+                    self.decompose_tag_string(value)?,
+                ))
+            }
+            InterpretationKind::TagTree => {
+                let value =
+                    *value
+                        .downcast::<Tree>()
+                        .map_err(|_| IrtgError::WrongInputType {
+                            interpretation: self.name.clone(),
+                        })?;
+                Ok(DecompositionAutomaton::TagTree(
+                    self.decompose_tag_tree(value)?,
+                ))
+            }
+            InterpretationKind::BinarizedTagTree => {
+                let value =
+                    *value
+                        .downcast::<Tree>()
+                        .map_err(|_| IrtgError::WrongInputType {
+                            interpretation: self.name.clone(),
+                        })?;
+                Ok(DecompositionAutomaton::BinarizedTagTree(
+                    self.decompose_binarized_tag_tree(value)?,
+                ))
+            }
+            InterpretationKind::OutputOnly => Err(IrtgError::NotInputable {
+                interpretation: self.name.clone(),
             }),
         }
     }
