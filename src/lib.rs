@@ -87,11 +87,14 @@ pub mod combinators;
 pub mod control;
 pub mod corpus;
 pub mod explicit;
+pub mod finite_language;
 pub mod heuristic;
 pub mod homomorphism;
 pub mod ids;
 pub mod interner;
 pub mod irtg;
+mod language_analysis;
+pub mod language_cardinality;
 pub mod materialize;
 pub mod memo;
 pub mod obligatory_leaf;
@@ -121,8 +124,8 @@ pub use alto::{
     parse_alto_with_signature,
 };
 pub use application::{
-    AutomatonSummary, EvaluatedInterpretation, InterpretationInfo, LanguageCardinality,
-    ParseStrategy, RenderedInterpretation, RenderedValue, ResolvedRule,
+    AutomatonSummary, EvaluatedInterpretation, InterpretationInfo, ParseStrategy,
+    RenderedInterpretation, RenderedValue, ResolvedRule,
 };
 pub use astar::{
     AstarOptions, AstarStats, PreparedAstarGrammar, astar_one_best, astar_one_best_with,
@@ -141,7 +144,12 @@ pub use codecs::{TulipacError, TulipacInputCodec};
 pub use combinators::{Determinized, InvHom, Mapped, Product};
 pub use control::ParseControl;
 pub use corpus::{Corpus, CorpusError, CorpusWriter, Instance, read_corpus};
-pub use explicit::{Explicit, ExplicitBuildError, ExplicitBuilder, Rule};
+pub use explicit::{
+    Explicit, ExplicitBuildError, ExplicitBuilder, Rule, StateMapping, TrimmedExplicit,
+};
+pub use finite_language::{
+    Derivation, DerivationNode, FiniteLanguageError, FiniteLanguageIterator, FiniteLanguagePlan,
+};
 pub use heuristic::{
     IntersectionHeuristic, MinHeuristic, OutsideHeuristic, ScoredZeroHeuristic, ZeroHeuristic,
 };
@@ -153,6 +161,7 @@ pub use irtg::{
     MaterializationStrategy, NonNullFilteredChart, ParseChart, ParseInput, TypedInterpretation,
     parse_irtg,
 };
+pub use language_cardinality::LanguageCardinality;
 pub use materialize::{
     IndexedCondensedIntersectionStats, materialize, materialize_indexed_condensed_intersection,
     materialize_indexed_condensed_intersection_with_pairs,

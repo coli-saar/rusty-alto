@@ -2,6 +2,7 @@
 
 use crate::{
     BottomUpTa, DetBottomUpTa, FxHashMap, FxHashSet, IndexedBottomUpTa, StateId, Symbol, TopDownTa,
+    language_analysis::{RuleInput, analyze},
     traits::{CondensedTa, CondensedTopDownTa, StateUniverse, SymbolSet},
 };
 use fixedbitset::FixedBitSet;
@@ -50,7 +51,7 @@ impl Hash for HigherKey {
 }
 
 #[derive(Clone, Debug)]
-struct StoredRule {
+pub(crate) struct StoredRule {
     symbol: Symbol,
     children: SmallVec<[StateId; 2]>,
     result: StateId,
@@ -127,7 +128,51 @@ pub enum ExplicitBuildError {
 pub struct ExplicitBuilder {
     next_state: u32,
     accepting: Vec<StateId>,
-    rules: Vec<(Symbol, SmallVec<[StateId; 2]>, StateId, f64)>,
+    rules: Vec<StoredRule>,
+}
+
+/// An explicit automaton produced by trimming, together with its state remapping.
+#[derive(Clone, Debug)]
+pub struct TrimmedExplicit {
+    /// The compact automaton containing only states and rules that participate
+    /// in at least one accepting derivation.
+    pub automaton: Explicit,
+    /// Mapping between builder state IDs and compact automaton state IDs.
+    pub state_mapping: StateMapping,
+}
+
+/// Bidirectional state-ID mapping returned by [`ExplicitBuilder::build_trimmed`].
+///
+/// Trimming removes useless states and therefore must compact the surviving
+/// IDs. New IDs are assigned in increasing old-ID order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateMapping {
+    old_to_new: Vec<Option<StateId>>,
+    new_to_old: Vec<StateId>,
+}
+
+impl StateMapping {
+    /// Return the compact ID for an old builder ID, or `None` if it was removed.
+    pub fn new_state(&self, old: StateId) -> Option<StateId> {
+        self.old_to_new.get(old.index()).copied().flatten()
+    }
+
+    /// Return the old builder ID corresponding to a compact ID.
+    ///
+    /// Panics if `new` is not a state of the trimmed automaton.
+    pub fn old_state(&self, new: StateId) -> StateId {
+        self.new_to_old[new.index()]
+    }
+
+    /// Return the number of retained states.
+    pub fn len(&self) -> usize {
+        self.new_to_old.len()
+    }
+
+    /// Return whether no states were retained.
+    pub fn is_empty(&self) -> bool {
+        self.new_to_old.is_empty()
+    }
 }
 
 impl ExplicitBuilder {
@@ -195,7 +240,12 @@ impl ExplicitBuilder {
         for &child in &children {
             self.check_state(child);
         }
-        self.rules.push((f, children, q, weight));
+        self.rules.push(StoredRule {
+            symbol: f,
+            children,
+            result: q,
+            weight,
+        });
     }
 
     /// Build the explicit automaton.
@@ -217,6 +267,84 @@ impl ExplicitBuilder {
         self.finish(true)
     }
 
+    /// Build only the states and rules that can occur in accepting derivations.
+    ///
+    /// The submitted builder is validated before trimming, so duplicate rules
+    /// remain errors even when they occur entirely in a discarded component.
+    /// Panics on such an error, matching [`Self::build`].
+    pub fn build_trimmed(self) -> TrimmedExplicit {
+        self.try_build_trimmed()
+            .expect("explicit automaton contains duplicate transitions")
+    }
+
+    /// Try to build a trimmed explicit automaton and its state remapping.
+    ///
+    /// A state is retained exactly when it is productive and reachable below
+    /// an accepting state through productive rules. Productive cycles are
+    /// retained when they can participate in acceptance. Surviving state IDs
+    /// are compacted deterministically in increasing old-ID order.
+    pub fn try_build_trimmed(self) -> Result<TrimmedExplicit, ExplicitBuildError> {
+        self.validate_duplicates()?;
+
+        let inputs = self
+            .rules
+            .iter()
+            .map(|rule| RuleInput {
+                children: &rule.children,
+                result: rule.result,
+            })
+            .collect::<Vec<_>>();
+        let analysis = analyze(
+            self.next_state as usize,
+            &inputs,
+            self.accepting.iter().copied(),
+        );
+
+        let mut old_to_new = vec![None; self.next_state as usize];
+        let mut new_to_old = Vec::new();
+        for (old_index, &useful) in analysis.relevant.iter().enumerate() {
+            if useful {
+                let new = StateId(new_to_old.len() as u32);
+                old_to_new[old_index] = Some(new);
+                new_to_old.push(StateId(old_index as u32));
+            }
+        }
+
+        let mut accepting = FixedBitSet::with_capacity(new_to_old.len());
+        for old in self.accepting {
+            if let Some(new) = old_to_new[old.index()] {
+                accepting.set(new.index(), true);
+            }
+        }
+
+        let mut rules = Vec::new();
+        for (rule_index, rule) in self.rules.into_iter().enumerate() {
+            if !analysis.productive_rules[rule_index] || !analysis.relevant[rule.result.index()] {
+                continue;
+            }
+            rules.push(StoredRule {
+                symbol: rule.symbol,
+                children: rule
+                    .children
+                    .into_iter()
+                    .map(|child| old_to_new[child.index()].expect("useful child must be retained"))
+                    .collect(),
+                result: old_to_new[rule.result.index()].expect("useful result must be retained"),
+                weight: rule.weight,
+            });
+        }
+
+        let state_mapping = StateMapping {
+            old_to_new,
+            new_to_old,
+        };
+        let automaton = Explicit::from_parts(state_mapping.len() as u32, accepting, rules);
+        Ok(TrimmedExplicit {
+            automaton,
+            state_mapping,
+        })
+    }
+
     /// Build without checking for duplicate transitions.
     ///
     /// This is for internal algorithms that already enforce uniqueness while
@@ -236,40 +364,44 @@ impl ExplicitBuilder {
         let mut seen = FxHashSet::default();
         let mut stored = Vec::with_capacity(self.rules.len());
 
-        for (symbol, children, result, weight) in self.rules {
+        for rule in self.rules {
             if check_duplicates {
                 let key = RuleKey {
-                    symbol,
-                    children: children.clone(),
-                    result,
+                    symbol: rule.symbol,
+                    children: rule.children.clone(),
+                    result: rule.result,
                 };
                 if !seen.insert(key) {
                     return Err(ExplicitBuildError::DuplicateTransition {
-                        symbol,
-                        children: children.into_vec(),
-                        result,
+                        symbol: rule.symbol,
+                        children: rule.children.into_vec(),
+                        result: rule.result,
                     });
                 }
             }
-            let rule = StoredRule {
-                symbol,
-                children,
-                result,
-                weight,
-            };
             stored.push(rule);
         }
 
-        Ok(Explicit {
-            num_states: self.next_state,
-            accepting,
-            rules: stored,
-            bottom_up_indexes: OnceLock::new(),
-            reachable_cache: OnceLock::new(),
-            result_index: OnceLock::new(),
-            indexes: OnceLock::new(),
-            condensed_cache: OnceLock::new(),
-        })
+        Ok(Explicit::from_parts(self.next_state, accepting, stored))
+    }
+
+    fn validate_duplicates(&self) -> Result<(), ExplicitBuildError> {
+        let mut seen = FxHashSet::default();
+        for rule in &self.rules {
+            let key = RuleKey {
+                symbol: rule.symbol,
+                children: rule.children.clone(),
+                result: rule.result,
+            };
+            if !seen.insert(key) {
+                return Err(ExplicitBuildError::DuplicateTransition {
+                    symbol: rule.symbol,
+                    children: rule.children.to_vec(),
+                    result: rule.result,
+                });
+            }
+        }
+        Ok(())
     }
 
     fn check_state(&self, q: StateId) {
@@ -286,6 +418,19 @@ impl ExplicitBuilder {
 }
 
 impl Explicit {
+    fn from_parts(num_states: u32, accepting: FixedBitSet, rules: Vec<StoredRule>) -> Self {
+        Self {
+            num_states,
+            accepting,
+            rules,
+            bottom_up_indexes: OnceLock::new(),
+            reachable_cache: OnceLock::new(),
+            result_index: OnceLock::new(),
+            indexes: OnceLock::new(),
+            condensed_cache: OnceLock::new(),
+        }
+    }
+
     /// Return the number of allocated states.
     pub fn num_states(&self) -> u32 {
         self.num_states
@@ -673,6 +818,119 @@ mod tests {
     use super::*;
     use crate::BottomUpTa;
     use std::collections::hash_map::DefaultHasher;
+
+    #[test]
+    fn trimming_removes_dead_states_and_maps_survivors_densely() {
+        let mut b = ExplicitBuilder::new();
+        let dead_leaf = b.new_state();
+        let useful_leaf = b.new_state();
+        let dead_cycle = b.new_state();
+        let root = b.new_state();
+        b.add_rule(Symbol(0), vec![], dead_leaf);
+        b.add_weighted_rule(Symbol(1), vec![], useful_leaf, -0.0);
+        b.add_rule(Symbol(2), vec![dead_cycle], dead_cycle);
+        b.add_weighted_rule(Symbol(3), vec![useful_leaf], root, -2.5);
+        b.add_accepting(root);
+
+        let trimmed = b.build_trimmed();
+        assert_eq!(trimmed.automaton.num_states(), 2);
+        assert_eq!(trimmed.automaton.num_rules(), 2);
+        assert_eq!(trimmed.state_mapping.new_state(dead_leaf), None);
+        assert_eq!(trimmed.state_mapping.new_state(dead_cycle), None);
+        assert_eq!(
+            trimmed.state_mapping.new_state(useful_leaf),
+            Some(StateId(0))
+        );
+        assert_eq!(trimmed.state_mapping.new_state(root), Some(StateId(1)));
+        assert_eq!(trimmed.state_mapping.old_state(StateId(0)), useful_leaf);
+        assert_eq!(trimmed.state_mapping.old_state(StateId(1)), root);
+        assert!(trimmed.automaton.is_accepting(&StateId(1)));
+        assert_eq!(
+            trimmed.automaton.rule(0).weight.to_bits(),
+            (-0.0f64).to_bits()
+        );
+        assert_eq!(trimmed.automaton.rule(1).weight, -2.5);
+    }
+
+    #[test]
+    fn trimming_keeps_productive_cycles_and_excludes_unproductive_rules() {
+        let mut b = ExplicitBuilder::new();
+        let leaf = b.new_state();
+        let bad = b.new_state();
+        let root = b.new_state();
+        b.add_rule(Symbol(0), vec![], leaf);
+        b.add_rule(Symbol(1), vec![leaf], root);
+        b.add_rule(Symbol(2), vec![root], leaf);
+        b.add_rule(Symbol(3), vec![bad], root);
+        b.add_rule(Symbol(4), vec![bad], bad);
+        b.add_accepting(root);
+        let trimmed = b.build_trimmed();
+        assert_eq!(trimmed.automaton.num_states(), 2);
+        assert_eq!(trimmed.automaton.num_rules(), 3);
+        assert_eq!(
+            trimmed.automaton.language_cardinality(),
+            crate::LanguageCardinality::Infinite
+        );
+    }
+
+    #[test]
+    fn trimming_empty_language_returns_empty_mapping_and_automaton() {
+        let mut b = ExplicitBuilder::new();
+        let q = b.new_state();
+        b.add_rule(Symbol(0), vec![], q);
+        let trimmed = b.build_trimmed();
+        assert!(trimmed.state_mapping.is_empty());
+        assert_eq!(trimmed.automaton.num_states(), 0);
+        assert_eq!(trimmed.automaton.num_rules(), 0);
+    }
+
+    #[test]
+    fn trimming_validates_duplicates_in_dead_components() {
+        let mut b = ExplicitBuilder::new();
+        let q = b.new_state();
+        b.add_rule(Symbol(0), vec![], q);
+        b.add_weighted_rule(Symbol(0), vec![], q, 2.0);
+        assert!(matches!(
+            b.try_build_trimmed(),
+            Err(ExplicitBuildError::DuplicateTransition { .. })
+        ));
+    }
+
+    #[test]
+    fn trimming_preserves_repeated_children_and_child_order() {
+        let mut b = ExplicitBuilder::new();
+        let first = b.new_state();
+        let removed = b.new_state();
+        let second = b.new_state();
+        let root = b.new_state();
+        b.add_rule(Symbol(0), vec![], first);
+        b.add_rule(Symbol(1), vec![], second);
+        b.add_rule(Symbol(2), vec![], removed);
+        b.add_rule(Symbol(3), vec![second, first, second], root);
+        b.add_accepting(root);
+        let trimmed = b.build_trimmed();
+        assert_eq!(trimmed.state_mapping.new_state(removed), None);
+        assert_eq!(
+            trimmed.automaton.rule(2).children,
+            &[StateId(1), StateId(0), StateId(1)]
+        );
+    }
+
+    #[test]
+    fn trimming_a_deep_chain_is_iterative() {
+        let mut b = ExplicitBuilder::new();
+        let mut state = b.new_state();
+        b.add_rule(Symbol(0), vec![], state);
+        for _ in 0..20_000 {
+            let parent = b.new_state();
+            b.add_rule(Symbol(1), vec![state], parent);
+            state = parent;
+        }
+        b.add_accepting(state);
+        let trimmed = b.build_trimmed();
+        assert_eq!(trimmed.automaton.num_states(), 20_001);
+        assert_eq!(trimmed.automaton.num_rules(), 20_001);
+    }
 
     #[test]
     fn add_rule_defaults_to_unit_weight() {
