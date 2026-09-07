@@ -2,7 +2,7 @@
 
 use crate::{
     BottomUpTa, DetBottomUpTa, FxHashMap, FxHashSet, IndexedBottomUpTa, StateId, Symbol, TopDownTa,
-    language_analysis::{RuleInput, analyze},
+    language_analysis::{RuleInput, analyze_for_trimming, analyze_productive_for_trimming},
     traits::{CondensedTa, CondensedTopDownTa, StateUniverse, SymbolSet},
 };
 use fixedbitset::FixedBitSet;
@@ -209,6 +209,19 @@ impl ExplicitBuilder {
         self.add_weighted_rule(f, children, q, 1.0);
     }
 
+    /// Add a bottom-up transition rule from an iterator of child states.
+    ///
+    /// This avoids requiring a temporary `Vec` when a caller already has an
+    /// iterator or compact child tuple.
+    pub fn add_rule_from_iter(
+        &mut self,
+        f: Symbol,
+        children: impl IntoIterator<Item = StateId>,
+        q: StateId,
+    ) {
+        self.add_weighted_rule_inline(f, children.into_iter().collect(), q, 1.0);
+    }
+
     /// Add a weighted bottom-up transition rule.
     ///
     /// `children` is the exact child-state tuple for the rule. An empty vector
@@ -269,11 +282,22 @@ impl ExplicitBuilder {
 
     /// Build only the states and rules that can occur in accepting derivations.
     ///
-    /// The submitted builder is validated before trimming, so duplicate rules
-    /// remain errors even when they occur entirely in a discarded component.
-    /// Panics on such an error, matching [`Self::build`].
+    /// Duplicate surviving rules remain errors. Duplicates confined to a
+    /// discarded component do not affect the resulting automaton and are
+    /// ignored. Panics on an error, matching [`Self::build`].
     pub fn build_trimmed(self) -> TrimmedExplicit {
         self.try_build_trimmed()
+            .expect("explicit automaton contains duplicate transitions")
+    }
+
+    /// Build a trimmed automaton when every allocated state is known productive.
+    ///
+    /// This skips productivity analysis and removes only states that cannot
+    /// occur below an accepting state. Callers constructing states bottom-up
+    /// from rules with productive children can use this without exposing their
+    /// construction bookkeeping.
+    pub fn build_trimmed_assuming_productive(self) -> TrimmedExplicit {
+        self.try_build_trimmed_assuming_productive()
             .expect("explicit automaton contains duplicate transitions")
     }
 
@@ -284,8 +308,23 @@ impl ExplicitBuilder {
     /// retained when they can participate in acceptance. Surviving state IDs
     /// are compacted deterministically in increasing old-ID order.
     pub fn try_build_trimmed(self) -> Result<TrimmedExplicit, ExplicitBuildError> {
-        self.validate_duplicates()?;
+        self.try_build_trimmed_inner(false)
+    }
 
+    /// Try to build a trimmed automaton when every allocated state is productive.
+    ///
+    /// This is the fallible counterpart of
+    /// [`Self::build_trimmed_assuming_productive`].
+    pub fn try_build_trimmed_assuming_productive(
+        self,
+    ) -> Result<TrimmedExplicit, ExplicitBuildError> {
+        self.try_build_trimmed_inner(true)
+    }
+
+    fn try_build_trimmed_inner(
+        self,
+        assume_productive: bool,
+    ) -> Result<TrimmedExplicit, ExplicitBuildError> {
         let inputs = self
             .rules
             .iter()
@@ -294,11 +333,19 @@ impl ExplicitBuilder {
                 result: rule.result,
             })
             .collect::<Vec<_>>();
-        let analysis = analyze(
-            self.next_state as usize,
-            &inputs,
-            self.accepting.iter().copied(),
-        );
+        let analysis = if assume_productive {
+            analyze_productive_for_trimming(
+                self.next_state as usize,
+                &inputs,
+                self.accepting.iter().copied(),
+            )
+        } else {
+            analyze_for_trimming(
+                self.next_state as usize,
+                &inputs,
+                self.accepting.iter().copied(),
+            )
+        };
 
         let mut old_to_new = vec![None; self.next_state as usize];
         let mut new_to_old = Vec::new();
@@ -318,11 +365,12 @@ impl ExplicitBuilder {
         }
 
         let mut rules = Vec::new();
+        let mut seen = FxHashSet::default();
         for (rule_index, rule) in self.rules.into_iter().enumerate() {
             if !analysis.productive_rules[rule_index] || !analysis.relevant[rule.result.index()] {
                 continue;
             }
-            rules.push(StoredRule {
+            let stored = StoredRule {
                 symbol: rule.symbol,
                 children: rule
                     .children
@@ -331,7 +379,20 @@ impl ExplicitBuilder {
                     .collect(),
                 result: old_to_new[rule.result.index()].expect("useful result must be retained"),
                 weight: rule.weight,
-            });
+            };
+            let key = RuleKey {
+                symbol: stored.symbol,
+                children: stored.children.clone(),
+                result: stored.result,
+            };
+            if !seen.insert(key) {
+                return Err(ExplicitBuildError::DuplicateTransition {
+                    symbol: stored.symbol,
+                    children: stored.children.into_vec(),
+                    result: stored.result,
+                });
+            }
+            rules.push(stored);
         }
 
         let state_mapping = StateMapping {
@@ -383,25 +444,6 @@ impl ExplicitBuilder {
         }
 
         Ok(Explicit::from_parts(self.next_state, accepting, stored))
-    }
-
-    fn validate_duplicates(&self) -> Result<(), ExplicitBuildError> {
-        let mut seen = FxHashSet::default();
-        for rule in &self.rules {
-            let key = RuleKey {
-                symbol: rule.symbol,
-                children: rule.children.clone(),
-                result: rule.result,
-            };
-            if !seen.insert(key) {
-                return Err(ExplicitBuildError::DuplicateTransition {
-                    symbol: rule.symbol,
-                    children: rule.children.to_vec(),
-                    result: rule.result,
-                });
-            }
-        }
-        Ok(())
     }
 
     fn check_state(&self, q: StateId) {
@@ -885,15 +927,50 @@ mod tests {
     }
 
     #[test]
-    fn trimming_validates_duplicates_in_dead_components() {
+    fn trimming_ignores_duplicates_in_dead_components() {
         let mut b = ExplicitBuilder::new();
         let q = b.new_state();
         b.add_rule(Symbol(0), vec![], q);
         b.add_weighted_rule(Symbol(0), vec![], q, 2.0);
+        let trimmed = b.try_build_trimmed().unwrap();
+        assert!(trimmed.automaton.rules().next().is_none());
+    }
+
+    #[test]
+    fn trimming_rejects_duplicate_surviving_transitions() {
+        let mut b = ExplicitBuilder::new();
+        let q = b.new_state();
+        b.add_rule(Symbol(0), vec![], q);
+        b.add_weighted_rule(Symbol(0), vec![], q, 2.0);
+        b.add_accepting(q);
         assert!(matches!(
             b.try_build_trimmed(),
             Err(ExplicitBuildError::DuplicateTransition { .. })
         ));
+    }
+
+    #[test]
+    fn productive_trimming_matches_general_trimming() {
+        fn builder() -> ExplicitBuilder {
+            let mut b = ExplicitBuilder::new();
+            let leaf = b.new_state();
+            let middle = b.new_state();
+            let root = b.new_state();
+            b.add_rule(Symbol(0), vec![], leaf);
+            b.add_rule(Symbol(1), vec![leaf], middle);
+            b.add_rule(Symbol(2), vec![middle, leaf], root);
+            b.add_rule(Symbol(3), vec![leaf], root);
+            b.add_accepting(root);
+            b
+        }
+
+        let general = builder().build_trimmed();
+        let specialized = builder().build_trimmed_assuming_productive();
+        assert_eq!(general.state_mapping, specialized.state_mapping);
+        assert_eq!(
+            general.automaton.rules().collect::<Vec<_>>(),
+            specialized.automaton.rules().collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -943,6 +1020,18 @@ mod tests {
         let mut out = Vec::new();
         e.step(Symbol(1), &[], &mut |q| out.push(q));
         assert_eq!(out, vec![q]);
+    }
+
+    #[test]
+    fn add_rule_from_iter_defaults_to_unit_weight_and_preserves_children() {
+        let mut b = ExplicitBuilder::new();
+        let child = b.new_state();
+        let result = b.new_state();
+        b.add_rule_from_iter(Symbol(1), [child, child], result);
+        let e = b.build();
+        let rule = e.rules().next().unwrap();
+        assert_eq!(rule.children, &[child, child]);
+        assert_eq!(rule.weight, 1.0);
     }
 
     #[test]

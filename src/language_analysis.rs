@@ -38,6 +38,51 @@ pub(crate) fn analyze(
     rules: &[RuleInput<'_>],
     accepting: impl IntoIterator<Item = StateId>,
 ) -> LanguageAnalysis {
+    analyze_inner(state_count, rules, accepting, true)
+}
+
+pub(crate) fn analyze_for_trimming(
+    state_count: usize,
+    rules: &[RuleInput<'_>],
+    accepting: impl IntoIterator<Item = StateId>,
+) -> LanguageAnalysis {
+    analyze_inner(state_count, rules, accepting, false)
+}
+
+pub(crate) fn analyze_productive_for_trimming(
+    state_count: usize,
+    rules: &[RuleInput<'_>],
+    accepting: impl IntoIterator<Item = StateId>,
+) -> LanguageAnalysis {
+    let productive = vec![true; state_count];
+    let productive_rules = vec![true; rules.len()];
+    let mut rules_by_result = vec![Vec::new(); state_count];
+    for (rule_index, rule) in rules.iter().enumerate() {
+        rules_by_result[rule.result.index()].push(rule_index);
+    }
+    let relevant = relevant_states(
+        state_count,
+        rules,
+        accepting,
+        &productive,
+        &productive_rules,
+        &rules_by_result,
+    );
+    LanguageAnalysis {
+        productive,
+        productive_rules,
+        relevant,
+        rules_by_result,
+        topological: None,
+    }
+}
+
+fn analyze_inner(
+    state_count: usize,
+    rules: &[RuleInput<'_>],
+    accepting: impl IntoIterator<Item = StateId>,
+    compute_topological: bool,
+) -> LanguageAnalysis {
     let mut productive = vec![false; state_count];
     let mut productive_rules = vec![false; rules.len()];
     let mut remaining = Vec::with_capacity(rules.len());
@@ -75,22 +120,23 @@ pub(crate) fn analyze(
         }
     }
 
-    let accepting = accepting.into_iter().collect::<Vec<_>>();
-    let mut relevant = vec![false; state_count];
-    let mut stack = accepting
-        .iter()
-        .copied()
-        .filter(|state| productive[state.index()])
-        .collect::<Vec<_>>();
-    while let Some(state) = stack.pop() {
-        if std::mem::replace(&mut relevant[state.index()], true) {
-            continue;
-        }
-        for &rule_index in &rules_by_result[state.index()] {
-            if productive_rules[rule_index] {
-                stack.extend(rules[rule_index].children.iter().copied());
-            }
-        }
+    let relevant = relevant_states(
+        state_count,
+        rules,
+        accepting,
+        &productive,
+        &productive_rules,
+        &rules_by_result,
+    );
+
+    if !compute_topological {
+        return LanguageAnalysis {
+            productive,
+            productive_rules,
+            relevant,
+            rules_by_result,
+            topological: None,
+        };
     }
 
     // Edges point from a child dependency to its parent. Kahn's algorithm then
@@ -130,4 +176,30 @@ pub(crate) fn analyze(
         rules_by_result,
         topological: (order.len() == relevant_count).then_some(order),
     }
+}
+
+fn relevant_states(
+    state_count: usize,
+    rules: &[RuleInput<'_>],
+    accepting: impl IntoIterator<Item = StateId>,
+    productive: &[bool],
+    productive_rules: &[bool],
+    rules_by_result: &[Vec<usize>],
+) -> Vec<bool> {
+    let mut relevant = vec![false; state_count];
+    let mut stack = accepting
+        .into_iter()
+        .filter(|state| productive[state.index()])
+        .collect::<Vec<_>>();
+    while let Some(state) = stack.pop() {
+        if std::mem::replace(&mut relevant[state.index()], true) {
+            continue;
+        }
+        for &rule_index in &rules_by_result[state.index()] {
+            if productive_rules[rule_index] {
+                stack.extend(rules[rule_index].children.iter().copied());
+            }
+        }
+    }
+    relevant
 }

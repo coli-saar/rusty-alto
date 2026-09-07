@@ -1,9 +1,10 @@
 //! Fast unsorted enumeration of finite explicit derivation languages.
 
 use crate::{
-    BottomUpTa, Explicit, StateId, Symbol,
+    BottomUpTa, Explicit, LanguageCardinality, StateId, Symbol,
     language_analysis::{LanguageAnalysis, analyze_explicit},
 };
+use num_traits::{CheckedAdd, CheckedMul, One, Zero};
 use thiserror::Error;
 
 /// Error returned when a finite-language plan cannot be constructed.
@@ -14,7 +15,7 @@ pub enum FiniteLanguageError {
     InfiniteLanguage,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct PlannedRule {
     original_index: usize,
     symbol: Symbol,
@@ -34,6 +35,7 @@ pub struct FiniteLanguagePlan {
     accepting: Vec<StateId>,
     rules: Vec<PlannedRule>,
     rules_by_state: Vec<Vec<usize>>,
+    topological: Vec<StateId>,
 }
 
 impl FiniteLanguagePlan {
@@ -43,14 +45,18 @@ impl FiniteLanguagePlan {
     /// ambiguous runs are retained separately. Rule weights are copied for
     /// inspection but do not affect completeness or order.
     pub fn new(automaton: &Explicit) -> Result<Self, FiniteLanguageError> {
-        let analysis = analyze_explicit(automaton);
-        if analysis.topological.is_none() {
+        let mut analysis = analyze_explicit(automaton);
+        let Some(topological) = analysis.topological.take() else {
             return Err(FiniteLanguageError::InfiniteLanguage);
-        }
-        Ok(Self::from_analysis(automaton, analysis))
+        };
+        Ok(Self::from_analysis(automaton, analysis, topological))
     }
 
-    fn from_analysis(automaton: &Explicit, analysis: LanguageAnalysis) -> Self {
+    fn from_analysis(
+        automaton: &Explicit,
+        analysis: LanguageAnalysis,
+        topological: Vec<StateId>,
+    ) -> Self {
         let accepting = (0..automaton.num_states())
             .map(StateId)
             .filter(|state| automaton.is_accepting(state) && analysis.productive[state.index()])
@@ -76,7 +82,45 @@ impl FiniteLanguagePlan {
             accepting,
             rules,
             rules_by_state,
+            topological,
         }
+    }
+
+    /// Count this plan's finite derivation language using checked arithmetic.
+    ///
+    /// This reuses the productivity, relevance, and topological analysis
+    /// already performed when the plan was created.
+    pub fn language_cardinality_as<N>(&self) -> LanguageCardinality<N>
+    where
+        N: Clone + Zero + One + CheckedAdd + CheckedMul,
+    {
+        let mut counts = vec![N::zero(); self.rules_by_state.len()];
+        for &state in &self.topological {
+            let mut state_total = N::zero();
+            for &rule_index in &self.rules_by_state[state.index()] {
+                let mut combinations = N::one();
+                for child in &self.rules[rule_index].children {
+                    let Some(next) = combinations.checked_mul(&counts[child.index()]) else {
+                        return LanguageCardinality::TooLarge;
+                    };
+                    combinations = next;
+                }
+                let Some(next) = state_total.checked_add(&combinations) else {
+                    return LanguageCardinality::TooLarge;
+                };
+                state_total = next;
+            }
+            counts[state.index()] = state_total;
+        }
+
+        let mut total = N::zero();
+        for &state in &self.accepting {
+            let Some(next) = total.checked_add(&counts[state.index()]) else {
+                return LanguageCardinality::TooLarge;
+            };
+            total = next;
+        }
+        LanguageCardinality::Finite(total)
     }
 
     /// Create a fresh iterator with independent reusable traversal storage.
@@ -90,51 +134,55 @@ impl FiniteLanguagePlan {
 /// Nodes are exposed in root-first, left-to-right pre-order. Rule indices refer
 /// to the source automaton's stable [`Explicit::rule`] order.
 #[derive(Clone, Debug, PartialEq)]
-pub struct DerivationNode {
+pub struct DerivationNode<'a> {
+    rule: &'a PlannedRule,
     state: StateId,
-    rule_index: usize,
-    symbol: Symbol,
-    weight: f64,
-    parent: Option<usize>,
-    child_position: Option<usize>,
-    arity: usize,
-    choice: usize,
+    parent: u32,
+    child_position: u32,
+    choice: u32,
 }
 
-impl DerivationNode {
+impl DerivationNode<'_> {
     /// State assigned to this occurrence.
+    #[inline]
     pub fn state(&self) -> StateId {
         self.state
     }
 
     /// Index of the selected rule in the source automaton.
+    #[inline]
     pub fn rule_index(&self) -> usize {
-        self.rule_index
+        self.rule.original_index
     }
 
     /// Symbol selected at this occurrence.
+    #[inline]
     pub fn symbol(&self) -> Symbol {
-        self.symbol
+        self.rule.symbol
     }
 
     /// Weight stored on the selected rule; enumeration itself ignores weights.
+    #[inline]
     pub fn weight(&self) -> f64 {
-        self.weight
+        self.rule.weight
     }
 
     /// Pre-order index of the parent, or `None` at the root.
+    #[inline]
     pub fn parent(&self) -> Option<usize> {
-        self.parent
+        (self.parent != NO_INDEX).then_some(self.parent as usize)
     }
 
     /// Left-to-right position below the parent, or `None` at the root.
+    #[inline]
     pub fn child_position(&self) -> Option<usize> {
-        self.child_position
+        (self.child_position != NO_INDEX).then_some(self.child_position as usize)
     }
 
     /// Number of children selected by this node's rule.
+    #[inline]
     pub fn arity(&self) -> usize {
-        self.arity
+        self.rule.children.len()
     }
 }
 
@@ -144,26 +192,29 @@ impl DerivationNode {
 /// is therefore valid only until the iterator is mutably accessed again.
 #[derive(Clone, Copy, Debug)]
 pub struct Derivation<'a> {
-    nodes: &'a [DerivationNode],
+    nodes: &'a [DerivationNode<'a>],
 }
 
 impl<'a> Derivation<'a> {
     /// Return all nodes in root-first, left-to-right pre-order.
-    pub fn nodes(&self) -> &'a [DerivationNode] {
+    #[inline]
+    pub fn nodes(&self) -> &'a [DerivationNode<'a>] {
         self.nodes
     }
 
     /// Iterate over the pre-order node sequence.
-    pub fn iter(&self) -> impl ExactSizeIterator<Item = &'a DerivationNode> {
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &'a DerivationNode<'a>> {
         self.nodes.iter()
     }
 
     /// Return the number of nodes in this derivation.
+    #[inline]
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
 
     /// Return whether this derivation contains no nodes.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
@@ -172,10 +223,12 @@ impl<'a> Derivation<'a> {
 #[derive(Clone, Copy)]
 struct ExpectedNode {
     state: StateId,
-    parent: Option<usize>,
-    child_position: Option<usize>,
-    choice: usize,
+    parent: u32,
+    child_position: u32,
+    choice: u32,
 }
+
+const NO_INDEX: u32 = u32::MAX;
 
 /// Lending iterator over every derivation of a finite explicit language.
 ///
@@ -185,8 +238,9 @@ struct ExpectedNode {
 pub struct FiniteLanguageIterator<'a> {
     plan: &'a FiniteLanguagePlan,
     accepting_position: usize,
-    nodes: Vec<DerivationNode>,
-    alternatives: Vec<usize>,
+    nodes: Vec<DerivationNode<'a>>,
+    alternatives: Vec<u32>,
+    pending: Vec<ExpectedNode>,
     current: bool,
     exhausted: bool,
     changed_from: Option<usize>,
@@ -199,6 +253,7 @@ impl<'a> FiniteLanguageIterator<'a> {
             accepting_position: 0,
             nodes: Vec::new(),
             alternatives: Vec::new(),
+            pending: Vec::new(),
             current: false,
             exhausted: false,
             changed_from: None,
@@ -209,6 +264,7 @@ impl<'a> FiniteLanguageIterator<'a> {
     ///
     /// Returns `false` permanently after exhaustion. A successful call makes a
     /// complete borrowed derivation available through [`Self::current`].
+    #[inline]
     pub fn advance(&mut self) -> bool {
         if self.exhausted {
             return false;
@@ -218,17 +274,18 @@ impl<'a> FiniteLanguageIterator<'a> {
         }
 
         if let Some(changed) = self.alternatives.pop() {
+            let changed = changed as usize;
             let next_choice = self.nodes[changed].choice + 1;
             self.rebuild_suffix(changed, next_choice);
             self.changed_from = Some(changed);
             return true;
         }
 
-        self.accepting_position += 1;
         self.start_accepting_state()
     }
 
     /// Return the current derivation, or `None` before advancement and after exhaustion.
+    #[inline]
     pub fn current(&self) -> Option<Derivation<'_>> {
         self.current.then_some(Derivation { nodes: &self.nodes })
     }
@@ -238,6 +295,7 @@ impl<'a> FiniteLanguageIterator<'a> {
     /// The first derivation and every change of accepting root state return
     /// `Some(0)`. Everything before the returned position is identical to the
     /// preceding derivation. Returns `None` when there is no current derivation.
+    #[inline]
     pub fn changed_from(&self) -> Option<usize> {
         self.changed_from
     }
@@ -251,79 +309,78 @@ impl<'a> FiniteLanguageIterator<'a> {
             self.changed_from = None;
             return false;
         };
+        self.accepting_position += 1;
         self.nodes.clear();
         self.alternatives.clear();
-        self.expand(vec![ExpectedNode {
+        self.pending.clear();
+        self.pending.push(ExpectedNode {
             state,
-            parent: None,
-            child_position: None,
+            parent: NO_INDEX,
+            child_position: NO_INDEX,
             choice: 0,
-        }]);
+        });
+        self.expand();
         self.current = true;
         self.changed_from = Some(0);
         true
     }
 
-    fn rebuild_suffix(&mut self, changed: usize, next_choice: usize) {
+    fn rebuild_suffix(&mut self, changed: usize, next_choice: u32) {
         let changed_node = &self.nodes[changed];
-        let mut continuations = Vec::new();
+        let changed_state = changed_node.state;
+        let changed_parent = changed_node.parent;
+        let changed_child_position = changed_node.child_position;
+        self.pending.clear();
         let mut cursor = changed;
-        while let Some(parent_index) = self.nodes[cursor].parent {
-            let child_position = self.nodes[cursor]
-                .child_position
-                .expect("non-root node must have a child position");
+        while self.nodes[cursor].parent != NO_INDEX {
+            let child_position = self.nodes[cursor].child_position as usize;
+            let parent_index = self.nodes[cursor].parent as usize;
             let parent = &self.nodes[parent_index];
-            let parent_rule_index = self.plan.rules_by_state[parent.state.index()][parent.choice];
-            let parent_rule = &self.plan.rules[parent_rule_index];
+            let parent_rule = parent.rule;
             for position in child_position + 1..parent_rule.children.len() {
-                continuations.push(ExpectedNode {
+                self.pending.push(ExpectedNode {
                     state: parent_rule.children[position],
-                    parent: Some(parent_index),
-                    child_position: Some(position),
+                    parent: parent_index as u32,
+                    child_position: u32::try_from(position).expect("rule arity fits in u32"),
                     choice: 0,
                 });
             }
             cursor = parent_index;
         }
 
-        let changed_expected = ExpectedNode {
-            state: changed_node.state,
-            parent: changed_node.parent,
-            child_position: changed_node.child_position,
-            choice: next_choice,
-        };
         self.nodes.truncate(changed);
-        self.alternatives.retain(|&index| index < changed);
-
-        let mut pending = continuations.into_iter().rev().collect::<Vec<_>>();
-        pending.push(changed_expected);
-        self.expand(pending);
+        self.pending.reverse();
+        self.pending.push(ExpectedNode {
+            state: changed_state,
+            parent: changed_parent,
+            child_position: changed_child_position,
+            choice: next_choice,
+        });
+        self.expand();
     }
 
-    fn expand(&mut self, mut pending: Vec<ExpectedNode>) {
-        while let Some(expected) = pending.pop() {
+    fn expand(&mut self) {
+        while let Some(expected) = self.pending.pop() {
             let node_index = self.nodes.len();
             let rule_options = &self.plan.rules_by_state[expected.state.index()];
-            let plan_rule_index = rule_options[expected.choice];
-            let rule = &self.plan.rules[plan_rule_index];
+            let rule = &self.plan.rules[rule_options[expected.choice as usize]];
             self.nodes.push(DerivationNode {
+                rule,
                 state: expected.state,
-                rule_index: rule.original_index,
-                symbol: rule.symbol,
-                weight: rule.weight,
                 parent: expected.parent,
                 child_position: expected.child_position,
-                arity: rule.children.len(),
                 choice: expected.choice,
             });
-            if expected.choice + 1 < rule_options.len() {
-                self.alternatives.push(node_index);
+            if expected.choice as usize + 1 < rule_options.len() {
+                self.alternatives
+                    .push(u32::try_from(node_index).expect("a derivation fits in u32"));
             }
+            let parent = u32::try_from(node_index).expect("a derivation fits in u32");
             for (position, &child) in rule.children.iter().enumerate().rev() {
-                pending.push(ExpectedNode {
+                self.pending.push(ExpectedNode {
                     state: child,
-                    parent: Some(node_index),
-                    child_position: Some(position),
+                    parent,
+                    child_position: u32::try_from(position).expect("rule arity fits in u32"),
                     choice: 0,
                 });
             }
@@ -422,6 +479,30 @@ mod tests {
             automaton.language_cardinality_as::<BigUint>(),
             LanguageCardinality::Finite(BigUint::from(4u8))
         );
+    }
+
+    #[test]
+    fn reuses_pending_storage_across_derivations() {
+        let mut builder = ExplicitBuilder::new();
+        let leaf = builder.new_state();
+        let root = builder.new_state();
+        builder.add_rule(Symbol(0), vec![], leaf);
+        builder.add_rule(Symbol(1), vec![], leaf);
+        builder.add_rule(Symbol(2), vec![leaf, leaf], root);
+        builder.add_accepting(root);
+        let automaton = builder.build();
+        let plan = FiniteLanguagePlan::new(&automaton).unwrap();
+        let mut iterator = plan.iter();
+
+        assert!(iterator.advance());
+        let capacity = iterator.pending.capacity();
+        let allocation = iterator.pending.as_ptr();
+        assert!(capacity > 0);
+
+        while iterator.advance() {
+            assert_eq!(iterator.pending.capacity(), capacity);
+            assert_eq!(iterator.pending.as_ptr(), allocation);
+        }
     }
 
     #[test]
@@ -653,6 +734,11 @@ mod tests {
                 other => panic!("generated DAG must be finite, got {other:?}"),
             };
             let plan = FiniteLanguagePlan::new(&original).unwrap();
+            assert_eq!(
+                plan.language_cardinality_as::<BigUint>(),
+                LanguageCardinality::Finite(expected.clone()),
+                "seed {seed}"
+            );
             let mut iterator = plan.iter();
             let mut count = BigUint::from(0u8);
             while iterator.advance() {
