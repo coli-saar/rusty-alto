@@ -130,10 +130,10 @@ pub use application::{
 };
 pub use astar::{
     AstarOptions, AstarStats, PreparedAstarGrammar, astar_one_best, astar_one_best_with,
-    astar_one_best_with_stats, astar_string_one_best_lazy_benchmark_with_stats_prepared,
-    astar_string_one_best_with_stats_prepared, materialize_astar_intersection,
-    materialize_astar_intersection_with, materialize_astar_string_intersection_with_prepared,
-    materialize_astar_viterbi_forest, materialize_astar_viterbi_forest_with,
+    astar_one_best_with_stats, astar_string_one_best_with_stats_prepared,
+    materialize_astar_intersection, materialize_astar_intersection_with,
+    materialize_astar_string_intersection_with_prepared, materialize_astar_viterbi_forest,
+    materialize_astar_viterbi_forest_with,
 };
 pub use codec::{
     AltoTreeAutomatonInputCodec, CodecMetadata, DisplayCodec, FeatureStructureVisualizationCodec,
@@ -146,7 +146,8 @@ pub use combinators::{Determinized, InvHom, Mapped, Product};
 pub use control::ParseControl;
 pub use corpus::{Corpus, CorpusError, CorpusWriter, Instance, read_corpus};
 pub use explicit::{
-    Explicit, ExplicitBuildError, ExplicitBuilder, Rule, StateMapping, TrimmedExplicit,
+    Explicit, ExplicitBuildError, ExplicitBuilder, ProbabilityWeightError, Rule, StateMapping,
+    TrimmedExplicit,
 };
 pub use finite_language::{
     Derivation, DerivationNode, FiniteLanguageError, FiniteLanguageIterator, FiniteLanguagePlan,

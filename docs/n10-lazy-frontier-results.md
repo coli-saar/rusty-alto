@@ -19,7 +19,7 @@ regresses long sentences.
 ## What was built
 
 A lazy candidate-generation frontier for the deterministic binary string-span A*
-path (`src/astar/lazy_span.rs` + `run_with_lazy_span_frontier` and helpers in
+path (`src/astar/experimental/mod.rs` + `run_with_lazy_span_frontier` and helpers in
 `src/astar.rs`). Design notes in `astar-performance-next-phase.md` (N10) and the
 plan file. Key points:
 

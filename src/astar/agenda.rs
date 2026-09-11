@@ -111,6 +111,7 @@ impl AstarAgenda {
         Some(best)
     }
 
+    #[cfg(feature = "experimental-lazy-astar")]
     pub(super) fn peek_merit(&self) -> Option<f64> {
         self.heap.first().map(|(_, merit)| *merit)
     }

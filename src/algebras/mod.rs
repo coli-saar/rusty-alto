@@ -11,13 +11,16 @@ use crate::{BottomUpTa, DetBottomUpTa, Signature, Symbol, VisualRepresentation};
 use packed_term_arena::tree::{Tree, TreeArena};
 use std::hash::Hash;
 
+#[cfg(feature = "experimental-lazy-astar")]
+pub(crate) use string::SpanProductSibling;
+pub(crate) use string::SpanProductSiblingFinder;
 pub use string::{
     SentenceSxHeuristic, Span, StringAlgebra, StringDecompositionAutomaton, UniversalSxHeuristic,
 };
-pub(crate) use string::{SpanProductSibling, SpanProductSiblingFinder};
+#[cfg(feature = "experimental-lazy-astar")]
+pub(crate) use string_astar::SpanBinarySiblingGroup;
 pub(crate) use string_astar::{
-    SpanAstarLeftIndex, SpanBinarySiblingGroup, SpanInterner, StringAstarSource,
-    string_fallback_rules,
+    SpanAstarLeftIndex, SpanInterner, StringAstarSource, string_fallback_rules,
 };
 pub use tag_string::{
     CONC11, CONC12, CONC21, TAG_E, TAG_EE, TagSpan, TagStringAlgebra,

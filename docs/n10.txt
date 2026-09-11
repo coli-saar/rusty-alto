@@ -52,7 +52,7 @@ N10: Lazy candidate generation (span/binary fast path)
  the existing pop-side reopen guard (src/astar.rs:1023) for the known 1-ULP
  float-tie re-pushes.
 
- Data structures (new: src/astar/lazy_span.rs)
+ Data structures (new: src/astar/experimental/mod.rs)
 
  /// One combination site: the earlier-finalized trigger product, the child slot
  /// it fills, and the rule group that fixes symbol + sibling-left requirement.
@@ -123,7 +123,7 @@ N10: Lazy candidate generation (span/binary fast path)
 
  Verification
 
- - Unit (src/astar/lazy_span.rs tests): small hand-built grammars; assert the
+ - Unit (src/astar/experimental/mod.rs tests): small hand-built grammars; assert the
  multiset of realized (parent, edge) and final best_inside equal the eager
  path; cover s(X,X), ties, and a non-goal-reaching beam.
  - Exactness gate (the bar from the doc): run src/bin/astar-join-replay.rs

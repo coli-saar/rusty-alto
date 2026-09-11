@@ -2,7 +2,7 @@
 
 ## Summary
 
-Make A* general for arbitrary condensed automata and rule arities while preserving an optimized binary-string candidate source. Optimize the eager path first, retain `lazy_span.rs` as an unwired experiment, then benchmark it against the improved eager implementation.
+Make A* general for arbitrary condensed automata and rule arities while preserving an optimized binary-string candidate source. Optimize the eager path first, retain `astar/experimental` behind the `experimental-lazy-astar` feature as an unwired experiment, then benchmark it against the improved eager implementation.
 
 ## P0 — Correctness and Baseline
 
@@ -47,7 +47,7 @@ Make A* general for arbitrary condensed automata and rule arities while preservi
   - String-specific candidate source.
 
 - Remove `RUSTY_ALTO_LAZY_FRONTIER` and automatic production selection.
-- Keep `lazy_span.rs`, focused equivalence tests, and an explicit benchmark-only entry point.
+- Keep `astar/experimental`, focused equivalence tests, and an explicit benchmark-only entry point.
 - Adapt the lazy frontier to the new candidate-source and compact-storage interfaces without duplicating the general search core.
 - After P1–P3 stabilize, benchmark eager and lazy with identical scoring, candidate generation, agenda, and product storage.
 - Enable lazy in production only if it demonstrates a reproducible time or memory advantage. Otherwise preserve it as an unwired research prototype.
@@ -93,4 +93,4 @@ For lazy-frontier evaluation, compare eager and lazy at limits 20, 100, and full
 - Binary string parsing is the principal optimized workload, not a correctness assumption.
 - String yield templates remain private to the string specialization.
 - Arbitrary algebras require only `CondensedTa`.
-- `lazy_span.rs` remains available for controlled experimentation.
+- `astar/experimental` remains available for controlled experimentation via the `experimental-lazy-astar` feature.

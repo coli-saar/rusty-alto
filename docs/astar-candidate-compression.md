@@ -109,7 +109,7 @@ must come from **not being exhaustive**:
   finalize ≈ the whole reachable chart, SX/F is loose and this is the dominant lever.
 - **(b) Generate edges lazily in merit order with a goal-bound cutoff** — so the `Θ(n)`
   dominated edges per cell (M2) and *all* edges of cells that never beat the goal are never
-  built. The existing lazy frontier (`astar/lazy_span.rs`, `RUSTY_ALTO_LAZY_FRONTIER`) was
+  built. The existing lazy frontier (`astar/experimental/mod.rs`, `RUSTY_ALTO_LAZY_FRONTIER`) was
   break-even because it **pre-scores every sibling** (an `O(s)` scan per generator) and has no F
   and no goal cutoff. Fixing those is the candidate lever.
 
@@ -149,7 +149,7 @@ must come from **not being exhaustive**:
 - `src/astar.rs` — `expand_from_finalized_with_span_product_siblings` (:903), the dominance
   gate `push_candidate_with_child_score` (:705), the run loop (:1252), the lazy frontier
   driver; audit counters would live in `AstarStats` + the `ptb-eval` summary line.
-- `src/astar/span.rs`, `src/astar/lazy_span.rs`, `src/algebras/string.rs` (sibling finder).
+- `src/astar/span.rs`, `src/astar/experimental/mod.rs`, `src/algebras/string.rs` (sibling finder).
 - `src/heuristic.rs`, `src/obligatory_leaf.rs` (ĥ / F).
 
 ## Verification (for any fix)

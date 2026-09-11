@@ -50,6 +50,7 @@ lalrpop = "0.23"
 default = []
 stats = []
 viterbi-benchmark = []
+experimental-lazy-astar = []
 
 [[bin]]
 name = "ptb-eval"

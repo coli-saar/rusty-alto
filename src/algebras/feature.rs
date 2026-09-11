@@ -12,6 +12,7 @@ use crate::{
     BottomUpTa, FeatureStructureVisualizationCodec, FxHashMap, OutputCodec, Signature, Symbol,
     VisualRepresentation,
 };
+use packed_term_arena::tree::{Tree, TreeArena};
 use std::{
     collections::{BTreeMap, HashMap},
     fmt,
@@ -366,6 +367,36 @@ impl Graph {
         }
     }
 
+    fn project(&mut self, root: usize, attribute: &str) -> Option<usize> {
+        let root = self.find(root);
+        let WorkNode::Map(attributes) = &self.nodes[root] else {
+            return None;
+        };
+        let child = *attributes.get(attribute)?;
+        Some(self.find(child))
+    }
+
+    fn embed(&mut self, root: usize, attribute: &str) -> usize {
+        let mut attributes = BTreeMap::new();
+        attributes.insert(attribute.to_owned(), root);
+        self.add(WorkNode::Map(attributes))
+    }
+
+    fn remap(&mut self, root: usize, mappings: &[(String, String)]) -> Option<usize> {
+        let root = self.find(root);
+        let WorkNode::Map(source_attributes) = &self.nodes[root] else {
+            return None;
+        };
+        let mut attributes = BTreeMap::new();
+        for (source, target) in mappings {
+            let child = *source_attributes.get(source)?;
+            if attributes.insert(target.clone(), child).is_some() {
+                return None;
+            }
+        }
+        Some(self.add(WorkNode::Map(attributes)))
+    }
+
     fn freeze(mut self, root: usize) -> FeatureStructure {
         fn copy(
             graph: &mut Graph,
@@ -458,6 +489,48 @@ impl FeatureStructureAlgebra {
     pub fn filter(&self) -> FeatureStructureFilter<'_> {
         FeatureStructureFilter { algebra: self }
     }
+
+    fn evaluate_term_in_graph(
+        &self,
+        arena: &TreeArena<Symbol>,
+        node: Tree,
+        graph: &mut Graph,
+    ) -> Option<usize> {
+        let children = arena.get_children(node);
+        match self.operations.get(arena.get_label(node))? {
+            Operation::Unify => {
+                let &[left, right] = children else {
+                    return None;
+                };
+                let left = self.evaluate_term_in_graph(arena, left, graph)?;
+                let right = self.evaluate_term_in_graph(arena, right, graph)?;
+                graph.unify(left, right)
+            }
+            Operation::Project(attribute) => {
+                let &[child] = children else {
+                    return None;
+                };
+                let child = self.evaluate_term_in_graph(arena, child, graph)?;
+                graph.project(child, attribute)
+            }
+            Operation::Embed(attribute) => {
+                let &[child] = children else {
+                    return None;
+                };
+                let child = self.evaluate_term_in_graph(arena, child, graph)?;
+                Some(graph.embed(child, attribute))
+            }
+            Operation::Remap(mappings) => {
+                let &[child] = children else {
+                    return None;
+                };
+                let child = self.evaluate_term_in_graph(arena, child, graph)?;
+                graph.remap(child, mappings)
+            }
+            Operation::Literal(value) if children.is_empty() => Some(graph.append(value)),
+            Operation::Literal(_) | Operation::InvalidLiteral => None,
+        }
+    }
 }
 
 impl Algebra for FeatureStructureAlgebra {
@@ -489,6 +562,22 @@ impl Algebra for FeatureStructureAlgebra {
             (Operation::InvalidLiteral, _) => None,
             _ => None,
         }
+    }
+
+    fn evaluate_term_internal(
+        &self,
+        arena: &TreeArena<Symbol>,
+        root: Tree,
+    ) -> Option<Self::InternalValue> {
+        let mut graph = Graph::default();
+        let root = self.evaluate_term_in_graph(arena, root, &mut graph)?;
+        Some(graph.freeze(root))
+    }
+
+    fn evaluate_term(&self, arena: &TreeArena<Symbol>, root: Tree) -> Option<Self::Value> {
+        // Internal and public feature structures have the same owned representation, so the
+        // freshly frozen result can be returned directly rather than cloned by the default.
+        self.evaluate_term_internal(arena, root)
     }
 
     fn parse_object(&mut self, input: &str) -> Result<Self::InternalValue, Self::ParseError> {
@@ -771,5 +860,65 @@ mod tests {
             value.node(nested[0].value),
             Some(FeatureStructureNode::Atom("nom"))
         );
+    }
+
+    #[test]
+    fn workspace_term_evaluation_matches_nondestructive_operations() {
+        fn reference(
+            algebra: &FeatureStructureAlgebra,
+            arena: &TreeArena<Symbol>,
+            node: Tree,
+        ) -> Option<FeatureStructure> {
+            let children = arena
+                .get_children(node)
+                .iter()
+                .map(|&child| reference(algebra, arena, child))
+                .collect::<Option<Vec<_>>>()?;
+            algebra.evaluate(*arena.get_label(node), &children)
+        }
+
+        let mut signature = Signature::new();
+        let source = signature
+            .intern("[left: #x, right: #x]".to_owned(), 0)
+            .unwrap();
+        let remap = signature
+            .intern("remap_left=first,right=second".to_owned(), 1)
+            .unwrap();
+        let project = signature.intern("proj_first".to_owned(), 1).unwrap();
+        let embed = signature.intern("emb_target".to_owned(), 1).unwrap();
+        let constraint = signature.intern("[target: nom]".to_owned(), 0).unwrap();
+        let unify = signature.intern(FS_UNIFY.to_owned(), 2).unwrap();
+        let algebra = FeatureStructureAlgebra::with_signature(signature);
+
+        let mut arena = TreeArena::new();
+        let source = arena.add_leaf(source);
+        let remapped = arena.add_node(remap, vec![source]);
+        let projected = arena.add_node(project, vec![remapped]);
+        let embedded = arena.add_node(embed, vec![projected]);
+        let constraint = arena.add_leaf(constraint);
+        let root = arena.add_node(unify, vec![embedded, constraint]);
+
+        assert_eq!(
+            algebra.evaluate_term_internal(&arena, root),
+            reference(&algebra, &arena, root)
+        );
+        assert_eq!(
+            algebra.evaluate_term_internal(&arena, root).unwrap(),
+            FeatureStructure::parse("[target: nom]").unwrap()
+        );
+    }
+
+    #[test]
+    fn workspace_term_evaluation_rejects_clashes() {
+        let mut signature = Signature::new();
+        let nom = signature.intern("[case: nom]".to_owned(), 0).unwrap();
+        let acc = signature.intern("[case: acc]".to_owned(), 0).unwrap();
+        let unify = signature.intern(FS_UNIFY.to_owned(), 2).unwrap();
+        let algebra = FeatureStructureAlgebra::with_signature(signature);
+        let mut arena = TreeArena::new();
+        let nom = arena.add_leaf(nom);
+        let acc = arena.add_leaf(acc);
+        let root = arena.add_node(unify, vec![nom, acc]);
+        assert!(algebra.evaluate_term_internal(&arena, root).is_none());
     }
 }

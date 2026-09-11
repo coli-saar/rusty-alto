@@ -6,12 +6,12 @@
 
 mod state_stream_table;
 
-use crate::{Explicit, StateId, Symbol, TopDownTa, explicit::RuleId};
+use crate::{Explicit, ProbabilityWeightError, StateId, Symbol, TopDownTa, explicit::RuleId};
 use fixedbitset::FixedBitSet;
 use packed_term_arena::tree::{Tree, TreeArena};
 use smallvec::SmallVec;
 use state_stream_table::StateStreamTable;
-use std::{cmp::Ordering, collections::BinaryHeap};
+use std::{cmp::Ordering, collections::BinaryHeap, num::NonZeroUsize};
 
 /// A weighted tree produced by [`SortedLanguageIterator`].
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -53,19 +53,38 @@ pub struct SortedLanguageIterator<'a> {
 
 impl Explicit {
     /// Iterate over accepted trees in descending weight order.
+    ///
+    /// Panics if any rule weight is not finite or lies outside `[0, 1]`. Use
+    /// [`Self::try_sorted_language`] to handle that validation error.
     pub fn sorted_language(&self) -> SortedLanguageIterator<'_> {
         SortedLanguageIterator::new(self)
+    }
+
+    /// Try to iterate over accepted trees in descending weight order.
+    pub fn try_sorted_language(
+        &self,
+    ) -> Result<SortedLanguageIterator<'_>, ProbabilityWeightError> {
+        SortedLanguageIterator::try_new(self)
     }
 }
 
 impl<'a> SortedLanguageIterator<'a> {
     /// Construct an iterator without initializing streams for untouched states.
+    ///
+    /// Panics if any rule weight is not finite or lies outside `[0, 1]`. Use
+    /// [`Self::try_new`] to handle that validation error.
     pub fn new(automaton: &'a Explicit) -> Self {
+        Self::try_new(automaton).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Try to construct an iterator after validating its weight contract.
+    pub fn try_new(automaton: &'a Explicit) -> Result<Self, ProbabilityWeightError> {
+        automaton.validate_probability_weights()?;
         let mut accepting = Vec::new();
         automaton.initial_states(&mut |state| accepting.push(state));
         let productive = automaton.reachable_states_ref();
 
-        Self {
+        Ok(Self {
             automaton,
             productive,
             accepting,
@@ -76,7 +95,7 @@ impl<'a> SortedLanguageIterator<'a> {
             arena: TreeArena::new(),
             visiting: FixedBitSet::with_capacity(automaton.num_states() as usize),
             next_seq: 0,
-        }
+        })
     }
 
     /// Return the arena containing trees returned so far.
@@ -138,22 +157,13 @@ impl<'a> SortedLanguageIterator<'a> {
                 .take_unstarted(rules.len());
             if range.len() == 1 {
                 let rule = rules[range.start];
-                let candidate = ScoredCandidate {
-                    rule,
-                    base_rank: 0,
-                    dimension: ZERO_DIMENSION,
-                    weight: self.automaton.rule_by_id(rule).weight,
-                };
+                let candidate =
+                    ScoredCandidate::initial(rule, self.automaton.rule_by_id(rule).weight);
                 return Some(self.finalize_candidate(state, candidate));
             }
             let ready = rules[range]
                 .iter()
-                .map(|&rule| ScoredCandidate {
-                    rule,
-                    base_rank: 0,
-                    dimension: ZERO_DIMENSION,
-                    weight: self.automaton.rule_by_id(rule).weight,
-                })
+                .map(|&rule| ScoredCandidate::initial(rule, self.automaton.rule_by_id(rule).weight))
                 .collect();
             self.extend_agenda(state, ready);
         }
@@ -307,12 +317,7 @@ impl<'a> SortedLanguageIterator<'a> {
                         weight
                     }
                 };
-                CandidateOutcome::Ready(ScoredCandidate {
-                    rule: candidate.rule,
-                    base_rank: 0,
-                    dimension: ZERO_DIMENSION,
-                    weight,
-                })
+                CandidateOutcome::Ready(ScoredCandidate::initial(candidate.rule, weight))
             }
             CandidateRanks::Bump {
                 base_rank,
@@ -325,12 +330,12 @@ impl<'a> SortedLanguageIterator<'a> {
                 let child = self.automaton.rule_by_id(candidate.rule).children[*dimension];
                 match self.ensure_item_recursive(child, next_rank) {
                     EnsureOutcome::Available(child_weight) => {
-                        CandidateOutcome::Ready(ScoredCandidate {
-                            rule: candidate.rule,
-                            base_rank: *base_rank,
-                            dimension: *dimension,
-                            weight: self.bump_weight(child_weight, *left_factor, *right_factor),
-                        })
+                        CandidateOutcome::Ready(ScoredCandidate::bumped(
+                            candidate.rule,
+                            *base_rank,
+                            *dimension,
+                            self.bump_weight(child_weight, *left_factor, *right_factor),
+                        ))
                     }
                     EnsureOutcome::Exhausted => CandidateOutcome::Dead,
                     EnsureOutcome::Blocked => CandidateOutcome::Blocked(candidate),
@@ -342,12 +347,12 @@ impl<'a> SortedLanguageIterator<'a> {
     fn finalize_candidate(&mut self, state: StateId, candidate: ScoredCandidate) -> f64 {
         let weight = candidate.weight;
         let arity = self.automaton.rule_by_id(candidate.rule).children.len();
-        let ranks = if candidate.dimension == ZERO_DIMENSION {
-            SmallVec::from_elem(0, arity)
-        } else {
+        let ranks = if let Some(dimension) = candidate.bumped_dimension() {
             let mut ranks = self.copy_child_ranks(state, candidate.base_rank, arity);
-            ranks[candidate.dimension] += 1;
+            ranks[dimension] += 1;
             ranks
+        } else {
+            SmallVec::from_elem(0, arity)
         };
         let child_ranks = match ranks.as_slice() {
             [] => ChildRanks::Zero,
@@ -810,11 +815,40 @@ struct TupleCandidate {
 struct ScoredCandidate {
     rule: RuleId,
     base_rank: usize,
-    dimension: usize,
+    /// One-based so `None` can represent an initial, all-zero rank tuple.
+    bumped_dimension: Option<NonZeroUsize>,
     weight: f64,
 }
 
-const ZERO_DIMENSION: usize = usize::MAX;
+impl ScoredCandidate {
+    fn initial(rule: RuleId, weight: f64) -> Self {
+        Self {
+            rule,
+            base_rank: 0,
+            bumped_dimension: None,
+            weight,
+        }
+    }
+
+    fn bumped(rule: RuleId, base_rank: usize, dimension: usize, weight: f64) -> Self {
+        let one_based = dimension
+            .checked_add(1)
+            .expect("candidate dimension must be representable");
+        Self {
+            rule,
+            base_rank,
+            bumped_dimension: Some(
+                NonZeroUsize::new(one_based).expect("one-based dimension must be nonzero"),
+            ),
+            weight,
+        }
+    }
+
+    #[inline]
+    fn bumped_dimension(&self) -> Option<usize> {
+        self.bumped_dimension.map(|dimension| dimension.get() - 1)
+    }
+}
 
 #[derive(Clone, Debug)]
 enum CandidateRanks {
@@ -853,30 +887,6 @@ struct CandidateHeapItem {
     seq: usize,
 }
 
-impl PartialEq for CandidateHeapItem {
-    fn eq(&self, other: &Self) -> bool {
-        self.candidate.weight.total_cmp(&other.candidate.weight) == Ordering::Equal
-            && self.seq == other.seq
-    }
-}
-
-impl Eq for CandidateHeapItem {}
-
-impl PartialOrd for CandidateHeapItem {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for CandidateHeapItem {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.candidate
-            .weight
-            .total_cmp(&other.candidate.weight)
-            .then_with(|| other.seq.cmp(&self.seq))
-    }
-}
-
 #[derive(Clone, Debug)]
 struct RootHeapItem {
     state: StateId,
@@ -885,32 +895,76 @@ struct RootHeapItem {
     seq: usize,
 }
 
-impl PartialEq for RootHeapItem {
-    fn eq(&self, other: &Self) -> bool {
-        self.weight.total_cmp(&other.weight) == Ordering::Equal && self.seq == other.seq
-    }
+macro_rules! impl_stable_max_heap_order {
+    ($item:ty, $weight:expr) => {
+        impl PartialEq for $item {
+            fn eq(&self, other: &Self) -> bool {
+                $weight(self).total_cmp(&$weight(other)) == Ordering::Equal && self.seq == other.seq
+            }
+        }
+
+        impl Eq for $item {}
+
+        impl PartialOrd for $item {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+
+        impl Ord for $item {
+            fn cmp(&self, other: &Self) -> Ordering {
+                $weight(self)
+                    .total_cmp(&$weight(other))
+                    .then_with(|| other.seq.cmp(&self.seq))
+            }
+        }
+    };
 }
 
-impl Eq for RootHeapItem {}
-
-impl PartialOrd for RootHeapItem {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for RootHeapItem {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.weight
-            .total_cmp(&other.weight)
-            .then_with(|| other.seq.cmp(&self.seq))
-    }
-}
+impl_stable_max_heap_order!(CandidateHeapItem, |item: &CandidateHeapItem| item
+    .candidate
+    .weight);
+impl_stable_max_heap_order!(RootHeapItem, |item: &RootHeapItem| item.weight);
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ExplicitBuilder;
+    use crate::{ExplicitBuilder, FiniteLanguagePlan};
+
+    type TreeKey = Vec<(u32, usize)>;
+
+    fn tree_key(arena: &TreeArena<Symbol>, root: Tree, output: &mut TreeKey) {
+        let children = arena.get_children(root);
+        output.push((arena.get_label(root).0, children.len()));
+        for &child in children {
+            tree_key(arena, child, output);
+        }
+    }
+
+    fn finite_oracle(automaton: &Explicit) -> Vec<(TreeKey, f64)> {
+        let plan = FiniteLanguagePlan::new(automaton).unwrap();
+        let mut iterator = plan.iter();
+        let mut output = Vec::new();
+        while iterator.advance() {
+            let nodes = iterator.current().unwrap().nodes();
+            output.push((
+                nodes
+                    .iter()
+                    .map(|node| (node.symbol().0, node.arity()))
+                    .collect(),
+                nodes.iter().map(|node| node.weight()).product(),
+            ));
+        }
+        output
+    }
+
+    fn sort_derivations(derivations: &mut [(TreeKey, f64)]) {
+        derivations.sort_by(|(left_tree, left_weight), (right_tree, right_weight)| {
+            left_tree
+                .cmp(right_tree)
+                .then_with(|| left_weight.total_cmp(right_weight))
+        });
+    }
 
     fn assert_weight_sequences_close(actual: &[f64], expected: &[f64]) {
         assert_eq!(actual.len(), expected.len());
@@ -996,5 +1050,89 @@ mod tests {
         assert_eq!(weights.len(), 40);
         assert!((weights[0] - 0.7).abs() < 1e-14);
         assert!(weights[1..].iter().all(|weight| *weight == 0.0));
+    }
+
+    #[test]
+    fn checked_constructor_rejects_non_probability_weights() {
+        for invalid in [-0.1, 1.1, f64::INFINITY, f64::NAN] {
+            let mut builder = ExplicitBuilder::new();
+            let state = builder.new_state();
+            builder.add_weighted_rule(Symbol(0), vec![], state, invalid);
+            builder.add_accepting(state);
+            let automaton = builder.build();
+
+            let error = automaton.try_sorted_language().err().unwrap();
+            assert_eq!(error.rule_index, 0);
+            assert!(error.weight.to_bits() == invalid.to_bits());
+        }
+    }
+
+    #[test]
+    fn checked_constructor_accepts_probability_boundaries() {
+        let mut builder = ExplicitBuilder::new();
+        let state = builder.new_state();
+        builder.add_weighted_rule(Symbol(0), vec![], state, 0.0);
+        builder.add_weighted_rule(Symbol(1), vec![], state, 1.0);
+        builder.add_accepting(state);
+        let automaton = builder.build();
+
+        assert!(automaton.try_sorted_language().is_ok());
+    }
+
+    #[test]
+    fn generated_finite_dags_match_independent_unsorted_oracle() {
+        const WEIGHTS: [f64; 6] = [0.0, 0.125, 0.25, 0.5, 0.75, 1.0];
+        for seed in 0u32..128 {
+            let weight = |salt: usize| WEIGHTS[((seed as usize).wrapping_mul(5) + salt) % 6];
+            let mut builder = ExplicitBuilder::new();
+            let q0 = builder.new_state();
+            let q1 = builder.new_state();
+            let q2 = builder.new_state();
+            let q3 = builder.new_state();
+            let irrelevant = builder.new_state();
+
+            builder.add_weighted_rule(Symbol(0), vec![], q0, weight(0));
+            if seed & 1 != 0 {
+                builder.add_weighted_rule(Symbol(1), vec![], q0, weight(1));
+            }
+            builder.add_weighted_rule(Symbol(2), vec![], q1, weight(2));
+            if seed & 2 != 0 {
+                builder.add_weighted_rule(Symbol(3), vec![q0, q0], q1, weight(3));
+            }
+            builder.add_weighted_rule(Symbol(4), vec![q0], q2, weight(4));
+            if seed & 4 != 0 {
+                builder.add_weighted_rule(Symbol(5), vec![q0, q1], q2, weight(5));
+            }
+            builder.add_weighted_rule(Symbol(6), vec![q1, q2], q3, weight(6));
+            if seed & 8 != 0 {
+                builder.add_weighted_rule(Symbol(7), vec![], q3, weight(7));
+            }
+            builder.add_weighted_rule(Symbol(8), vec![], irrelevant, weight(8));
+            builder.add_weighted_rule(Symbol(9), vec![irrelevant], irrelevant, weight(9));
+            builder.add_accepting(q2);
+            if seed & 16 != 0 {
+                builder.add_accepting(q3);
+            }
+            let automaton = builder.build();
+
+            let mut expected = finite_oracle(&automaton);
+            let mut iterator = automaton.sorted_language();
+            let mut actual = Vec::new();
+            let mut emitted_weights = Vec::new();
+            while let Some(weighted) = iterator.next() {
+                let mut key = Vec::new();
+                tree_key(iterator.arena(), weighted.tree(), &mut key);
+                emitted_weights.push(weighted.weight());
+                actual.push((key, weighted.weight()));
+            }
+            assert!(
+                emitted_weights.windows(2).all(|pair| pair[0] >= pair[1]),
+                "seed {seed}"
+            );
+
+            sort_derivations(&mut expected);
+            sort_derivations(&mut actual);
+            assert_eq!(actual, expected, "seed {seed}");
+        }
     }
 }

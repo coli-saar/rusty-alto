@@ -254,7 +254,7 @@ in shrinking the `Θ(n³)` hyperedge count with a tighter heuristic.
 
 ## 9. Empirical confirmation
 
-The heap-successor variant was implemented (`src/astar/lazy_span.rs`:
+The heap-successor variant was implemented (`src/astar/experimental/mod.rs`:
 `SpanGenerator.pending: BinaryHeap<SiblingEntry>` built at spawn, popped on
 realize; `RUSTY_ALTO_LAZY_FRONTIER=1`). On PTB `sentences20` (astar-sx, one-best),
 the prediction holds exactly:

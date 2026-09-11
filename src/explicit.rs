@@ -28,6 +28,7 @@ pub struct Explicit {
     num_states: u32,
     accepting: FixedBitSet,
     rules: Vec<StoredRule>,
+    probability_weights: bool,
     bottom_up_indexes: OnceLock<BottomUpIndexes>,
     reachable_cache: OnceLock<FixedBitSet>,
     result_index: OnceLock<DenseIndex<RuleId>>,
@@ -125,6 +126,16 @@ pub enum ExplicitBuildError {
         /// Parent/result state on the duplicated transition.
         result: StateId,
     },
+}
+
+/// A rule weight that cannot be interpreted as a probability.
+#[derive(Clone, Debug, Error, PartialEq)]
+#[error("rule {rule_index} has weight {weight}; expected a finite value in [0, 1]")]
+pub struct ProbabilityWeightError {
+    /// Index of the first rule with an invalid weight.
+    pub rule_index: usize,
+    /// Invalid rule weight.
+    pub weight: f64,
 }
 
 /// Builder for [`Explicit`] automata.
@@ -476,10 +487,14 @@ impl Explicit {
             rules.len() <= u32::MAX as usize,
             "an explicit automaton cannot contain more than u32::MAX rules"
         );
+        let probability_weights = rules
+            .iter()
+            .all(|rule| rule.weight.is_finite() && (0.0..=1.0).contains(&rule.weight));
         Self {
             num_states,
             accepting,
             rules,
+            probability_weights,
             bottom_up_indexes: OnceLock::new(),
             reachable_cache: OnceLock::new(),
             result_index: OnceLock::new(),
@@ -496,6 +511,28 @@ impl Explicit {
     /// Return the number of transition rules in this automaton.
     pub fn num_rules(&self) -> usize {
         self.rules.len()
+    }
+
+    /// Check that every rule weight is a finite value in `[0, 1]`.
+    ///
+    /// Algorithms that extend a derivation by multiplying another rule weight,
+    /// such as sorted-language iteration, require this monotonicity contract.
+    /// Valid automata take constant time to check; invalid automata are scanned
+    /// once to identify the offending rule.
+    pub fn validate_probability_weights(&self) -> Result<(), ProbabilityWeightError> {
+        if self.probability_weights {
+            return Ok(());
+        }
+        let (rule_index, rule) = self
+            .rules
+            .iter()
+            .enumerate()
+            .find(|(_, rule)| !rule.weight.is_finite() || !(0.0..=1.0).contains(&rule.weight))
+            .expect("cached probability-weight validation must be consistent");
+        Err(ProbabilityWeightError {
+            rule_index,
+            weight: rule.weight,
+        })
     }
 
     /// Return true if no tree can be accepted by this automaton.
