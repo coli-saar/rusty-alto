@@ -73,6 +73,11 @@ name = "sorted_language_scaling"
 path = "benches/sorted_language/scaling.rs"
 harness = false
 
+[[bench]]
+name = "sorted_language_memory"
+path = "benches/sorted_language/memory.rs"
+harness = false
+
 [profile.release-optimized]
 inherits = "release"
 lto = "fat"

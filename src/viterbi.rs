@@ -130,8 +130,8 @@ fn visit_and_score<S: WeightScorer>(
 
         marks[state.index()] = 1;
         stack.push((state.index() << 1) | 1);
-        for &rule_idx in auto.rule_indexes_topdown(state).iter().rev() {
-            let rule = auto.rule(rule_idx);
+        for &rule_id in auto.rule_indexes_topdown(state).iter().rev() {
+            let rule = auto.rule_by_id(rule_id);
             if rule.children.contains(&state) {
                 continue;
             }
@@ -158,8 +158,8 @@ fn visit_state_fast(auto: &Explicit, start: StateId, marks: &mut [u8], order: &m
             continue;
         }
         stack.push((state, true));
-        for &rule_idx in auto.rule_indexes_topdown(state).iter().rev() {
-            let rule = auto.rule(rule_idx);
+        for &rule_id in auto.rule_indexes_topdown(state).iter().rev() {
+            let rule = auto.rule_by_id(rule_id);
             if rule.children.contains(&state) {
                 continue;
             }

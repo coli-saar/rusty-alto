@@ -30,9 +30,19 @@ pub struct Explicit {
     rules: Vec<StoredRule>,
     bottom_up_indexes: OnceLock<BottomUpIndexes>,
     reachable_cache: OnceLock<FixedBitSet>,
-    result_index: OnceLock<Vec<Vec<usize>>>,
+    result_index: OnceLock<DenseIndex<RuleId>>,
     indexes: OnceLock<Indexes>,
     condensed_cache: OnceLock<Vec<CondensedRule>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) struct RuleId(u32);
+
+impl RuleId {
+    #[inline]
+    pub(crate) fn index(self) -> usize {
+        self.0 as usize
+    }
 }
 
 #[derive(Clone, Debug, Eq)]
@@ -462,6 +472,10 @@ impl ExplicitBuilder {
 
 impl Explicit {
     fn from_parts(num_states: u32, accepting: FixedBitSet, rules: Vec<StoredRule>) -> Self {
+        assert!(
+            rules.len() <= u32::MAX as usize,
+            "an explicit automaton cannot contain more than u32::MAX rules"
+        );
         Self {
             num_states,
             accepting,
@@ -567,9 +581,10 @@ impl Explicit {
 
     /// Iterate over rules with the given parent/result state.
     pub fn rules_topdown(&self, parent: StateId) -> impl Iterator<Item = Rule<'_>> {
-        self.result_index()[parent.index()]
+        self.result_index()
+            .values(parent.index())
             .iter()
-            .map(|&rule_idx| self.rule(rule_idx))
+            .map(|&rule_id| self.rule_by_id(rule_id))
     }
 
     /// Return the transition rule at the given index.
@@ -588,25 +603,26 @@ impl Explicit {
         }
     }
 
-    pub(crate) fn rule_indexes_topdown(&self, parent: StateId) -> &[usize] {
-        &self.result_index()[parent.index()]
+    #[inline]
+    pub(crate) fn rule_by_id(&self, rule_id: RuleId) -> Rule<'_> {
+        self.rule(rule_id.index())
     }
 
-    fn result_index(&self) -> &[Vec<usize>] {
-        self.result_index.get_or_init(|| {
-            let mut counts = vec![0usize; self.num_states as usize];
-            for rule in &self.rules {
-                counts[rule.result.index()] += 1;
-            }
+    pub(crate) fn rule_indexes_topdown(&self, parent: StateId) -> &[RuleId] {
+        self.result_index().values(parent.index())
+    }
 
-            let mut by_result = counts
-                .into_iter()
-                .map(Vec::with_capacity)
-                .collect::<Vec<_>>();
-            for (rule_idx, rule) in self.rules.iter().enumerate() {
-                by_result[rule.result.index()].push(rule_idx);
-            }
-            by_result
+    fn result_index(&self) -> &DenseIndex<RuleId> {
+        self.result_index.get_or_init(|| {
+            DenseIndex::from_pairs(
+                self.num_states as usize,
+                self.rules.iter().enumerate().map(|(rule_index, rule)| {
+                    (
+                        rule.result.index(),
+                        RuleId(u32::try_from(rule_index).expect("rule-count invariant violated")),
+                    )
+                }),
+            )
         })
     }
 
@@ -775,8 +791,8 @@ impl TopDownTa for Explicit {
         let Some(rule_indexes) = self.result_index().get(parent.index()) else {
             return;
         };
-        for &rule_idx in rule_indexes {
-            let rule = &self.rules[rule_idx];
+        for &rule_id in rule_indexes {
+            let rule = &self.rules[rule_id.index()];
             out(rule.symbol, &rule.children);
         }
     }

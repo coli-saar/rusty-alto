@@ -43,6 +43,11 @@ impl<V: Copy + Default> DenseIndex<V> {
     pub(crate) fn values(&self, key: usize) -> &[V] {
         &self.values[self.offsets[key]..self.offsets[key + 1]]
     }
+
+    #[inline]
+    pub(crate) fn get(&self, key: usize) -> Option<&[V]> {
+        (key + 1 < self.offsets.len()).then(|| self.values(key))
+    }
 }
 
 #[cfg(test)]

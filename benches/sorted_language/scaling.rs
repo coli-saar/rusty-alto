@@ -1,7 +1,7 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use rusty_alto::{Explicit, ExplicitBuilder, Symbol};
+use rusty_alto::{Explicit, ExplicitBuilder, Symbol, parse_alto};
 
 const SAMPLE_TARGET: Duration = Duration::from_millis(120);
 
@@ -322,9 +322,7 @@ fn main() {
         report("accepting_all", size, size, &automaton);
     }
 
-    for depth in [
-        16, 32, 64, 128, 256, 512, 1_024, 2_048, 4_096, 8_192, 16_384, 32_768,
-    ] {
+    for depth in [16, 32, 64, 128, 256, 512, 1_024] {
         report("deep_first", depth, 1, &deep_chain(depth));
     }
 
@@ -375,5 +373,13 @@ fn main() {
     for size in [128, 256, 512, 1_024, 2_048, 4_096, 8_192] {
         report_cold("cold_wide_first", size, 1, &wide_nullary(size));
         report_cold("cold_irrelevant_first", size, 1, &mostly_irrelevant(size));
+    }
+
+    if let Ok(path) = std::env::var("RUSTY_ALTO_BENCH_AUTOMATON") {
+        let input = std::fs::read_to_string(path).expect("failed to read benchmark automaton");
+        let parsed = parse_alto(&input).expect("failed to parse benchmark automaton");
+        let states = parsed.automaton.num_states() as usize;
+        report("realistic_first", states, 1, &parsed.automaton);
+        report("realistic_128", states, 128, &parsed.automaton);
     }
 }

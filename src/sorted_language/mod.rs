@@ -6,12 +6,12 @@
 
 mod state_stream_table;
 
-use crate::{Explicit, StateId, Symbol, TopDownTa};
+use crate::{Explicit, StateId, Symbol, TopDownTa, explicit::RuleId};
 use fixedbitset::FixedBitSet;
 use packed_term_arena::tree::{Tree, TreeArena};
 use smallvec::SmallVec;
 use state_stream_table::StateStreamTable;
-use std::{cmp::Ordering, collections::BinaryHeap, mem};
+use std::{cmp::Ordering, collections::BinaryHeap};
 
 /// A weighted tree produced by [`SortedLanguageIterator`].
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -34,9 +34,10 @@ impl WeightedTree {
 
 /// Lazily enumerate accepted derivations in descending weight order.
 ///
-/// Runtime state streams are allocated on demand. Each stream owns one heap
+/// Runtime state streams are initialized on demand. Each stream owns one heap
 /// containing candidates from all rules for that state; a popped candidate is
-/// retained only as a rule-and-child-ranks backpointer. The implementation has
+/// retained as a compact rule-and-child-ranks backpointer. Correct descending
+/// enumeration requires finite rule weights in the interval `[0, 1]`.
 pub struct SortedLanguageIterator<'a> {
     automaton: &'a Explicit,
     productive: &'a FixedBitSet,
@@ -58,7 +59,7 @@ impl Explicit {
 }
 
 impl<'a> SortedLanguageIterator<'a> {
-    /// Construct an iterator without allocating streams for untouched states.
+    /// Construct an iterator without initializing streams for untouched states.
     pub fn new(automaton: &'a Explicit) -> Self {
         let mut accepting = Vec::new();
         automaton.initial_states(&mut |state| accepting.push(state));
@@ -68,7 +69,7 @@ impl<'a> SortedLanguageIterator<'a> {
             automaton,
             productive,
             accepting,
-            state_streams: StateStreamTable::default(),
+            state_streams: StateStreamTable::new(automaton.num_states() as usize),
             root_agenda: BinaryHeap::new(),
             root_initialized: false,
             pending_root_successor: None,
@@ -106,7 +107,6 @@ impl<'a> SortedLanguageIterator<'a> {
                 materialized: Vec::new(),
                 agenda: BinaryHeap::new(),
                 candidates,
-                next_unexpanded: 0,
             },
         );
     }
@@ -122,11 +122,11 @@ impl<'a> SortedLanguageIterator<'a> {
             let rules = self.automaton.rule_indexes_topdown(state);
             stream.candidates.generated.is_empty()
                 && stream.agenda.is_empty()
-                && stream.next_unexpanded == stream.known.len()
+                && !stream.candidates.successors_pending
                 && stream.candidates.has_unstarted(rules.len())
-                && rules[stream.candidates.next_rule..]
+                && rules[stream.candidates.next_rule as usize..]
                     .iter()
-                    .all(|&rule| self.automaton.rule(rule).children.is_empty())
+                    .all(|&rule| self.automaton.rule_by_id(rule).children.is_empty())
         };
         if nullary_only {
             let rules = self.automaton.rule_indexes_topdown(state);
@@ -142,7 +142,7 @@ impl<'a> SortedLanguageIterator<'a> {
                     rule,
                     base_rank: 0,
                     dimension: ZERO_DIMENSION,
-                    weight: self.automaton.rule(rule).weight,
+                    weight: self.automaton.rule_by_id(rule).weight,
                 };
                 return Some(self.finalize_candidate(state, candidate));
             }
@@ -152,7 +152,7 @@ impl<'a> SortedLanguageIterator<'a> {
                     rule,
                     base_rank: 0,
                     dimension: ZERO_DIMENSION,
-                    weight: self.automaton.rule(rule).weight,
+                    weight: self.automaton.rule_by_id(rule).weight,
                 })
                 .collect();
             self.extend_agenda(state, ready);
@@ -166,7 +166,7 @@ impl<'a> SortedLanguageIterator<'a> {
         let stream = &self.state_streams[&state];
         if rank == stream.known.len()
             && !self.visiting.contains(state.index())
-            && stream.next_unexpanded == stream.known.len()
+            && !stream.candidates.successors_pending
             && !stream.agenda.is_empty()
             && stream
                 .candidates
@@ -182,23 +182,13 @@ impl<'a> SortedLanguageIterator<'a> {
             return Some(self.finalize_candidate(state, candidate));
         }
 
-        match self.ensure_item_recursive(state, rank, 0) {
+        match self.ensure_item_recursive(state, rank) {
             EnsureOutcome::Available(weight) => Some(weight),
             EnsureOutcome::Exhausted | EnsureOutcome::Blocked => None,
         }
     }
 
-    fn ensure_item_recursive(
-        &mut self,
-        state: StateId,
-        rank: usize,
-        depth: usize,
-    ) -> EnsureOutcome {
-        const RECURSION_LIMIT: usize = 512;
-        if depth == RECURSION_LIMIT {
-            return self.ensure_item(state, rank);
-        }
-
+    fn ensure_item_recursive(&mut self, state: StateId, rank: usize) -> EnsureOutcome {
         self.ensure_state_stream(state);
         if let Some(item) = self.state_streams[&state].known.get(rank) {
             return EnsureOutcome::Available(item.weight);
@@ -226,7 +216,7 @@ impl<'a> SortedLanguageIterator<'a> {
             .generated
             .pop()
         {
-            match self.resolve_candidate_recursive(state, candidate, depth + 1) {
+            match self.resolve_candidate_recursive(state, candidate) {
                 CandidateOutcome::Ready(candidate) => ready.push(candidate),
                 CandidateOutcome::Blocked(candidate) => leftovers.push(candidate),
                 CandidateOutcome::Dead => {}
@@ -236,7 +226,7 @@ impl<'a> SortedLanguageIterator<'a> {
             let rule = self.automaton.rule_indexes_topdown(state)[position];
             if !self
                 .automaton
-                .rule(rule)
+                .rule_by_id(rule)
                 .children
                 .iter()
                 .all(|child| self.productive.contains(child.index()))
@@ -247,7 +237,7 @@ impl<'a> SortedLanguageIterator<'a> {
                 rule,
                 ranks: CandidateRanks::Zero,
             };
-            match self.resolve_candidate_recursive(state, candidate, depth + 1) {
+            match self.resolve_candidate_recursive(state, candidate) {
                 CandidateOutcome::Ready(candidate) => ready.push(candidate),
                 CandidateOutcome::Blocked(candidate) => leftovers.push(candidate),
                 CandidateOutcome::Dead => {}
@@ -274,27 +264,26 @@ impl<'a> SortedLanguageIterator<'a> {
         &mut self,
         owner: StateId,
         candidate: TupleCandidate,
-        depth: usize,
     ) -> CandidateOutcome {
         match &candidate.ranks {
             CandidateRanks::Zero => {
-                let rule = self.automaton.rule(candidate.rule);
+                let rule = self.automaton.rule_by_id(candidate.rule);
                 let weight = match rule.children {
                     [] => rule.weight,
-                    &[child] => match self.ensure_item_recursive(child, 0, depth) {
+                    &[child] => match self.ensure_item_recursive(child, 0) {
                         EnsureOutcome::Available(child_weight) => rule.weight * child_weight,
                         EnsureOutcome::Exhausted => return CandidateOutcome::Dead,
                         EnsureOutcome::Blocked => return CandidateOutcome::Blocked(candidate),
                     },
                     &[left, right] => {
-                        let left_weight = match self.ensure_item_recursive(left, 0, depth) {
+                        let left_weight = match self.ensure_item_recursive(left, 0) {
                             EnsureOutcome::Available(weight) => weight,
                             EnsureOutcome::Exhausted => return CandidateOutcome::Dead,
                             EnsureOutcome::Blocked => {
                                 return CandidateOutcome::Blocked(candidate);
                             }
                         };
-                        let right_weight = match self.ensure_item_recursive(right, 0, depth) {
+                        let right_weight = match self.ensure_item_recursive(right, 0) {
                             EnsureOutcome::Available(weight) => weight,
                             EnsureOutcome::Exhausted => return CandidateOutcome::Dead,
                             EnsureOutcome::Blocked => {
@@ -307,7 +296,7 @@ impl<'a> SortedLanguageIterator<'a> {
                         let children: SmallVec<[StateId; 2]> = children.iter().copied().collect();
                         let mut weight = rule.weight;
                         for child in children {
-                            match self.ensure_item_recursive(child, 0, depth) {
+                            match self.ensure_item_recursive(child, 0) {
                                 EnsureOutcome::Available(child_weight) => weight *= child_weight,
                                 EnsureOutcome::Exhausted => return CandidateOutcome::Dead,
                                 EnsureOutcome::Blocked => {
@@ -333,8 +322,8 @@ impl<'a> SortedLanguageIterator<'a> {
                 ..
             } => {
                 let next_rank = self.child_rank(owner, *base_rank, *dimension) + 1;
-                let child = self.automaton.rule(candidate.rule).children[*dimension];
-                match self.ensure_item_recursive(child, next_rank, depth) {
+                let child = self.automaton.rule_by_id(candidate.rule).children[*dimension];
+                match self.ensure_item_recursive(child, next_rank) {
                     EnsureOutcome::Available(child_weight) => {
                         CandidateOutcome::Ready(ScoredCandidate {
                             rule: candidate.rule,
@@ -350,204 +339,9 @@ impl<'a> SortedLanguageIterator<'a> {
         }
     }
 
-    fn ensure_item(&mut self, state: StateId, rank: usize) -> EnsureOutcome {
-        let mut frames = vec![SearchFrame::Ensure { state, rank }];
-        let mut ensured = None;
-        let mut resolved = None;
-
-        while let Some(frame) = frames.pop() {
-            match frame {
-                SearchFrame::Ensure { state, rank } => {
-                    self.ensure_state_stream(state);
-                    if let Some(item) = self.state_streams[&state].known.get(rank) {
-                        ensured = Some(EnsureOutcome::Available(item.weight));
-                    } else if rank != self.state_streams[&state].known.len()
-                        || self.visiting.contains(state.index())
-                    {
-                        ensured = Some(EnsureOutcome::Blocked);
-                    } else {
-                        self.visiting.set(state.index(), true);
-                        self.expand_pending(state);
-                        let rule_count = self.automaton.rule_indexes_topdown(state).len();
-                        let (mut candidates, initial_rules) = self
-                            .state_streams
-                            .get_mut(&state)
-                            .expect("state stream must exist")
-                            .candidates
-                            .take(rule_count);
-                        candidates.extend(initial_rules.filter_map(|position| {
-                            let rule = self.automaton.rule_indexes_topdown(state)[position];
-                            self.automaton
-                                .rule(rule)
-                                .children
-                                .iter()
-                                .all(|child| self.productive.contains(child.index()))
-                                .then_some(TupleCandidate {
-                                    rule,
-                                    ranks: CandidateRanks::Zero,
-                                })
-                        }));
-                        frames.push(SearchFrame::EvaluateState {
-                            state,
-                            candidates: candidates.into_iter(),
-                            leftovers: Vec::new(),
-                            ready: Vec::new(),
-                        });
-                    }
-                }
-                SearchFrame::EvaluateState {
-                    state,
-                    mut candidates,
-                    mut leftovers,
-                    mut ready,
-                } => {
-                    if let Some(candidate_result) = resolved.take() {
-                        match candidate_result {
-                            CandidateOutcome::Ready(candidate) => ready.push(candidate),
-                            CandidateOutcome::Blocked(candidate) => leftovers.push(candidate),
-                            CandidateOutcome::Dead => {}
-                        }
-                    }
-
-                    if let Some(candidate) = candidates.next() {
-                        frames.push(SearchFrame::EvaluateState {
-                            state,
-                            candidates,
-                            leftovers,
-                            ready,
-                        });
-                        frames.push(SearchFrame::ResolveCandidate {
-                            owner: state,
-                            candidate,
-                            next_child: 0,
-                            weight: 0.0,
-                        });
-                    } else {
-                        self.state_streams
-                            .get_mut(&state)
-                            .expect("state stream must exist")
-                            .candidates
-                            .generated
-                            .extend(leftovers);
-                        self.extend_agenda(state, ready);
-                        let popped = self
-                            .state_streams
-                            .get_mut(&state)
-                            .expect("state stream must exist")
-                            .agenda
-                            .pop()
-                            .map(|entry| entry.candidate);
-                        self.visiting.set(state.index(), false);
-                        ensured = Some(if let Some(candidate) = popped {
-                            EnsureOutcome::Available(self.finalize_candidate(state, candidate))
-                        } else if self.state_streams[&state]
-                            .candidates
-                            .is_empty(self.automaton.rule_indexes_topdown(state).len())
-                        {
-                            EnsureOutcome::Exhausted
-                        } else {
-                            EnsureOutcome::Blocked
-                        });
-                    }
-                }
-                SearchFrame::ResolveCandidate {
-                    owner,
-                    candidate,
-                    next_child,
-                    mut weight,
-                } => {
-                    if next_child != 0 {
-                        match ensured
-                            .take()
-                            .expect("child request must produce an outcome")
-                        {
-                            EnsureOutcome::Available(child_weight) => {
-                                if let CandidateRanks::Bump {
-                                    left_factor,
-                                    right_factor,
-                                    ..
-                                } = &candidate.ranks
-                                {
-                                    weight =
-                                        self.bump_weight(child_weight, *left_factor, *right_factor);
-                                } else {
-                                    weight *= child_weight;
-                                }
-                            }
-                            EnsureOutcome::Exhausted => {
-                                resolved = Some(CandidateOutcome::Dead);
-                                continue;
-                            }
-                            EnsureOutcome::Blocked => {
-                                resolved = Some(CandidateOutcome::Blocked(candidate));
-                                continue;
-                            }
-                        }
-                    }
-
-                    match &candidate.ranks {
-                        CandidateRanks::Zero => {
-                            let rule = self.automaton.rule(candidate.rule);
-                            if next_child == rule.children.len() {
-                                resolved = Some(CandidateOutcome::Ready(ScoredCandidate {
-                                    rule: candidate.rule,
-                                    base_rank: 0,
-                                    dimension: ZERO_DIMENSION,
-                                    weight: if next_child == 0 { rule.weight } else { weight },
-                                }));
-                            } else {
-                                let child = rule.children[next_child];
-                                frames.push(SearchFrame::ResolveCandidate {
-                                    owner,
-                                    candidate,
-                                    next_child: next_child + 1,
-                                    weight: if next_child == 0 { rule.weight } else { weight },
-                                });
-                                frames.push(SearchFrame::Ensure {
-                                    state: child,
-                                    rank: 0,
-                                });
-                            }
-                        }
-                        CandidateRanks::Bump {
-                            base_rank,
-                            dimension,
-                            ..
-                        } => {
-                            if next_child == 0 {
-                                let old_rank = self.child_rank(owner, *base_rank, *dimension);
-                                let child =
-                                    self.automaton.rule(candidate.rule).children[*dimension];
-                                frames.push(SearchFrame::ResolveCandidate {
-                                    owner,
-                                    candidate,
-                                    next_child: 1,
-                                    weight,
-                                });
-                                frames.push(SearchFrame::Ensure {
-                                    state: child,
-                                    rank: old_rank + 1,
-                                });
-                            } else {
-                                resolved = Some(CandidateOutcome::Ready(ScoredCandidate {
-                                    rule: candidate.rule,
-                                    base_rank: *base_rank,
-                                    dimension: *dimension,
-                                    weight,
-                                }));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        ensured.expect("root request must produce an outcome")
-    }
-
     fn finalize_candidate(&mut self, state: StateId, candidate: ScoredCandidate) -> f64 {
         let weight = candidate.weight;
-        let arity = self.automaton.rule(candidate.rule).children.len();
+        let arity = self.automaton.rule_by_id(candidate.rule).children.len();
         let ranks = if candidate.dimension == ZERO_DIMENSION {
             SmallVec::from_elem(0, arity)
         } else {
@@ -573,16 +367,11 @@ impl<'a> SortedLanguageIterator<'a> {
             child_ranks,
             weight,
         });
-        if arity == 0 {
-            stream.next_unexpanded += 1;
-        }
+        debug_assert!(!stream.candidates.successors_pending);
+        stream.candidates.successors_pending = arity >= 2;
         if arity == 1 {
             let item_rank = self.state_streams[&state].known.len() - 1;
             self.expand_successors(state, item_rank);
-            self.state_streams
-                .get_mut(&state)
-                .expect("state stream must exist")
-                .next_unexpanded += 1;
         }
         weight
     }
@@ -611,7 +400,7 @@ impl<'a> SortedLanguageIterator<'a> {
     fn expand_successors(&mut self, state: StateId, item_rank: usize) {
         let item = &self.state_streams[&state].known[item_rank];
         let rule_index = item.rule;
-        let rule = self.automaton.rule(rule_index);
+        let rule = self.automaton.rule_by_id(rule_index);
         let arity = rule.children.len();
         match arity {
             0 => return,
@@ -713,17 +502,16 @@ impl<'a> SortedLanguageIterator<'a> {
     }
 
     fn expand_pending(&mut self, state: StateId) {
-        loop {
-            let item_rank = self.state_streams[&state].next_unexpanded;
-            if item_rank == self.state_streams[&state].known.len() {
-                return;
-            }
-            self.state_streams
-                .get_mut(&state)
-                .expect("state stream must exist")
-                .next_unexpanded += 1;
-            self.expand_successors(state, item_rank);
+        if !self.state_streams[&state].candidates.successors_pending {
+            return;
         }
+        let item_rank = self.state_streams[&state].known.len() - 1;
+        self.state_streams
+            .get_mut(&state)
+            .expect("state stream must exist")
+            .candidates
+            .successors_pending = false;
+        self.expand_successors(state, item_rank);
     }
 
     fn extend_agenda(&mut self, state: StateId, ready: Vec<ScoredCandidate>) {
@@ -818,7 +606,7 @@ impl<'a> SortedLanguageIterator<'a> {
 
     fn materialize(&mut self, state: StateId, rank: usize) -> Tree {
         let root_rule = self.state_streams[&state].known[rank].rule;
-        let root = self.automaton.rule(root_rule);
+        let root = self.automaton.rule_by_id(root_rule);
         if root.children.is_empty() {
             return self.arena.add_leaf(root.symbol);
         }
@@ -841,20 +629,10 @@ impl<'a> SortedLanguageIterator<'a> {
             return self.arena.add_node_from_slice(root.symbol, &children);
         }
 
-        self.materialize_recursive(state, rank, false, 0)
+        self.materialize_recursive(state, rank, false)
     }
 
-    fn materialize_recursive(
-        &mut self,
-        state: StateId,
-        rank: usize,
-        cache: bool,
-        depth: usize,
-    ) -> Tree {
-        const RECURSION_LIMIT: usize = 1_024;
-        if depth == RECURSION_LIMIT {
-            return self.materialize_iterative(state, rank, cache);
-        }
+    fn materialize_recursive(&mut self, state: StateId, rank: usize, cache: bool) -> Tree {
         if cache
             && let Some(tree) = self.state_streams[&state]
                 .materialized
@@ -866,7 +644,7 @@ impl<'a> SortedLanguageIterator<'a> {
         }
 
         let item = &self.state_streams[&state].known[rank];
-        let rule = self.automaton.rule(item.rule);
+        let rule = self.automaton.rule_by_id(item.rule);
         let symbol = rule.symbol;
         let child_ranks = self.copy_child_ranks(state, rank, rule.children.len());
         let children: SmallVec<[(StateId, usize); 2]> =
@@ -874,7 +652,7 @@ impl<'a> SortedLanguageIterator<'a> {
         let children: SmallVec<[Tree; 2]> = children
             .into_iter()
             .map(|(child_state, child_rank)| {
-                self.materialize_recursive(child_state, child_rank, true, depth + 1)
+                self.materialize_recursive(child_state, child_rank, true)
             })
             .collect();
         let tree = self.arena.add_node_from_slice(symbol, &children);
@@ -890,95 +668,6 @@ impl<'a> SortedLanguageIterator<'a> {
         }
         tree
     }
-
-    fn materialize_iterative(&mut self, state: StateId, rank: usize, cache_root: bool) -> Tree {
-        let mut frames = vec![MaterializeFrame::Enter {
-            state,
-            rank,
-            cache: cache_root,
-        }];
-        let mut results = Vec::new();
-
-        while let Some(frame) = frames.pop() {
-            match frame {
-                MaterializeFrame::Enter { state, rank, cache } => {
-                    if cache
-                        && let Some(tree) = self.state_streams[&state]
-                            .materialized
-                            .get(rank)
-                            .copied()
-                            .flatten()
-                    {
-                        results.push(tree);
-                        continue;
-                    }
-
-                    let item = &self.state_streams[&state].known[rank];
-                    let rule = self.automaton.rule(item.rule);
-                    let child_ranks = self.copy_child_ranks(state, rank, rule.children.len());
-                    let children: SmallVec<[(StateId, usize); 2]> =
-                        rule.children.iter().copied().zip(child_ranks).collect();
-                    frames.push(MaterializeFrame::Exit {
-                        state,
-                        rank,
-                        cache,
-                        symbol: rule.symbol,
-                        child_count: children.len(),
-                    });
-                    frames.extend(children.into_iter().rev().map(|(state, rank)| {
-                        MaterializeFrame::Enter {
-                            state,
-                            rank,
-                            cache: true,
-                        }
-                    }));
-                }
-                MaterializeFrame::Exit {
-                    state,
-                    rank,
-                    cache,
-                    symbol,
-                    child_count,
-                } => {
-                    let children_start = results.len() - child_count;
-                    let tree = self
-                        .arena
-                        .add_node_from_slice(symbol, &results[children_start..]);
-                    results.truncate(children_start);
-                    if cache {
-                        let stream = self
-                            .state_streams
-                            .get_mut(&state)
-                            .expect("state stream must exist");
-                        if stream.materialized.len() <= rank {
-                            stream.materialized.resize(rank + 1, None);
-                        }
-                        stream.materialized[rank] = Some(tree);
-                    }
-                    results.push(tree);
-                }
-            }
-        }
-
-        results
-            .pop()
-            .expect("materialization must produce one root")
-    }
-}
-
-enum MaterializeFrame {
-    Enter {
-        state: StateId,
-        rank: usize,
-        cache: bool,
-    },
-    Exit {
-        state: StateId,
-        rank: usize,
-        cache: bool,
-        symbol: Symbol,
-        child_count: usize,
-    },
 }
 
 impl Iterator for SortedLanguageIterator<'_> {
@@ -992,7 +681,7 @@ impl Iterator for SortedLanguageIterator<'_> {
         let tree = self.materialize(best.state, best.rank);
         if !self
             .automaton
-            .rule(self.state_streams[&best.state].known[best.rank].rule)
+            .rule_by_id(self.state_streams[&best.state].known[best.rank].rule)
             .children
             .is_empty()
         {
@@ -1019,7 +708,6 @@ struct StateStream {
     materialized: Vec<Option<Tree>>,
     agenda: BinaryHeap<CandidateHeapItem>,
     candidates: PendingCandidates,
-    next_unexpanded: usize,
 }
 
 /// Lazy source of candidates for one state.
@@ -1031,20 +719,26 @@ struct StateStream {
 #[derive(Clone, Debug)]
 struct PendingCandidates {
     generated: Vec<TupleCandidate>,
-    next_rule: usize,
+    next_rule: u32,
+    successors_pending: bool,
 }
 
 impl PendingCandidates {
     fn new(productive: bool, rule_count: usize) -> Self {
         Self {
             generated: Vec::new(),
-            next_rule: if productive { 0 } else { rule_count },
+            next_rule: if productive {
+                0
+            } else {
+                u32::try_from(rule_count).expect("rule-count invariant violated")
+            },
+            successors_pending: false,
         }
     }
 
     #[inline]
     fn has_unstarted(&self, rule_count: usize) -> bool {
-        self.next_rule < rule_count
+        (self.next_rule as usize) < rule_count
     }
 
     #[inline]
@@ -1053,22 +747,15 @@ impl PendingCandidates {
     }
 
     fn take_unstarted(&mut self, rule_count: usize) -> std::ops::Range<usize> {
-        let range = self.next_rule..rule_count;
-        self.next_rule = rule_count;
+        let range = self.next_rule as usize..rule_count;
+        self.next_rule = u32::try_from(rule_count).expect("rule-count invariant violated");
         range
-    }
-
-    fn take(&mut self, rule_count: usize) -> (Vec<TupleCandidate>, std::ops::Range<usize>) {
-        (
-            mem::take(&mut self.generated),
-            self.take_unstarted(rule_count),
-        )
     }
 }
 
 #[derive(Clone, Debug)]
 struct StateItem {
-    rule: usize,
+    rule: RuleId,
     child_ranks: ChildRanks,
     weight: f64,
 }
@@ -1115,13 +802,13 @@ impl ChildRanks {
 
 #[derive(Clone, Debug)]
 struct TupleCandidate {
-    rule: usize,
+    rule: RuleId,
     ranks: CandidateRanks,
 }
 
 #[derive(Clone, Debug)]
 struct ScoredCandidate {
-    rule: usize,
+    rule: RuleId,
     base_rank: usize,
     dimension: usize,
     weight: f64,
@@ -1151,25 +838,6 @@ enum CandidateOutcome {
     Ready(ScoredCandidate),
     Blocked(TupleCandidate),
     Dead,
-}
-
-enum SearchFrame {
-    Ensure {
-        state: StateId,
-        rank: usize,
-    },
-    EvaluateState {
-        state: StateId,
-        candidates: std::vec::IntoIter<TupleCandidate>,
-        leftovers: Vec<TupleCandidate>,
-        ready: Vec<ScoredCandidate>,
-    },
-    ResolveCandidate {
-        owner: StateId,
-        candidate: TupleCandidate,
-        next_child: usize,
-        weight: f64,
-    },
 }
 
 fn canonical_successor_limit(child_ranks: &[usize]) -> usize {
@@ -1328,20 +996,5 @@ mod tests {
         assert_eq!(weights.len(), 40);
         assert!((weights[0] - 0.7).abs() < 1e-14);
         assert!(weights[1..].iter().all(|weight| *weight == 0.0));
-    }
-
-    #[test]
-    fn deeply_nested_first_tree_does_not_use_the_process_stack() {
-        let mut builder = ExplicitBuilder::new();
-        let mut state = builder.new_state();
-        builder.add_weighted_rule(Symbol(0), vec![], state, 0.999);
-        for symbol in 1..=20_000 {
-            let parent = builder.new_state();
-            builder.add_weighted_rule(Symbol(symbol), vec![state], parent, 0.999);
-            state = parent;
-        }
-        builder.add_accepting(state);
-        let automaton = builder.build();
-        assert!(automaton.sorted_language().next().is_some());
     }
 }
