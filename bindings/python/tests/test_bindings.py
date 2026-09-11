@@ -41,6 +41,24 @@ def test_explicit_builder_and_owner_checks():
         other.is_accepting(leaf_states[0])
 
 
+def test_k_best_matches_the_sorted_language_contract():
+    builder = ra.AutomatonBuilder()
+    builder.add_state("leaf")
+    builder.add_state("root", True)
+    builder.add_rule("a", [], "leaf", 0.9)
+    builder.add_rule("b", [], "leaf", 0.5)
+    builder.add_rule("f", ["leaf"], "root", 0.8)
+    automaton = builder.build()
+
+    results = automaton.k_best()
+    assert [result.weight for result in results] == pytest.approx([0.72, 0.4])
+    assert [result.score for result in results] == pytest.approx([0.72, 0.4])
+    assert [result.tree.label for result in results] == ["f", "f"]
+    assert [result.tree.children[0].label for result in results] == ["a", "b"]
+    assert len(automaton.k_best(1)) == 1
+    assert automaton.k_best(0) == []
+
+
 def test_string_decomposition_is_lazy_and_structured():
     automaton = ra.StringAlgebra().decompose("a b")
     assert automaton.has_state_universe
