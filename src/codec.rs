@@ -792,7 +792,13 @@ mod tests {
         assert!(registry.codecs_for::<u64>().is_empty());
         assert_eq!(calls.load(Ordering::Relaxed), 0);
 
-        assert_eq!(registry.codec_for_name::<u32>("COUNTING").unwrap().encode(&7), "7");
+        assert_eq!(
+            registry
+                .codec_for_name::<u32>("COUNTING")
+                .unwrap()
+                .encode(&7),
+            "7"
+        );
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert!(matches!(
             registry.codec_for_name::<u64>("counting"),

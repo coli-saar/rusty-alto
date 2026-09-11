@@ -4,6 +4,7 @@ use crate::{
     BottomUpTa, DetBottomUpTa, FxHashMap, FxHashSet, IndexedBottomUpTa, StateId, Symbol, TopDownTa,
     language_analysis::{RuleInput, analyze_for_trimming, analyze_productive_for_trimming},
     traits::{CondensedTa, CondensedTopDownTa, StateUniverse, SymbolSet},
+    util::dense_index::DenseIndex,
 };
 use fixedbitset::FixedBitSet;
 use smallvec::SmallVec;
@@ -501,9 +502,12 @@ impl Explicit {
     /// result is cached after the first call because explicit automata are
     /// immutable.
     pub fn reachable_states(&self) -> FixedBitSet {
+        self.reachable_states_ref().clone()
+    }
+
+    pub(crate) fn reachable_states_ref(&self) -> &FixedBitSet {
         self.reachable_cache
             .get_or_init(|| self.compute_reachable_states())
-            .clone()
     }
 
     fn compute_reachable_states(&self) -> FixedBitSet {
@@ -511,34 +515,34 @@ impl Explicit {
         let mut worklist = Vec::new();
 
         let mut remaining: Vec<usize> = self.rules.iter().map(|r| r.children.len()).collect();
-        let mut mentions: FxHashMap<StateId, Vec<usize>> = FxHashMap::default();
-
-        for (idx, rule) in self.rules.iter().enumerate() {
+        for rule in &self.rules {
             if rule.children.is_empty()
                 && mark_reachable(&mut reachable, &mut worklist, rule.result)
             {
                 continue;
             }
-            let mut unique_children: SmallVec<[StateId; 4]> = SmallVec::new();
-            for &child in rule.children.iter() {
-                if !unique_children.contains(&child) {
-                    unique_children.push(child);
-                    mentions.entry(child).or_default().push(idx);
-                }
-            }
         }
 
+        // Keep one mention per child occurrence. When a state becomes
+        // reachable, each occurrence discharges one slot in `remaining`; this
+        // handles repeated children without rescanning the rule. Dense state
+        // IDs let us use one compact CSR index instead of a hash of vectors.
+        let mentions = DenseIndex::from_pairs(
+            self.num_states as usize,
+            self.rules.iter().enumerate().flat_map(|(rule_idx, rule)| {
+                rule.children
+                    .iter()
+                    .map(move |child| (child.index(), rule_idx))
+            }),
+        );
+
         while let Some(q) = worklist.pop() {
-            let Some(dependents) = mentions.get(&q) else {
-                continue;
-            };
-            for &idx in dependents {
+            for &idx in mentions.values(q.index()) {
                 if remaining[idx] == 0 {
                     continue;
                 }
                 let rule = &self.rules[idx];
-                let newly_satisfied = rule.children.iter().filter(|&&c| c == q).count();
-                remaining[idx] = remaining[idx].saturating_sub(newly_satisfied);
+                remaining[idx] -= 1;
                 if remaining[idx] == 0 {
                     mark_reachable(&mut reachable, &mut worklist, rule.result);
                 }

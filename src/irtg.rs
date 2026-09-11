@@ -1623,43 +1623,42 @@ impl Interpretation {
         let value = self.parse_object_erased(input)?;
         match self.kind {
             InterpretationKind::String => {
-                let value = *value.downcast::<Vec<Symbol>>().map_err(|_| {
-                    IrtgError::WrongInputType {
-                        interpretation: self.name.clone(),
-                    }
-                })?;
+                let value =
+                    *value
+                        .downcast::<Vec<Symbol>>()
+                        .map_err(|_| IrtgError::WrongInputType {
+                            interpretation: self.name.clone(),
+                        })?;
                 Ok(DecompositionAutomaton::String(
                     self.decompose_string(value)?,
                 ))
             }
             InterpretationKind::TagString => {
-                let value = *value
-                    .downcast::<TagStringValue<Symbol>>()
-                    .map_err(|_| IrtgError::WrongInputType {
+                let value = *value.downcast::<TagStringValue<Symbol>>().map_err(|_| {
+                    IrtgError::WrongInputType {
                         interpretation: self.name.clone(),
-                    })?;
+                    }
+                })?;
                 Ok(DecompositionAutomaton::TagString(
                     self.decompose_tag_string(value)?,
                 ))
             }
             InterpretationKind::TagTree => {
-                let value =
-                    *value
-                        .downcast::<Tree>()
-                        .map_err(|_| IrtgError::WrongInputType {
-                            interpretation: self.name.clone(),
-                        })?;
+                let value = *value
+                    .downcast::<Tree>()
+                    .map_err(|_| IrtgError::WrongInputType {
+                        interpretation: self.name.clone(),
+                    })?;
                 Ok(DecompositionAutomaton::TagTree(
                     self.decompose_tag_tree(value)?,
                 ))
             }
             InterpretationKind::BinarizedTagTree => {
-                let value =
-                    *value
-                        .downcast::<Tree>()
-                        .map_err(|_| IrtgError::WrongInputType {
-                            interpretation: self.name.clone(),
-                        })?;
+                let value = *value
+                    .downcast::<Tree>()
+                    .map_err(|_| IrtgError::WrongInputType {
+                        interpretation: self.name.clone(),
+                    })?;
                 Ok(DecompositionAutomaton::BinarizedTagTree(
                     self.decompose_binarized_tag_tree(value)?,
                 ))

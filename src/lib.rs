@@ -105,6 +105,7 @@ pub mod set_trie;
 pub mod signature;
 pub mod sorted_language;
 pub mod traits;
+mod util;
 pub mod viterbi;
 
 pub use algebras::{

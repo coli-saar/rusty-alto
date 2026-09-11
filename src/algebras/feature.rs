@@ -89,10 +89,14 @@ impl FeatureStructure {
         let Node::Map(attributes) = self.nodes.get(id.0)? else {
             return None;
         };
-        Some(attributes.iter().map(|(name, value)| FeatureStructureAttribute {
-            name,
-            value: FeatureStructureNodeId(*value),
-        }))
+        Some(
+            attributes
+                .iter()
+                .map(|(name, value)| FeatureStructureAttribute {
+                    name,
+                    value: FeatureStructureNodeId(*value),
+                }),
+        )
     }
 
     /// Construct an empty attribute-value matrix.
@@ -742,13 +746,15 @@ mod tests {
 
     #[test]
     fn public_graph_access_preserves_nesting_and_reentrancy() {
-        let value =
-            FeatureStructure::parse("[left: #x [case: nom], right: #x, open: #y]").unwrap();
+        let value = FeatureStructure::parse("[left: #x [case: nom], right: #x, open: #y]").unwrap();
         let root = value.root();
         assert_eq!(value.node(root), Some(FeatureStructureNode::Map));
         let attributes = value.attributes(root).unwrap().collect::<Vec<_>>();
         assert_eq!(
-            attributes.iter().map(|attribute| attribute.name).collect::<Vec<_>>(),
+            attributes
+                .iter()
+                .map(|attribute| attribute.name)
+                .collect::<Vec<_>>(),
             vec!["left", "open", "right"]
         );
         assert_eq!(attributes[0].value, attributes[2].value);
