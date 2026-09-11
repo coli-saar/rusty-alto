@@ -9,8 +9,8 @@
 //!
 //! The lazy frontier keeps the eager combination rule unchanged — the
 //! later-finalized child is the trigger, combined with already-finalized siblings
-//! recorded in the shared [`SpanProductSiblingFinder`] — but defers
-//! *realization*. When a product finalizes it spawns one [`SpanGenerator`] per
+//! recorded in the shared `SpanProductSiblingFinder` — but defers
+//! *realization*. When a product finalizes it spawns one `SpanGenerator` per
 //! `(position, sibling-left group)`. Each generator computes its candidates'
 //! merits once and stores them in a **binary heap ordered by merit**, so its
 //! next-best is a heap pop in `O(log siblings)` rather than a rescan in

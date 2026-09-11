@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "rusty-alto"
-version = "0.2.2"
+version = "0.2.3"
 description = "Fast weighted tree automata and interpreted regular tree grammars"
 readme = "README.md"
 requires-python = ">=3.9"

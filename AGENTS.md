@@ -4,3 +4,17 @@ Our main design concerns are clean API and efficiency. Prioritize clean abstract
 This project is very heavily inspired by Alto, a Java library whose source is in ~/Documents/workspace/alto. Our goal is to read inputs that are compatible with Alto, and to outperform it. We keep code for performance comparisons in tools/alto-compare. Whenever you make tricky algorithm decisions, look to Alto for inspiration while still exploiting performance opportunities that come from Rust and the rest of rusty_alto.
 
 We use packed-term-arena as our main tree library. Whenever you generate code for tree handling that is general-purpose enough, make a suggestion to extend packed-term-arena rather than adding it to rusty-alto. Do not edit packed-term-arena yourself.
+
+## Releases and changelog
+
+Updating `CHANGELOG.md` is a mandatory part of every release preparation. Do
+not bump or tag a release without adding its changelog entry.
+
+Keep the changelog concise and user-facing, following the style used by
+Pergamon: place releases newest first under headings of the form
+`## Changes in X.Y.Z (YYYY-MM-DD)`, followed directly by a short bullet list.
+Do not divide entries into Added, Changed, Fixed, or similar categories, and do
+not reproduce a commit-by-commit or file-by-file inventory. Combine related
+work into a few plain-language statements, omit invisible implementation churn,
+and call out compatibility changes, new minimum toolchain requirements, and
+important performance changes explicitly.

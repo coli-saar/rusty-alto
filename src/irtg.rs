@@ -36,6 +36,19 @@ use std::{
 };
 use thiserror::Error;
 
+type GenericChartOutput = (
+    Explicit,
+    Vec<String>,
+    Vec<Vec<String>>,
+    Option<IndexedCondensedIntersectionStats>,
+);
+
+type StringAstarChartOutput = (
+    Explicit,
+    Interner<crate::algebras::Span>,
+    Vec<(StateId, StateId)>,
+);
+
 fn product_state_names<S: Clone + Eq + Hash + fmt::Display>(
     left_names: &[String],
     right_states: &Interner<S>,
@@ -855,15 +868,7 @@ impl Irtg {
         strategy: &MaterializationStrategy<'_>,
         interpretation: &str,
         control: &ParseControl,
-    ) -> Result<
-        (
-            Explicit,
-            Vec<String>,
-            Vec<Vec<String>>,
-            Option<IndexedCondensedIntersectionStats>,
-        ),
-        IrtgError,
-    >
+    ) -> Result<GenericChartOutput, IrtgError>
     where
         R: CondensedTa + StateUniverse + TopDownTa,
         R::State: Clone + Eq + Hash + fmt::Display,
@@ -1001,14 +1006,7 @@ impl Irtg {
         heuristic: &AstarHeuristic<'_>,
         strategy: &MaterializationStrategy<'_>,
         control: &ParseControl,
-    ) -> Result<
-        (
-            Explicit,
-            Interner<crate::algebras::Span>,
-            Vec<(StateId, StateId)>,
-        ),
-        IrtgError,
-    > {
+    ) -> Result<StringAstarChartOutput, IrtgError> {
         let options = match strategy {
             MaterializationStrategy::Astar { options, .. } => AstarOptions {
                 stop_at_first_goal: options.stop_at_first_goal,

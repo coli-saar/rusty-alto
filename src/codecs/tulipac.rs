@@ -1068,7 +1068,7 @@ fn string_term(
                     sort: if operation == WRAP21 { 1 } else { 2 },
                 })
             }
-            AstHomTerm::Symbol(label, children) if label == HOLE => Ok(SortedTerm {
+            AstHomTerm::Symbol(label, _children) if label == HOLE => Ok(SortedTerm {
                 term: AstHomTerm::Symbol(EE.to_owned(), Vec::new()),
                 sort: 2,
             }),

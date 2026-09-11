@@ -3,9 +3,9 @@ name: Package and publish
 on:
   push:
     branches: [main]
+    tags:
+      - "v*.*.*"
   pull_request:
-  release:
-    types: [published]
   workflow_dispatch:
 
 permissions:
@@ -13,7 +13,7 @@ permissions:
 
 concurrency:
   group: package-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'release' }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   package:
@@ -35,7 +35,7 @@ jobs:
         run: cargo package --locked
 
   publish:
-    if: github.event_name == 'release'
+    if: startsWith(github.ref, 'refs/tags/')
     needs: package
     runs-on: ubuntu-latest
     environment: crates-io
@@ -46,16 +46,19 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Verify release tag
+      - name: Verify package name and tag
         shell: bash
         run: |
-          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
-          if [[ "${GITHUB_REF_NAME}" != "v${version}" ]]; then
-            echo "release tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${version}" >&2
-            exit 1
-          fi
+          metadata="$(cargo metadata --no-deps --format-version 1)"
+          crate_name="$(python3 -c 'import json, sys; packages = json.load(sys.stdin)["packages"]; print(next(package["name"] for package in packages if package["name"] == "rusty-alto"))' <<<"${metadata}")"
+          crate_version="$(python3 -c 'import json, sys; packages = json.load(sys.stdin)["packages"]; print(next(package["version"] for package in packages if package["name"] == "rusty-alto"))' <<<"${metadata}")"
+          test "${crate_name}" = "rusty-alto"
+          test "${GITHUB_REF_NAME}" = "v${crate_version}"
+
+      - name: Verify package
+        run: cargo publish --dry-run --locked -p rusty-alto
 
       - name: Publish to crates.io
-        run: cargo publish --locked
+        run: cargo publish --locked -p rusty-alto
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

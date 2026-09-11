@@ -404,10 +404,10 @@ impl BottomUpTa for TagTreeDecompositionAutomaton {
             if self.nodes[parent].children[position] != child.top {
                 return;
             }
-            if let Some(hole) = child.bottom {
-                if bottom.replace(hole).is_some() {
-                    return;
-                }
+            if let Some(hole) = child.bottom
+                && bottom.replace(hole).is_some()
+            {
+                return;
             }
         }
         out(TagTreeContext {

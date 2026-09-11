@@ -16,7 +16,8 @@ available immediately before publishing.
 
 ## Release checklist
 
-1. Update `version` in `Cargo.toml`.
+1. Add a concise entry to `CHANGELOG.md`, then update `version` in
+   `Cargo.toml`.
 2. Update `Cargo.lock`:
 
    ```sh
@@ -31,14 +32,21 @@ available immediately before publishing.
    cargo package --list
    ```
 
-4. Inspect the archive under `target/package/`. It should contain only the
-   manifest, lockfile, README, build script, and Rust sources.
+4. Inspect the archive under `target/package/`. It should contain the manifest,
+   lockfile, licenses, README, build script, Rust sources, and user-facing
+   documentation. It must not contain benchmarks or benchmark results.
 5. Commit and push the version change.
-6. Create a GitHub Release with the tag `vX.Y.Z`, exactly matching the
-   `Cargo.toml` version.
-7. Watch the `Package and publish` workflow. Its package job repeats the tests
-   and archive verification before the publish job can run.
-8. Verify the new release on crates.io and docs.rs.
+6. Tag that commit with `vX.Y.Z`, exactly matching the `Cargo.toml` version,
+   and push the tag:
+
+   ```sh
+   git tag vX.Y.Z
+   git push origin vX.Y.Z
+   ```
+
+7. Watch the `Package and publish` workflow. It repeats the tests and package
+   verification before publishing the crate. A GitHub Release is not required.
+8. Verify the new version on crates.io and docs.rs.
 
 If the release tag and manifest version differ, the workflow refuses to
 publish.

@@ -1,8 +1,8 @@
 [package]
 name = "rusty-alto"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 default-run = "rusty-alto"
 description = "Weighted tree automata and interpreted regular tree grammars with Alto-compatible I/O"
 license = "Apache-2.0"
@@ -15,10 +15,10 @@ categories = ["algorithms", "parsing", "science"]
 publish = ["crates-io"]
 include = [
     "/src/**",
-    "/benches/**",
     "/build.rs",
     "/Cargo.toml",
     "/Cargo.lock",
+    "/CHANGELOG.md",
     "/LICENSE-APACHE",
     "/README.md",
     "/docs/**",

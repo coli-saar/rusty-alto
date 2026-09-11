@@ -31,6 +31,10 @@ create_exception!(_rusty_alto, StateOwnerError, RustyAltoError);
 
 static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
 
+type CondensedRule = (Vec<StateValue>, Vec<Symbol>, StateValue);
+type PyCondensedRule = (Vec<PyState>, Vec<u32>, PyState);
+type PyExplicitRule = (u32, Vec<u32>, u32, f64);
+
 fn next_owner() -> u64 {
     NEXT_OWNER.fetch_add(1, Ordering::Relaxed)
 }
@@ -144,7 +148,6 @@ impl PyState {
             ],
             StateValue::Determinized(states) => states
                 .iter()
-                .cloned()
                 .map(|value| PyState::new(self.owner, value.clone(), value.to_string()))
                 .collect(),
             StateValue::TagSpan(TagSpan::Pair(left, right)) => vec![
@@ -602,7 +605,7 @@ impl AutomatonData {
                     let StateValue::Determinized(states) = child else {
                         return out;
                     };
-                    pools.push(states.iter().cloned().collect::<Vec<_>>());
+                    pools.push(states.to_vec());
                 }
                 let mut result = HashSet::new();
                 cartesian(&pools, &mut |tuple| {
@@ -872,7 +875,7 @@ impl AutomatonData {
         Some(out)
     }
 
-    fn condensed_rules(&self) -> Option<Vec<(Vec<StateValue>, Vec<Symbol>, StateValue)>> {
+    fn condensed_rules(&self) -> Option<Vec<CondensedRule>> {
         let mut out = Vec::new();
         match &self.kind {
             AutomatonKind::Explicit(named) => {
@@ -1299,7 +1302,7 @@ impl PyAutomaton {
             .collect())
     }
 
-    fn condensed_rules(&self) -> PyResult<Vec<(Vec<PyState>, Vec<u32>, PyState)>> {
+    fn condensed_rules(&self) -> PyResult<Vec<PyCondensedRule>> {
         let rules = self
             .data
             .condensed_rules()
@@ -1346,7 +1349,7 @@ impl PyAutomaton {
             .collect())
     }
 
-    fn rules(&self) -> PyResult<Vec<(u32, Vec<u32>, u32, f64)>> {
+    fn rules(&self) -> PyResult<Vec<PyExplicitRule>> {
         let AutomatonKind::Explicit(named) = &self.data.kind else {
             return Err(UnsupportedOperationError::new_err(
                 "only explicit automata store a finite weighted rule table",

@@ -99,21 +99,6 @@ fn parseval(c: &mut Criterion) {
 fn viterbi_performance(c: &mut Criterion) {
     #[cfg(feature = "viterbi-benchmark")]
     {
-        fn shared_dag(width: usize) -> Explicit {
-            let mut builder = ExplicitBuilder::new();
-            let leaf = builder.new_state();
-            builder.add_weighted_rule(A, vec![], leaf, 0.99);
-            let mut previous = leaf;
-            for i in 0..width {
-                let state = builder.new_state();
-                builder.add_weighted_rule(U, vec![previous], state, 0.99 - (i % 7) as f64 * 0.001);
-                builder.add_weighted_rule(F, vec![previous, leaf], state, 0.97);
-                previous = state;
-            }
-            builder.add_accepting(previous);
-            builder.build()
-        }
-
         fn balanced_automaton(depth: usize) -> Explicit {
             fn build(builder: &mut ExplicitBuilder, depth: usize) -> StateId {
                 if depth == 0 {
@@ -150,10 +135,6 @@ fn viterbi_performance(c: &mut Criterion) {
                 |b, automaton| b.iter(|| black_box(automaton.viterbi())),
             );
         }
-        let shared = shared_dag(8_192);
-        shapes.bench_function("new_shared_dag_8192", |b| {
-            b.iter(|| black_box(shared.viterbi()))
-        });
         shapes.finish();
     }
 
