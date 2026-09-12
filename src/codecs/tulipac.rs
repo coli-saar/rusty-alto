@@ -1422,6 +1422,31 @@ mod tests {
     }
 
     #[test]
+    fn sibling_finder_matches_topdown_on_tulipac_tag() {
+        let irtg = TulipacInputCodec.decode(CHASING).unwrap();
+        let string = irtg.interpretation::<TagStringAlgebra>("string").unwrap();
+        let value = string.parse_object("der hund jagt den hasen").unwrap();
+        let topdown = irtg
+            .parse_with(
+                [string.input(value.clone())],
+                &crate::MaterializationStrategy::TopDownCondensed,
+            )
+            .unwrap();
+        let sibling = irtg
+            .parse_with(
+                [string.input(value)],
+                &crate::MaterializationStrategy::SiblingFinder,
+            )
+            .unwrap();
+
+        assert_eq!(
+            topdown.automaton.language_cardinality(),
+            sibling.automaton.language_cardinality()
+        );
+        assert!(sibling.automaton.viterbi().is_some());
+    }
+
+    #[test]
     fn parses_tulipac_adjunction_with_exact_derivations() {
         let irtg = TulipacInputCodec.decode(ADJUNCTION).unwrap();
 
@@ -1513,6 +1538,20 @@ mod tests {
         let good_chart = irtg.parse([string.input(good)]).unwrap();
         assert!(
             irtg.filter_non_null(&good_chart.automaton, "ft")
+                .unwrap()
+                .viterbi()
+                .is_some()
+        );
+
+        let good = string.parse_object("der Hund").unwrap();
+        let good_sibling = irtg
+            .parse_with(
+                [string.input(good)],
+                &crate::MaterializationStrategy::SiblingFinder,
+            )
+            .unwrap();
+        assert!(
+            irtg.filter_non_null(&good_sibling.automaton, "ft")
                 .unwrap()
                 .viterbi()
                 .is_some()

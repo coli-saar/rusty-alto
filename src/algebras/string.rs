@@ -1,8 +1,9 @@
 use super::Algebra;
 use crate::{
     BottomUpTa, CondensedTa, DetBottomUpTa, Explicit, FxHashMap, IndexedBottomUpTa, InvHom,
-    OutputCodec, ProbabilityScorer, Signature, SpaceJoinCodec, StateId, StateUniverse, Symbol,
-    SymbolSet, TextVisualizationCodec, TopDownTa, VisualRepresentation, WeightScorer,
+    OutputCodec, ProbabilityScorer, SiblingKeyedTa, Signature, SpaceJoinCodec, StateId,
+    StateUniverse, Symbol, SymbolSet, TextVisualizationCodec, TopDownTa, VisualRepresentation,
+    WeightScorer,
     heuristic::IntersectionHeuristic,
     homomorphism::{HomLabel, Homomorphism},
 };
@@ -362,6 +363,21 @@ impl BottomUpTa for StringDecompositionAutomaton {
 
     fn is_accepting(&self, q: &Span) -> bool {
         *q == Span::new(0, self.len())
+    }
+}
+
+impl SiblingKeyedTa for StringDecompositionAutomaton {
+    type Key = usize;
+
+    fn sibling_key(&self, f: Symbol, position: usize, state: &Span) -> Option<Self::Key> {
+        if f != self.concat || !self.valid_span(*state) {
+            return None;
+        }
+        match position {
+            0 => Some(state.end),
+            1 => Some(state.start),
+            _ => None,
+        }
     }
 }
 

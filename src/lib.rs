@@ -102,6 +102,7 @@ pub mod parseval;
 pub mod run;
 pub mod score;
 pub mod set_trie;
+pub mod sibling;
 pub mod signature;
 pub mod sorted_language;
 pub mod traits;
@@ -178,6 +179,10 @@ pub use parseval::{
 pub use run::{DetRun, NonDetRun, StateSet, run_det, run_nondet};
 pub use score::{LogProbabilityScorer, ProbabilityScorer, WeightScorer};
 pub use set_trie::{KeySet, SetTrie};
+pub use sibling::{
+    SiblingIntersectionError, SiblingIntersectionStats, SiblingKeyedTa,
+    materialize_rule_local_sibling_intersection, materialize_sibling_intersection,
+};
 pub use signature::{Signature, SignatureError};
 pub use sorted_language::{SortedLanguageIterator, WeightedTree};
 pub use traits::{

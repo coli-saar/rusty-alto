@@ -23,6 +23,7 @@ use crate::{
         materialize_topdown_condensed_intersection,
         materialize_topdown_condensed_intersection_with_pairs_controlled,
     },
+    sibling::materialize_sibling_intersection_controlled,
 };
 use lalrpop_util::ParseError;
 use packed_term_arena::tree::{Tree, TreeArena};
@@ -286,6 +287,12 @@ pub enum MaterializationStrategy<'h> {
     /// top-down strategy for some workloads, including some TAG-derived IRTGs.
     /// This is a property of the automata and inputs, not of a `.tag` filename.
     IndexedCondensed,
+    /// Bottom-up sibling-finder intersection with equality-indexed partners.
+    ///
+    /// The algorithm lifts the decomposition automaton's local partner keys
+    /// through homomorphic image terms. It currently supports string and TAG
+    /// string inputs whose target operations have rank at most two.
+    SiblingFinder,
     /// A* intersection with a configurable heuristic.
     ///
     /// **Precondition**: all grammar rule weights must be ≤ 1 (probability
@@ -568,6 +575,25 @@ impl Irtg {
                             stats.push(stat);
                             c
                         }
+                        MaterializationStrategy::SiblingFinder => {
+                            let (c, right_states, pairs, _stat) =
+                                materialize_sibling_intersection_controlled(
+                                    &chart,
+                                    invhom.inner(),
+                                    &interpretation.homomorphism,
+                                    control,
+                                )
+                                .map_err(|error| {
+                                    IrtgError::SiblingIntersection {
+                                        interpretation: interpretation.name.clone(),
+                                        message: error.to_string(),
+                                    }
+                                })?;
+                            state_names =
+                                string_product_state_names(&state_names, &right_states, &pairs);
+                            state_parts = product_state_parts(&state_parts, &right_states, &pairs);
+                            c
+                        }
                         MaterializationStrategy::Astar {
                             heuristic,
                             options: _,
@@ -595,16 +621,39 @@ impl Irtg {
                                 interpretation: interpretation.name.clone(),
                             })?;
                     let decomp = interpretation.decompose_tag_string(value)?;
-                    let (next_chart, next_names, next_parts, stat) = self.run_generic_chart(
-                        &chart,
-                        &state_names,
-                        &state_parts,
-                        decomp,
-                        &interpretation.homomorphism,
-                        strategy,
-                        &interpretation.name,
-                        control,
-                    )?;
+                    let (next_chart, next_names, next_parts, stat) = match strategy {
+                        MaterializationStrategy::SiblingFinder => {
+                            let (c, right_states, pairs, _sibling_stats) =
+                                materialize_sibling_intersection_controlled(
+                                    &chart,
+                                    &decomp,
+                                    &interpretation.homomorphism,
+                                    control,
+                                )
+                                .map_err(|error| {
+                                    IrtgError::SiblingIntersection {
+                                        interpretation: interpretation.name.clone(),
+                                        message: error.to_string(),
+                                    }
+                                })?;
+                            (
+                                c,
+                                product_state_names(&state_names, &right_states, &pairs),
+                                product_state_parts(&state_parts, &right_states, &pairs),
+                                None,
+                            )
+                        }
+                        _ => self.run_generic_chart(
+                            &chart,
+                            &state_names,
+                            &state_parts,
+                            decomp,
+                            &interpretation.homomorphism,
+                            strategy,
+                            &interpretation.name,
+                            control,
+                        )?,
+                    };
                     if let Some(stat) = stat {
                         stats.push(stat);
                     }
@@ -895,6 +944,10 @@ impl Irtg {
                 let parts = product_state_parts(left_state_parts, &right_states, &pairs);
                 Ok((chart, names, parts, Some(stats)))
             }
+            MaterializationStrategy::SiblingFinder => Err(IrtgError::SiblingIntersection {
+                interpretation: interpretation.to_owned(),
+                message: "the decomposition algebra does not provide sibling keys".to_owned(),
+            }),
             MaterializationStrategy::Astar { heuristic, options } => {
                 let options = AstarOptions {
                     stop_at_first_goal: options.stop_at_first_goal,
@@ -1890,6 +1943,16 @@ pub enum IrtgError {
         /// Alto algebra class name.
         class_name: String,
     },
+    /// Sibling-finder intersection is unavailable for an interpretation.
+    #[error(
+        "sibling intersection is incompatible with interpretation {interpretation:?}: {message}"
+    )]
+    SiblingIntersection {
+        /// Interpretation name.
+        interpretation: String,
+        /// Human-readable incompatibility.
+        message: String,
+    },
     /// A parse strategy selected a heuristic that is not defined for this algebra.
     #[error("heuristic is incompatible with interpretation {interpretation:?}: {message}")]
     IncompatibleHeuristic {
@@ -2481,6 +2544,31 @@ mod tests {
             )
             .unwrap();
         assert!(chart.automaton.is_empty());
+    }
+
+    #[test]
+    fn parse_with_sibling_finder_matches_string_chart_language() {
+        let irtg = parse_irtg(tiny_irtg_bytes()).unwrap();
+        let english = irtg.interpretation::<StringAlgebra>("english").unwrap();
+        let value = english.parse_object("john watches").unwrap();
+        let topdown = irtg
+            .parse_with(
+                [english.input(value.clone())],
+                &MaterializationStrategy::TopDownCondensed,
+            )
+            .unwrap();
+        let sibling = irtg
+            .parse_with(
+                [english.input(value)],
+                &MaterializationStrategy::SiblingFinder,
+            )
+            .unwrap();
+
+        assert_eq!(
+            topdown.automaton.language_cardinality(),
+            sibling.automaton.language_cardinality()
+        );
+        assert!(sibling.automaton.viterbi().is_some());
     }
 
     #[test]

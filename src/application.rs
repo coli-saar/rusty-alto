@@ -92,6 +92,8 @@ pub enum ParseStrategy {
     TopDownCondensed,
     /// Child-indexed condensed intersection.
     IndexedCondensed,
+    /// Bottom-up equality-indexed sibling-finder intersection.
+    SiblingFinder,
     /// Generic A* with the zero heuristic.
     AstarZero {
         /// Stop once the highest-ranked complete derivation is found.
@@ -107,6 +109,7 @@ impl ParseStrategy {
         match *self {
             Self::TopDownCondensed => MaterializationStrategy::TopDownCondensed,
             Self::IndexedCondensed => MaterializationStrategy::IndexedCondensed,
+            Self::SiblingFinder => MaterializationStrategy::SiblingFinder,
             Self::AstarZero {
                 stop_at_first_goal,
                 beam,

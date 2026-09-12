@@ -4,7 +4,8 @@ use packed_term_arena::tree::TreeArena;
 use rusty_alto::{
     CondensedTa, Explicit, ExplicitBuilder, HomLabel, Homomorphism, InvHom, Rule, StateId,
     StateUniverse, StringDecompositionAutomaton, Symbol, SymbolSet,
-    materialize_indexed_condensed_intersection,
+    materialize_indexed_condensed_intersection, materialize_rule_local_sibling_intersection,
+    materialize_sibling_intersection,
 };
 use smallvec::SmallVec;
 use std::collections::VecDeque;
@@ -41,8 +42,25 @@ fn run() -> Result<(), String> {
     )?;
 
     match workload {
-        Workload::Explicit(workload) => run_workload(&args, "explicit", &workload),
-        Workload::Implicit(workload) => run_workload(&args, "implicit", &workload),
+        Workload::Explicit(workload) => {
+            if matches!(
+                args.intersection,
+                IntersectionMode::Sibling | IntersectionMode::RuleLocalSibling
+            ) {
+                return Err("sibling intersection requires the implicit decomposition".to_owned());
+            }
+            run_workload(&args, "explicit", &workload)
+        }
+        Workload::Implicit(workload) => {
+            if matches!(
+                args.intersection,
+                IntersectionMode::Sibling | IntersectionMode::RuleLocalSibling
+            ) {
+                run_sibling_workload(&args, &workload)
+            } else {
+                run_workload(&args, "implicit", &workload)
+            }
+        }
     }
 }
 
@@ -55,29 +73,62 @@ where
     A: CondensedTa + StateUniverse + Clone,
     A::State: Clone + Eq + Hash,
 {
-    let mut last = Summary::default();
-    for _ in 0..args.warmup {
-        last = intersect_workload(
+    run_benchmark(args, decomp_mode, workload, || {
+        intersect_workload(
             args.intersection,
             &workload.left,
             &workload.decomp,
             &workload.hom,
-        );
+        )
+    })
+}
+
+fn run_sibling_workload(
+    args: &Args,
+    workload: &TypedWorkload<StringDecompositionAutomaton>,
+) -> Result<(), String> {
+    run_benchmark(args, "implicit", workload, || {
+        let result = match args.intersection {
+            IntersectionMode::Sibling => {
+                materialize_sibling_intersection(&workload.left, &workload.decomp, &workload.hom)
+            }
+            IntersectionMode::RuleLocalSibling => materialize_rule_local_sibling_intersection(
+                &workload.left,
+                &workload.decomp,
+                &workload.hom,
+            ),
+            _ => unreachable!("non-sibling workloads use run_workload"),
+        };
+        let (chart, _, _, stats) =
+            result.expect("string decomposition is sibling-keyed and binary");
+        Summary {
+            states: chart.num_states() as usize,
+            rules: chart.num_rules(),
+            condensed_rules: 0,
+            term_items: stats.term_items,
+        }
+    })
+}
+
+fn run_benchmark<A>(
+    args: &Args,
+    decomp_mode: &str,
+    workload: &TypedWorkload<A>,
+    mut intersect: impl FnMut() -> Summary,
+) -> Result<(), String> {
+    let mut last = Summary::default();
+    for _ in 0..args.warmup {
+        last = intersect();
     }
 
     let start = Instant::now();
     for _ in 0..args.iterations {
-        last = intersect_workload(
-            args.intersection,
-            &workload.left,
-            &workload.decomp,
-            &workload.hom,
-        );
+        last = intersect();
     }
     let elapsed = start.elapsed();
 
     println!("engine=rusty-alto");
-    println!("algorithm=condensed-invhom");
+    println!("algorithm={}", args.intersection.family_name());
     println!("decomp={decomp_mode}");
     println!("intersection={}", args.intersection.name());
     println!("grammar_states={}", args.states);
@@ -90,6 +141,7 @@ where
     println!("grammar_rules={}", workload.left_rules);
     println!("decomp_rules={}", workload.decomp_rules);
     println!("condensed_rules_last={}", last.condensed_rules);
+    println!("term_items_last={}", last.term_items);
     println!("output_states={}", last.states);
     println!("output_rules={}", last.rules);
     println!("elapsed_ms={:.3}", millis(elapsed));
@@ -120,7 +172,11 @@ where
                 states: stats.output_states,
                 rules: mat.rules().count(),
                 condensed_rules: stats.right_queries(),
+                term_items: 0,
             }
+        }
+        IntersectionMode::Sibling | IntersectionMode::RuleLocalSibling => {
+            unreachable!("sibling workloads use run_sibling_workload")
         }
     }
 }
@@ -206,13 +262,24 @@ enum DecompMode {
 enum IntersectionMode {
     Eager,
     IndexedCondensed,
+    Sibling,
+    RuleLocalSibling,
 }
 
 impl IntersectionMode {
+    fn family_name(self) -> &'static str {
+        match self {
+            Self::Sibling | Self::RuleLocalSibling => "sibling-intersection",
+            Self::Eager | Self::IndexedCondensed => "condensed-invhom",
+        }
+    }
+
     fn name(self) -> &'static str {
         match self {
             Self::Eager => "eager",
             Self::IndexedCondensed => "indexed-condensed",
+            Self::Sibling => "sibling",
+            Self::RuleLocalSibling => "rule-local-sibling",
         }
     }
 }
@@ -390,6 +457,7 @@ struct Summary {
     states: usize,
     rules: usize,
     condensed_rules: usize,
+    term_items: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -492,6 +560,7 @@ where
         states: pairs.len(),
         rules: rules.len(),
         condensed_rules: right_rules.len(),
+        term_items: 0,
     }
 }
 
@@ -603,8 +672,10 @@ fn parse_intersection(args: &mut impl Iterator<Item = String>) -> Result<Interse
     match next_arg(args, "--intersection")?.as_str() {
         "eager" => Ok(IntersectionMode::Eager),
         "indexed-condensed" => Ok(IntersectionMode::IndexedCondensed),
+        "sibling" => Ok(IntersectionMode::Sibling),
+        "rule-local-sibling" => Ok(IntersectionMode::RuleLocalSibling),
         other => Err(format!(
-            "invalid value for --intersection: {other:?}; expected eager or indexed-condensed"
+            "invalid value for --intersection: {other:?}; expected eager, indexed-condensed, sibling, or rule-local-sibling"
         )),
     }
 }
@@ -615,7 +686,7 @@ fn next_arg(args: &mut impl Iterator<Item = String>, name: &str) -> Result<Strin
 }
 
 fn usage() -> &'static str {
-    "usage: compare_condensed_parsing [--states N] [--len N] [--vocab N] [--lexical-labels N] [--binary-labels N] [--iterations N] [--warmup N] [--decomp explicit|implicit] [--intersection eager|indexed-condensed]"
+    "usage: compare_condensed_parsing [--states N] [--len N] [--vocab N] [--lexical-labels N] [--binary-labels N] [--iterations N] [--warmup N] [--decomp explicit|implicit] [--intersection eager|indexed-condensed|sibling|rule-local-sibling]"
 }
 
 #[cfg(test)]
@@ -623,7 +694,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn indexed_condensed_matches_eager_on_small_workload() {
+    fn condensed_algorithms_match_eager_and_share_rhs_items() {
         let Workload::Implicit(workload) =
             Workload::new(4, 5, 2, 2, 3, DecompMode::Implicit).unwrap()
         else {
@@ -642,8 +713,23 @@ mod tests {
             &workload.decomp,
             &workload.hom,
         );
+        let (sibling_chart, _, _, sibling_stats) =
+            materialize_sibling_intersection(&workload.left, &workload.decomp, &workload.hom)
+                .unwrap();
+        let (rule_local_chart, _, _, rule_local_stats) =
+            materialize_rule_local_sibling_intersection(
+                &workload.left,
+                &workload.decomp,
+                &workload.hom,
+            )
+            .unwrap();
 
         assert_eq!(indexed.states, eager.states);
         assert_eq!(indexed.rules, eager.rules);
+        assert_eq!(sibling_chart.num_states() as usize, eager.states);
+        assert_eq!(sibling_chart.num_rules(), eager.rules);
+        assert_eq!(rule_local_chart.num_states(), sibling_chart.num_states());
+        assert_eq!(rule_local_chart.num_rules(), sibling_chart.num_rules());
+        assert!(sibling_stats.term_items < rule_local_stats.term_items);
     }
 }

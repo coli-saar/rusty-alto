@@ -5,8 +5,9 @@
 
 use super::{Algebra, Span};
 use crate::{
-    BottomUpTa, CondensedTa, DisplayCodec, FxHashMap, IndexedBottomUpTa, OutputCodec, Signature,
-    StateUniverse, Symbol, SymbolSet, TextVisualizationCodec, TopDownTa, VisualRepresentation,
+    BottomUpTa, CondensedTa, DisplayCodec, FxHashMap, IndexedBottomUpTa, OutputCodec,
+    SiblingKeyedTa, Signature, StateUniverse, Symbol, SymbolSet, TextVisualizationCodec, TopDownTa,
+    VisualRepresentation,
 };
 use std::{convert::Infallible, fmt};
 
@@ -386,6 +387,27 @@ impl BottomUpTa for TagStringDecompositionAutomaton {
     }
 }
 
+impl SiblingKeyedTa for TagStringDecompositionAutomaton {
+    type Key = (usize, Option<usize>);
+
+    fn sibling_key(&self, symbol: Symbol, position: usize, state: &TagSpan) -> Option<Self::Key> {
+        use TagSpan::{Pair, String as One};
+        match (self.operation(symbol)?, position, *state) {
+            (Operation::Conc11, 0, One(span)) => Some((span.end, None)),
+            (Operation::Conc11, 1, One(span)) => Some((span.start, None)),
+            (Operation::Conc12, 0, One(span)) => Some((span.end, None)),
+            (Operation::Conc12, 1, Pair(left, _)) => Some((left.start, None)),
+            (Operation::Conc21, 0, Pair(_, right)) => Some((right.end, None)),
+            (Operation::Conc21, 1, One(span)) => Some((span.start, None)),
+            (Operation::Wrap21, 0, Pair(left, right)) => Some((left.end, Some(right.start))),
+            (Operation::Wrap21, 1, One(span)) => Some((span.start, Some(span.end))),
+            (Operation::Wrap22, 0, Pair(left, right)) => Some((left.end, Some(right.start))),
+            (Operation::Wrap22, 1, Pair(left, right)) => Some((left.start, Some(right.end))),
+            _ => None,
+        }
+    }
+}
+
 impl StateUniverse for TagStringDecompositionAutomaton {
     fn all_states(&self, out: &mut dyn FnMut(TagSpan)) {
         let n = self.len();
@@ -611,6 +633,32 @@ mod tests {
         assert!(
             matches!(eval(WRAP22, &[pair.clone(), pair.clone()]), Some(TagStringValue::Pair(l, r)) if l.len() == 2 && r.len() == 2)
         );
+    }
+
+    #[test]
+    fn sibling_keys_cover_every_valid_binary_transition() {
+        let mut algebra = TagStringAlgebra::new();
+        let words = algebra.parse_string("a b c");
+        let decomp = algebra.decompose(words).unwrap();
+        let mut states = Vec::new();
+        decomp.all_states(&mut |state| states.push(state));
+
+        for operation in [CONC11, CONC12, CONC21, WRAP21, WRAP22] {
+            let symbol = algebra.operation_symbol(operation).unwrap();
+            for &left in &states {
+                for &right in &states {
+                    let mut valid = false;
+                    decomp.step(symbol, &[left, right], &mut |_| valid = true);
+                    if valid {
+                        assert_eq!(
+                            decomp.sibling_key(symbol, 0, &left),
+                            decomp.sibling_key(symbol, 1, &right),
+                            "valid {operation} transition must have equal sibling keys"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
