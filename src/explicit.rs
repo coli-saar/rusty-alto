@@ -434,8 +434,11 @@ impl ExplicitBuilder {
     /// generating rules. External parsers and callers should use [`Self::build`]
     /// or [`Self::try_build`] so duplicates are rejected.
     pub(crate) fn build_trusted(self) -> Explicit {
-        self.finish(false)
-            .expect("trusted explicit automaton build cannot fail")
+        let mut accepting = FixedBitSet::with_capacity(self.next_state as usize);
+        for q in self.accepting {
+            accepting.set(q.index(), true);
+        }
+        Explicit::from_parts(self.next_state, accepting, self.rules)
     }
 
     fn finish(self, check_duplicates: bool) -> Result<Explicit, ExplicitBuildError> {

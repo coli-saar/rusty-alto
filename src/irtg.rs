@@ -24,7 +24,8 @@ use crate::{
         materialize_topdown_condensed_intersection_with_pairs_controlled,
     },
     sibling::{
-        SiblingIntersectionError, SiblingIntersectionStats,
+        CompiledSiblingGrammar, SiblingIntersectionError, SiblingIntersectionStats,
+        materialize_sibling_intersection_compiled_controlled,
         materialize_sibling_intersection_controlled,
     },
 };
@@ -363,9 +364,35 @@ pub struct Irtg {
     states: Interner<String>,
     grammar_signature: Signature,
     interpretations: FxHashMap<String, Interpretation>,
+    compiled_sibling_grammars: Mutex<FxHashMap<String, Arc<CompiledSiblingGrammar>>>,
 }
 
 impl Irtg {
+    fn compiled_sibling_grammar(
+        &self,
+        interpretation: &Interpretation,
+    ) -> Result<Arc<CompiledSiblingGrammar>, IrtgError> {
+        if let Some(compiled) = self
+            .compiled_sibling_grammars
+            .lock()
+            .unwrap()
+            .get(&interpretation.name)
+            .cloned()
+        {
+            return Ok(compiled);
+        }
+
+        let compiled = Arc::new(
+            CompiledSiblingGrammar::new(&self.grammar, &interpretation.homomorphism)
+                .map_err(|error| map_sibling_error(&interpretation.name, error))?,
+        );
+        let mut cache = self.compiled_sibling_grammars.lock().unwrap();
+        Ok(cache
+            .entry(interpretation.name.clone())
+            .or_insert_with(|| Arc::clone(&compiled))
+            .clone())
+    }
+
     /// Return the explicit grammar automaton.
     pub fn grammar(&self) -> &Explicit {
         &self.grammar
@@ -540,8 +567,8 @@ impl Irtg {
             self.check_astar_weight_precondition()?;
         }
 
-        let mut chart = self.grammar.clone();
-        let mut state_names = (0..chart.num_states())
+        let mut chart = None;
+        let mut state_names = (0..self.grammar.num_states())
             .map(|state| self.states.resolve(StateId(state)).clone())
             .collect::<Vec<_>>();
         let mut state_parts = state_names
@@ -551,8 +578,9 @@ impl Irtg {
             .collect::<Vec<_>>();
         let mut stats = Vec::new();
 
-        for input in inputs {
+        for (input_index, input) in inputs.into_iter().enumerate() {
             control.check().map_err(|_| IrtgError::Cancelled)?;
+            let current_chart = chart.as_ref().unwrap_or(&self.grammar);
             let interpretation = input.interpretation;
             match interpretation.kind {
                 InterpretationKind::String => {
@@ -567,7 +595,9 @@ impl Irtg {
                         MaterializationStrategy::TopDownCondensed => {
                             let (c, right_states, pairs, stat) =
                                 materialize_topdown_condensed_intersection_with_pairs_controlled(
-                                    &chart, &invhom, control,
+                                    current_chart,
+                                    &invhom,
+                                    control,
                                 )
                                 .map_err(|_| IrtgError::Cancelled)?;
                             state_names =
@@ -579,7 +609,9 @@ impl Irtg {
                         MaterializationStrategy::IndexedCondensed => {
                             let (c, right_states, pairs, stat) =
                                 materialize_indexed_condensed_intersection_with_pairs_controlled(
-                                    &chart, &invhom, control,
+                                    current_chart,
+                                    &invhom,
+                                    control,
                                 )
                                 .map_err(|_| IrtgError::Cancelled)?;
                             state_names =
@@ -589,13 +621,23 @@ impl Irtg {
                             c
                         }
                         MaterializationStrategy::SiblingFinder => {
-                            let (c, right_states, pairs, stat) =
+                            let result = if input_index == 0 {
+                                let compiled = self.compiled_sibling_grammar(interpretation)?;
+                                materialize_sibling_intersection_compiled_controlled(
+                                    current_chart,
+                                    invhom.inner(),
+                                    &compiled,
+                                    control,
+                                )
+                            } else {
                                 materialize_sibling_intersection_controlled(
-                                    &chart,
+                                    current_chart,
                                     invhom.inner(),
                                     &interpretation.homomorphism,
                                     control,
                                 )
+                            };
+                            let (c, right_states, pairs, stat) = result
                                 .map_err(|error| map_sibling_error(&interpretation.name, error))?;
                             state_names =
                                 string_product_state_names(&state_names, &right_states, &pairs);
@@ -610,8 +652,13 @@ impl Irtg {
                             // We need owned options — clone by rebuilding (AstarOptions is not Clone).
                             // Instead, call materialize_astar_intersection with a fresh options value.
                             // We route via a helper to avoid duplicating logic.
-                            let (c, right_states, pairs) = self
-                                .run_astar_chart(&chart, &invhom, heuristic, strategy, control)?;
+                            let (c, right_states, pairs) = self.run_astar_chart(
+                                current_chart,
+                                &invhom,
+                                heuristic,
+                                strategy,
+                                control,
+                            )?;
                             state_names =
                                 string_product_state_names(&state_names, &right_states, &pairs);
                             state_parts = product_state_parts(&state_parts, &right_states, &pairs);
@@ -619,7 +666,7 @@ impl Irtg {
                             c
                         }
                     };
-                    chart = next_chart;
+                    chart = Some(next_chart);
                 }
                 InterpretationKind::TagString => {
                     let value =
@@ -632,13 +679,23 @@ impl Irtg {
                     let decomp = interpretation.decompose_tag_string(value)?;
                     let (next_chart, next_names, next_parts, stat) = match strategy {
                         MaterializationStrategy::SiblingFinder => {
-                            let (c, right_states, pairs, sibling_stats) =
+                            let result = if input_index == 0 {
+                                let compiled = self.compiled_sibling_grammar(interpretation)?;
+                                materialize_sibling_intersection_compiled_controlled(
+                                    current_chart,
+                                    &decomp,
+                                    &compiled,
+                                    control,
+                                )
+                            } else {
                                 materialize_sibling_intersection_controlled(
-                                    &chart,
+                                    current_chart,
                                     &decomp,
                                     &interpretation.homomorphism,
                                     control,
                                 )
+                            };
+                            let (c, right_states, pairs, sibling_stats) = result
                                 .map_err(|error| map_sibling_error(&interpretation.name, error))?;
                             (
                                 c,
@@ -648,7 +705,7 @@ impl Irtg {
                             )
                         }
                         _ => self.run_generic_chart(
-                            &chart,
+                            current_chart,
                             &state_names,
                             &state_parts,
                             decomp,
@@ -661,7 +718,7 @@ impl Irtg {
                     if let Some(stat) = stat {
                         stats.push(stat);
                     }
-                    chart = next_chart;
+                    chart = Some(next_chart);
                     state_names = next_names;
                     state_parts = next_parts;
                 }
@@ -675,7 +732,7 @@ impl Irtg {
                             })?;
                     let decomp = interpretation.decompose_tag_tree(value)?;
                     let (next_chart, next_names, next_parts, stat) = self.run_generic_chart(
-                        &chart,
+                        current_chart,
                         &state_names,
                         &state_parts,
                         decomp,
@@ -687,7 +744,7 @@ impl Irtg {
                     if let Some(stat) = stat {
                         stats.push(stat);
                     }
-                    chart = next_chart;
+                    chart = Some(next_chart);
                     state_names = next_names;
                     state_parts = next_parts;
                 }
@@ -701,7 +758,7 @@ impl Irtg {
                             })?;
                     let decomp = interpretation.decompose_binarized_tag_tree(value)?;
                     let (next_chart, next_names, next_parts, stat) = self.run_generic_chart(
-                        &chart,
+                        current_chart,
                         &state_names,
                         &state_parts,
                         decomp,
@@ -713,7 +770,7 @@ impl Irtg {
                     if let Some(stat) = stat {
                         stats.push(stat);
                     }
-                    chart = next_chart;
+                    chart = Some(next_chart);
                     state_names = next_names;
                     state_parts = next_parts;
                 }
@@ -726,7 +783,7 @@ impl Irtg {
         }
 
         Ok(ParseChart {
-            automaton: chart,
+            automaton: chart.unwrap_or_else(|| self.grammar.clone()),
             state_names,
             state_parts,
             stats,
@@ -2237,6 +2294,7 @@ pub(crate) fn build_irtg(ast: AstIrtg) -> Result<Irtg, IrtgError> {
         states,
         grammar_signature,
         interpretations,
+        compiled_sibling_grammars: Mutex::new(FxHashMap::default()),
     })
 }
 
@@ -2610,6 +2668,12 @@ mod tests {
             .unwrap();
         let sibling = irtg
             .parse_with(
+                [english.input(value.clone())],
+                &MaterializationStrategy::SiblingFinder,
+            )
+            .unwrap();
+        let sibling_again = irtg
+            .parse_with(
                 [english.input(value)],
                 &MaterializationStrategy::SiblingFinder,
             )
@@ -2626,6 +2690,15 @@ mod tests {
         };
         assert_eq!(stats.output_states, sibling.automaton.num_states() as usize);
         assert_eq!(stats.output_rules, sibling.automaton.num_rules());
+        assert_eq!(
+            sibling.automaton.language_cardinality(),
+            sibling_again.automaton.language_cardinality()
+        );
+        assert_eq!(
+            sibling.automaton.num_rules(),
+            sibling_again.automaton.num_rules()
+        );
+        assert_eq!(irtg.compiled_sibling_grammars.lock().unwrap().len(), 1);
     }
 
     #[test]

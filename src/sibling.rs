@@ -27,6 +27,20 @@ pub trait SiblingKeyedTa: BottomUpTa {
     /// Return the partner-lookup key for `state` in child `position` of `f`.
     /// `None` means that the state cannot occur in that position.
     fn sibling_key(&self, f: Symbol, position: usize, state: &Self::State) -> Option<Self::Key>;
+
+    /// Number of values in an optional dense encoding of [`Self::Key`].
+    ///
+    /// Implementations may provide this together with [`Self::dense_sibling_key`]
+    /// to replace hash-table sibling indexes with direct array indexing.
+    fn dense_sibling_key_count(&self) -> Option<usize> {
+        None
+    }
+
+    /// Encode a sibling key as an integer below
+    /// [`Self::dense_sibling_key_count`].
+    fn dense_sibling_key(&self, _key: &Self::Key) -> Option<usize> {
+        None
+    }
 }
 
 /// Failure while constructing a sibling-finder intersection.
@@ -181,14 +195,40 @@ fn compile_term(
     })
 }
 
-struct BinaryIndex<K> {
-    positions: [FxHashMap<K, Vec<usize>>; 2],
+enum PositionIndex<K> {
+    Hashed(FxHashMap<K, Vec<usize>>),
+    Dense(Vec<Vec<usize>>),
 }
 
-impl<K> Default for BinaryIndex<K> {
-    fn default() -> Self {
+impl<K: Eq + Hash> PositionIndex<K> {
+    fn get(&self, key: &K, dense_key: Option<usize>) -> &[usize] {
+        match self {
+            Self::Hashed(index) => index.get(key).map_or(&[], Vec::as_slice),
+            Self::Dense(index) => &index[dense_key.expect("dense sibling key is missing")],
+        }
+    }
+
+    fn push(&mut self, key: K, dense_key: Option<usize>, item: usize) {
+        match self {
+            Self::Hashed(index) => index.entry(key).or_default().push(item),
+            Self::Dense(index) => {
+                index[dense_key.expect("dense sibling key is missing")].push(item)
+            }
+        }
+    }
+}
+
+struct BinaryIndex<K> {
+    positions: [PositionIndex<K>; 2],
+}
+
+impl<K> BinaryIndex<K> {
+    fn new(dense_key_count: Option<usize>) -> Self {
         Self {
-            positions: std::array::from_fn(|_| FxHashMap::default()),
+            positions: std::array::from_fn(|_| match dense_key_count {
+                Some(count) => PositionIndex::Dense((0..count).map(|_| Vec::new()).collect()),
+                None => PositionIndex::Hashed(FxHashMap::default()),
+            }),
         }
     }
 }
@@ -239,7 +279,30 @@ where
     condensed::materialize(left, decomp, hom, control)
 }
 
+#[allow(clippy::type_complexity)]
+pub(crate) fn materialize_sibling_intersection_compiled_controlled<D>(
+    left: &Explicit,
+    decomp: &D,
+    compiled: &CompiledSiblingGrammar,
+    control: &ParseControl,
+) -> Result<
+    (
+        Explicit,
+        Interner<D::State>,
+        Vec<(StateId, StateId)>,
+        SiblingIntersectionStats,
+    ),
+    SiblingIntersectionError,
+>
+where
+    D: SiblingKeyedTa,
+    D::State: Clone + Eq + Hash,
+{
+    condensed::materialize_compiled(left, decomp, compiled, control)
+}
+
 mod condensed;
+pub(crate) use condensed::CompiledSiblingGrammar;
 
 #[cfg(test)]
 mod tests {

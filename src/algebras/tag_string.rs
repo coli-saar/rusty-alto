@@ -406,6 +406,14 @@ impl SiblingKeyedTa for TagStringDecompositionAutomaton {
             _ => None,
         }
     }
+
+    fn dense_sibling_key_count(&self) -> Option<usize> {
+        Some((self.len() + 1) * (self.len() + 2))
+    }
+
+    fn dense_sibling_key(&self, &(first, second): &Self::Key) -> Option<usize> {
+        Some(first * (self.len() + 2) + second.map_or(0, |value| value + 1))
+    }
 }
 
 impl StateUniverse for TagStringDecompositionAutomaton {

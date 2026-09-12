@@ -20,13 +20,13 @@ struct RhsNodeChart<K> {
 }
 
 impl<K> RhsNodeChart<K> {
-    fn new(assignment_width: usize, is_binary: bool) -> Self {
+    fn new(assignment_width: usize, is_binary: bool, dense_key_count: Option<usize>) -> Self {
         Self {
             items: Vec::new(),
             assignments: Vec::new(),
             assignment_width,
             seen_by_hash: FxHashMap::default(),
-            binary_index: is_binary.then(BinaryIndex::default),
+            binary_index: is_binary.then(|| BinaryIndex::new(dense_key_count)),
         }
     }
 }
@@ -54,7 +54,7 @@ struct RhsEvaluation<'a, D: BottomUpTa> {
 }
 
 impl<K> RhsChart<K> {
-    fn new(plan: &CompiledTerm) -> Self {
+    fn new(plan: &CompiledTerm, dense_key_count: Option<usize>) -> Self {
         Self {
             nodes: plan
                 .nodes
@@ -65,6 +65,7 @@ impl<K> RhsChart<K> {
                         node.operation
                             .as_ref()
                             .is_some_and(|operation| operation.children.len() == 2),
+                        dense_key_count,
                     )
                 })
                 .collect(),
@@ -246,6 +247,7 @@ impl<K: Clone + Eq + Hash> RhsChart<K> {
                     else {
                         continue;
                     };
+                    let dense_key = evaluation.decomp.dense_sibling_key(&key);
                     let other_position = 1 - link.position;
                     let partner_key = key.clone();
                     let partner_count = {
@@ -254,12 +256,9 @@ impl<K: Clone + Eq + Hash> RhsChart<K> {
                             .as_mut()
                             .expect("binary operation nodes have a sibling index");
                         let partner_count = binary_index.positions[other_position]
-                            .get(&key)
-                            .map_or(0, Vec::len);
-                        binary_index.positions[link.position]
-                            .entry(key)
-                            .or_default()
-                            .push(item_id);
+                            .get(&key, dense_key)
+                            .len();
+                        binary_index.positions[link.position].push(key, dense_key, item_id);
                         partner_count
                     };
 
@@ -269,7 +268,8 @@ impl<K: Clone + Eq + Hash> RhsChart<K> {
                             .binary_index
                             .as_ref()
                             .expect("binary operation nodes have a sibling index")
-                            .positions[other_position][&partner_key][partner_index];
+                            .positions[other_position]
+                            .get(&partner_key, dense_key)[partner_index];
                         evaluation.stats.partner_candidates += 1;
                         let partner = &self.nodes[other_node].items[partner_id];
                         let (left, right) = if link.position == 0 {
@@ -397,6 +397,36 @@ struct OccurrenceGroup {
     rule_ids: Vec<usize>,
 }
 
+/// Grammar-only data compiled once for repeated sibling-finder parsing.
+pub(crate) struct CompiledSiblingGrammar {
+    programs: Vec<CompiledTerm>,
+    rules: Vec<OwnedRule>,
+    program_left_indexes: Vec<SetTrie<StateId, Vec<usize>>>,
+    by_left_child: Vec<Vec<OccurrenceGroup>>,
+}
+
+impl std::fmt::Debug for CompiledSiblingGrammar {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CompiledSiblingGrammar")
+            .field("programs", &self.programs.len())
+            .field("rules", &self.rules.len())
+            .field("left_states", &self.by_left_child.len())
+            .finish()
+    }
+}
+
+impl CompiledSiblingGrammar {
+    /// Compile the parts of sibling-finder parsing that depend only on the
+    /// source grammar and homomorphism.
+    pub(crate) fn new(
+        left: &Explicit,
+        hom: &Homomorphism,
+    ) -> Result<Self, SiblingIntersectionError> {
+        compile(left, hom)
+    }
+}
+
 struct SiblingIntersection<'a, D: BottomUpTa> {
     left: &'a Explicit,
     decomp: &'a D,
@@ -469,26 +499,10 @@ impl<'a, D: BottomUpTa> SiblingIntersection<'a, D> {
     }
 }
 
-#[allow(clippy::type_complexity)]
-pub(super) fn materialize<D>(
+fn compile(
     left: &Explicit,
-    decomp: &D,
     hom: &Homomorphism,
-    control: &ParseControl,
-) -> Result<
-    (
-        Explicit,
-        Interner<D::State>,
-        Vec<(StateId, StateId)>,
-        SiblingIntersectionStats,
-    ),
-    SiblingIntersectionError,
->
-where
-    D: SiblingKeyedTa,
-    D::State: Clone + Eq + Hash,
-{
-    control.check()?;
+) -> Result<CompiledSiblingGrammar, SiblingIntersectionError> {
     let mut programs = Vec::<CompiledTerm>::new();
     let mut program_by_term = vec![None; hom.num_terms()];
     let mut rules = Vec::<OwnedRule>::new();
@@ -549,7 +563,70 @@ where
     }
     drop(occurrence_group_ids);
 
-    let mut charts: Vec<RhsChart<D::Key>> = programs.iter().map(RhsChart::new).collect();
+    Ok(CompiledSiblingGrammar {
+        programs,
+        rules,
+        program_left_indexes,
+        by_left_child,
+    })
+}
+
+#[allow(clippy::type_complexity)]
+pub(super) fn materialize<D>(
+    left: &Explicit,
+    decomp: &D,
+    hom: &Homomorphism,
+    control: &ParseControl,
+) -> Result<
+    (
+        Explicit,
+        Interner<D::State>,
+        Vec<(StateId, StateId)>,
+        SiblingIntersectionStats,
+    ),
+    SiblingIntersectionError,
+>
+where
+    D: SiblingKeyedTa,
+    D::State: Clone + Eq + Hash,
+{
+    control.check()?;
+    let compiled = CompiledSiblingGrammar::new(left, hom)?;
+    materialize_compiled(left, decomp, &compiled, control)
+}
+
+#[allow(clippy::type_complexity)]
+pub(super) fn materialize_compiled<D>(
+    left: &Explicit,
+    decomp: &D,
+    compiled: &CompiledSiblingGrammar,
+    control: &ParseControl,
+) -> Result<
+    (
+        Explicit,
+        Interner<D::State>,
+        Vec<(StateId, StateId)>,
+        SiblingIntersectionStats,
+    ),
+    SiblingIntersectionError,
+>
+where
+    D: SiblingKeyedTa,
+    D::State: Clone + Eq + Hash,
+{
+    control.check()?;
+    let CompiledSiblingGrammar {
+        programs,
+        rules,
+        program_left_indexes,
+        by_left_child,
+    } = compiled;
+
+    let dense_key_count = decomp.dense_sibling_key_count();
+    let mut charts: Vec<RhsChart<D::Key>> = programs
+        .iter()
+        .map(|program| RhsChart::new(program, dense_key_count))
+        .collect();
     let mut intersection = SiblingIntersection::new(left, decomp);
     let mut new_roots = Vec::<usize>::new();
     let mut candidate_rules = Vec::<usize>::new();
@@ -688,7 +765,7 @@ mod tests {
             variable_nodes: Vec::new(),
             root_permutation: SmallVec::new(),
         };
-        let mut chart = RhsChart::<usize>::new(&plan);
+        let mut chart = RhsChart::<usize>::new(&plan, None);
         let mut stats = SiblingIntersectionStats::default();
         let first = [StateId(0), StateId(1), StateId(2)];
         let second = [StateId(0), StateId(1), StateId(3)];
