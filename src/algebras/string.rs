@@ -379,6 +379,14 @@ impl SiblingKeyedTa for StringDecompositionAutomaton {
             _ => None,
         }
     }
+
+    fn dense_sibling_key_count(&self) -> Option<usize> {
+        Some(self.len() + 1)
+    }
+
+    fn dense_sibling_key(&self, key: &Self::Key) -> Option<usize> {
+        Some(*key)
+    }
 }
 
 impl DetBottomUpTa for StringDecompositionAutomaton {
@@ -1566,6 +1574,18 @@ fn enumerate_sibling_splits_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sibling_keys_use_dense_boundary_indices() {
+        let mut algebra = StringAlgebra::new();
+        let word = algebra.intern_word("a");
+        let decomposition = algebra.decompose(vec![word, word, word]);
+
+        assert_eq!(decomposition.dense_sibling_key_count(), Some(4));
+        for boundary in 0..=3 {
+            assert_eq!(decomposition.dense_sibling_key(&boundary), Some(boundary));
+        }
+    }
 
     #[test]
     fn displays_spans_with_dash_bounds() {
