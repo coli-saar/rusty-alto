@@ -7,9 +7,10 @@ use crate::{
     HomomorphismError, IndexedCondensedIntersectionStats, Interner, InvHom, MinHeuristic,
     ObligatoryLeafTables, OutputCodec, OutputCodecError, OutputCodecRegistry, OutsideHeuristic,
     ParseControl, ScoredZeroHeuristic, Signature, SignatureError, SpaceJoinCodec, StateId,
-    StateUniverse, StringAlgebra, Symbol, TagStringAlgebra, TagStringDecompositionAutomaton,
-    TagStringValue, TagTreeAlgebra, TagTreeDecompositionAutomaton, TopDownTa, TreeAlgebra,
-    UniversalSxHeuristic, VisualRepresentation, ViterbiTree, WeightScorer, ZeroHeuristic,
+    StateUniverse, StringAlgebra, StringSiblingIndexFactory, Symbol, TagStringAlgebra,
+    TagStringDecompositionAutomaton, TagStringSiblingIndexFactory, TagStringValue, TagTreeAlgebra,
+    TagTreeDecompositionAutomaton, TopDownTa, TreeAlgebra, UniversalSxHeuristic,
+    VisualRepresentation, ViterbiTree, WeightScorer, ZeroHeuristic,
     alto_ast::{AstHomTerm, AstIrtg, AstState, LexError, Tok, lex},
     alto_grammar,
     astar::{
@@ -25,8 +26,7 @@ use crate::{
     },
     sibling::{
         CompiledSiblingGrammar, SiblingIntersectionError, SiblingIntersectionStats,
-        materialize_sibling_intersection_compiled_controlled,
-        materialize_sibling_intersection_controlled,
+        materialize_compiled,
     },
 };
 use lalrpop_util::ParseError;
@@ -301,11 +301,11 @@ pub enum MaterializationStrategy<'h> {
     /// top-down strategy for some workloads, including some TAG-derived IRTGs.
     /// This is a property of the automata and inputs, not of a `.tag` filename.
     IndexedCondensed,
-    /// Bottom-up sibling-finder intersection with equality-indexed partners.
+    /// Bottom-up sibling-indexed intersection.
     ///
-    /// The algorithm lifts the decomposition automaton's local partner keys
-    /// through homomorphic image terms. It currently supports string and TAG
-    /// string inputs whose target operations have rank at most two.
+    /// The algorithm lifts algebra-specific sibling indexes through
+    /// homomorphic image terms. It currently supports string and TAG string
+    /// inputs whose target operations have rank at most two.
     SiblingFinder,
     /// A* intersection with a configurable heuristic.
     ///
@@ -590,6 +590,7 @@ impl Irtg {
                         }
                     })?;
                     let decomp = interpretation.decompose_string(value)?;
+                    let sibling_indexes = StringSiblingIndexFactory;
                     let invhom = InvHom::new(decomp, &interpretation.homomorphism);
                     let next_chart = match strategy {
                         MaterializationStrategy::TopDownCondensed => {
@@ -621,22 +622,25 @@ impl Irtg {
                             c
                         }
                         MaterializationStrategy::SiblingFinder => {
-                            let result = if input_index == 0 {
-                                let compiled = self.compiled_sibling_grammar(interpretation)?;
-                                materialize_sibling_intersection_compiled_controlled(
-                                    current_chart,
-                                    invhom.inner(),
-                                    &compiled,
-                                    control,
-                                )
+                            let compiled = if input_index == 0 {
+                                self.compiled_sibling_grammar(interpretation)?
                             } else {
-                                materialize_sibling_intersection_controlled(
-                                    current_chart,
-                                    invhom.inner(),
-                                    &interpretation.homomorphism,
-                                    control,
+                                Arc::new(
+                                    CompiledSiblingGrammar::new(
+                                        current_chart,
+                                        &interpretation.homomorphism,
+                                    )
+                                    .map_err(|error| {
+                                        map_sibling_error(&interpretation.name, error)
+                                    })?,
                                 )
                             };
+                            let result = materialize_compiled(
+                                invhom.inner(),
+                                &compiled,
+                                &sibling_indexes,
+                                control,
+                            );
                             let (c, right_states, pairs, stat) = result
                                 .map_err(|error| map_sibling_error(&interpretation.name, error))?;
                             state_names =
@@ -677,24 +681,24 @@ impl Irtg {
                                 interpretation: interpretation.name.clone(),
                             })?;
                     let decomp = interpretation.decompose_tag_string(value)?;
+                    let sibling_indexes = TagStringSiblingIndexFactory;
                     let (next_chart, next_names, next_parts, stat) = match strategy {
                         MaterializationStrategy::SiblingFinder => {
-                            let result = if input_index == 0 {
-                                let compiled = self.compiled_sibling_grammar(interpretation)?;
-                                materialize_sibling_intersection_compiled_controlled(
-                                    current_chart,
-                                    &decomp,
-                                    &compiled,
-                                    control,
-                                )
+                            let compiled = if input_index == 0 {
+                                self.compiled_sibling_grammar(interpretation)?
                             } else {
-                                materialize_sibling_intersection_controlled(
-                                    current_chart,
-                                    &decomp,
-                                    &interpretation.homomorphism,
-                                    control,
+                                Arc::new(
+                                    CompiledSiblingGrammar::new(
+                                        current_chart,
+                                        &interpretation.homomorphism,
+                                    )
+                                    .map_err(|error| {
+                                        map_sibling_error(&interpretation.name, error)
+                                    })?,
                                 )
                             };
+                            let result =
+                                materialize_compiled(&decomp, &compiled, &sibling_indexes, control);
                             let (c, right_states, pairs, sibling_stats) = result
                                 .map_err(|error| map_sibling_error(&interpretation.name, error))?;
                             (
@@ -1017,7 +1021,7 @@ impl Irtg {
             }
             MaterializationStrategy::SiblingFinder => Err(IrtgError::SiblingIntersection {
                 interpretation: interpretation.to_owned(),
-                source: SiblingIntersectionError::UnsupportedDecomposition,
+                source: SiblingIntersectionError::SiblingIndexUnavailable,
             }),
             MaterializationStrategy::Astar { heuristic, options } => {
                 let options = AstarOptions {

@@ -5,9 +5,9 @@
 
 use super::{Algebra, Span};
 use crate::{
-    BottomUpTa, CondensedTa, DisplayCodec, FxHashMap, IndexedBottomUpTa, OutputCodec,
-    SiblingKeyedTa, Signature, StateUniverse, Symbol, SymbolSet, TextVisualizationCodec, TopDownTa,
-    VisualRepresentation,
+    BinarySiblingIndex, BottomUpTa, CondensedTa, DisplayCodec, FxHashMap, IndexedBottomUpTa,
+    OutputCodec, SiblingIndexFactory, Signature, StateUniverse, Symbol, SymbolSet,
+    TextVisualizationCodec, TopDownTa, VisualRepresentation,
 };
 use std::{convert::Infallible, fmt};
 
@@ -275,6 +275,78 @@ pub struct TagStringDecompositionAutomaton {
     positions_by_word: FxHashMap<Symbol, Vec<usize>>,
 }
 
+/// Creates operation-specific dense sibling indexes for TAG strings.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TagStringSiblingIndexFactory;
+
+/// Dense partner index for one binary TAG string operation.
+#[derive(Debug)]
+pub struct TagStringSiblingIndex {
+    operation: Operation,
+    width: usize,
+    positions: [Vec<Vec<usize>>; 2],
+}
+
+impl TagStringSiblingIndex {
+    #[inline]
+    fn slot(&self, position: usize, state: &TagSpan) -> Option<usize> {
+        use TagSpan::{Pair, String as One};
+        match (self.operation, position, *state) {
+            (Operation::Conc11 | Operation::Conc12, 0, One(span)) => Some(span.end),
+            (Operation::Conc11, 1, One(span)) => Some(span.start),
+            (Operation::Conc12, 1, Pair(left, _)) => Some(left.start),
+            (Operation::Conc21, 0, Pair(_, right)) => Some(right.end),
+            (Operation::Conc21, 1, One(span)) => Some(span.start),
+            (Operation::Wrap21 | Operation::Wrap22, 0, Pair(left, right)) => {
+                Some(left.end * self.width + right.start)
+            }
+            (Operation::Wrap21, 1, One(span)) => Some(span.start * self.width + span.end),
+            (Operation::Wrap22, 1, Pair(left, right)) => Some(left.start * self.width + right.end),
+            _ => None,
+        }
+    }
+}
+
+impl BinarySiblingIndex<TagSpan> for TagStringSiblingIndex {
+    #[inline]
+    fn add(&mut self, position: usize, state: &TagSpan, item: usize) {
+        if let Some(slot) = self.slot(position, state) {
+            self.positions[position][slot].push(item);
+        }
+    }
+
+    #[inline]
+    fn partners(&self, position: usize, state: &TagSpan) -> &[usize] {
+        let Some(slot) = self.slot(position, state) else {
+            return &[];
+        };
+        &self.positions[1 - position][slot]
+    }
+}
+
+impl SiblingIndexFactory<TagStringDecompositionAutomaton> for TagStringSiblingIndexFactory {
+    type Index = TagStringSiblingIndex;
+
+    fn new_index(
+        &self,
+        decomp: &TagStringDecompositionAutomaton,
+        symbol: Symbol,
+    ) -> Option<Self::Index> {
+        let operation = decomp.operation(symbol)?;
+        let boundaries = decomp.len() + 1;
+        let slots = match operation {
+            Operation::Conc11 | Operation::Conc12 | Operation::Conc21 => boundaries,
+            Operation::Wrap21 | Operation::Wrap22 => boundaries * boundaries,
+            Operation::E | Operation::Ee => return None,
+        };
+        Some(TagStringSiblingIndex {
+            operation,
+            width: boundaries,
+            positions: std::array::from_fn(|_| (0..slots).map(|_| Vec::new()).collect()),
+        })
+    }
+}
+
 impl TagStringDecompositionAutomaton {
     fn new(operations: FxHashMap<Symbol, Operation>, words: Vec<Symbol>) -> Self {
         let mut positions_by_word = FxHashMap::default();
@@ -384,35 +456,6 @@ impl BottomUpTa for TagStringDecompositionAutomaton {
 
     fn is_accepting(&self, state: &TagSpan) -> bool {
         *state == TagSpan::String(Span::new(0, self.len()))
-    }
-}
-
-impl SiblingKeyedTa for TagStringDecompositionAutomaton {
-    type Key = (usize, Option<usize>);
-
-    fn sibling_key(&self, symbol: Symbol, position: usize, state: &TagSpan) -> Option<Self::Key> {
-        use TagSpan::{Pair, String as One};
-        match (self.operation(symbol)?, position, *state) {
-            (Operation::Conc11, 0, One(span)) => Some((span.end, None)),
-            (Operation::Conc11, 1, One(span)) => Some((span.start, None)),
-            (Operation::Conc12, 0, One(span)) => Some((span.end, None)),
-            (Operation::Conc12, 1, Pair(left, _)) => Some((left.start, None)),
-            (Operation::Conc21, 0, Pair(_, right)) => Some((right.end, None)),
-            (Operation::Conc21, 1, One(span)) => Some((span.start, None)),
-            (Operation::Wrap21, 0, Pair(left, right)) => Some((left.end, Some(right.start))),
-            (Operation::Wrap21, 1, One(span)) => Some((span.start, Some(span.end))),
-            (Operation::Wrap22, 0, Pair(left, right)) => Some((left.end, Some(right.start))),
-            (Operation::Wrap22, 1, Pair(left, right)) => Some((left.start, Some(right.end))),
-            _ => None,
-        }
-    }
-
-    fn dense_sibling_key_count(&self) -> Option<usize> {
-        Some((self.len() + 1) * (self.len() + 2))
-    }
-
-    fn dense_sibling_key(&self, &(first, second): &Self::Key) -> Option<usize> {
-        Some(first * (self.len() + 2) + second.map_or(0, |value| value + 1))
     }
 }
 
@@ -644,27 +687,54 @@ mod tests {
     }
 
     #[test]
-    fn sibling_keys_cover_every_valid_binary_transition() {
+    fn sibling_indexes_return_exact_binary_partners() {
         let mut algebra = TagStringAlgebra::new();
         let words = algebra.parse_string("a b c");
         let decomp = algebra.decompose(words).unwrap();
+        let factory = TagStringSiblingIndexFactory;
         let mut states = Vec::new();
         decomp.all_states(&mut |state| states.push(state));
 
         for operation in [CONC11, CONC12, CONC21, WRAP21, WRAP22] {
             let symbol = algebra.operation_symbol(operation).unwrap();
+            let mut left_index = factory.new_index(&decomp, symbol).unwrap();
+            let expected_slots = if operation.starts_with("*CONC") {
+                4
+            } else {
+                16
+            };
+            assert_eq!(left_index.positions[0].len(), expected_slots);
+            for (item, state) in states.iter().enumerate() {
+                left_index.add(0, state, item);
+            }
+            for &right in &states {
+                let expected: Vec<_> = states
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(item, &left)| {
+                        let mut valid = false;
+                        decomp.step(symbol, &[left, right], &mut |_| valid = true);
+                        valid.then_some(item)
+                    })
+                    .collect();
+                assert_eq!(left_index.partners(1, &right), expected, "{operation}");
+            }
+
+            let mut right_index = factory.new_index(&decomp, symbol).unwrap();
+            for (item, state) in states.iter().enumerate() {
+                right_index.add(1, state, item);
+            }
             for &left in &states {
-                for &right in &states {
-                    let mut valid = false;
-                    decomp.step(symbol, &[left, right], &mut |_| valid = true);
-                    if valid {
-                        assert_eq!(
-                            decomp.sibling_key(symbol, 0, &left),
-                            decomp.sibling_key(symbol, 1, &right),
-                            "valid {operation} transition must have equal sibling keys"
-                        );
-                    }
-                }
+                let expected: Vec<_> = states
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(item, &right)| {
+                        let mut valid = false;
+                        decomp.step(symbol, &[left, right], &mut |_| valid = true);
+                        valid.then_some(item)
+                    })
+                    .collect();
+                assert_eq!(right_index.partners(0, &left), expected, "{operation}");
             }
         }
     }

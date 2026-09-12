@@ -1,9 +1,17 @@
-//! Equality-indexed sibling-finder intersection.
+//! Sibling-indexed bottom-up intersection for interpreted grammars.
 //!
-//! This module combines inverse homomorphism and automaton intersection in one
-//! bottom-up chart construction.  Decomposition automata only provide an
-//! equality key for each side of a binary operation.  The generic algorithm
-//! lifts those local chart indexes through homomorphism terms.
+//! The algorithm fuses inverse homomorphism with automaton intersection. A
+//! reachable product state `(p, q)` activates occurrences of the corresponding
+//! homomorphism variable. Decomposition states then propagate upward through a
+//! compiled homomorphism term. At a binary term node, an algebra-specific
+//! [`BinarySiblingIndex`] finds the items that can form a decomposition
+//! transition with the new item. A completed root item is the condensed
+//! inverse-homomorphism transition described in `sibling-finder.typ`; it is
+//! subsequently joined with every compatible source rule.
+//!
+//! This module defines the algebra-facing interface and compiles homomorphism
+//! terms. The private execution engine owns the term charts, product-state
+//! agenda, and final join.
 
 use crate::{
     BottomUpTa, Explicit, FxHashMap, HomLabel, Homomorphism, Interner, ParseControl, StateId,
@@ -14,33 +22,58 @@ use smallvec::SmallVec;
 use std::hash::Hash;
 use thiserror::Error;
 
-/// A decomposition automaton whose binary transitions admit equality-indexed
-/// partner lookup.
+/// Algebra-specific partner index for one occurrence of a binary operation.
 ///
-/// If `f(left, right)` is a valid transition, both calls to `sibling_key` must
-/// return equal keys. Returning equal keys for an invalid pair is allowed: the
-/// sibling materializer validates candidates with [`BottomUpTa::step`].
-pub trait SiblingKeyedTa: BottomUpTa {
-    /// Equality key stored in the local chart indexes.
-    type Key: Clone + Eq + Hash;
-
-    /// Return the partner-lookup key for `state` in child `position` of `f`.
-    /// `None` means that the state cannot occur in that position.
-    fn sibling_key(&self, f: Symbol, position: usize, state: &Self::State) -> Option<Self::Key>;
-
-    /// Number of values in an optional dense encoding of [`Self::Key`].
+/// The term chart creates a separate index for every binary node of every term
+/// program. Items are added at child position `0` or `1`. When an item arrives,
+/// [`partners`](Self::partners) returns item IDs already stored at the opposite
+/// position that can be combined with it.
+///
+/// Unlike the equality-key interface in earlier versions of the design, this
+/// interface does not expose keys to the generic algorithm. An implementation
+/// may use a boundary array, a multidimensional array, or another representation.
+/// It must return all and only compatible partners. The engine still calls the
+/// decomposition automaton to construct the parent state and debug-checks that
+/// an indexed pair has at least one result.
+///
+/// Returned slices borrow the index and need not be sorted. The engine relies on
+/// append-only item IDs remaining valid for the lifetime of the term chart.
+pub trait BinarySiblingIndex<State> {
+    /// Record `item` and its decomposition `state` at child `position`.
     ///
-    /// Implementations may provide this together with [`Self::dense_sibling_key`]
-    /// to replace hash-table sibling indexes with direct array indexing.
-    fn dense_sibling_key_count(&self) -> Option<usize> {
-        None
-    }
+    /// The engine adds each term-chart item once at each binary occurrence that
+    /// consumes it. `position` is therefore always `0` or `1`.
+    fn add(&mut self, position: usize, state: &State, item: usize);
 
-    /// Encode a sibling key as an integer below
-    /// [`Self::dense_sibling_key_count`].
-    fn dense_sibling_key(&self, _key: &Self::Key) -> Option<usize> {
-        None
-    }
+    /// Borrow the compatible item IDs stored at the other child position.
+    ///
+    /// Only items added before this call may be returned. The result must be
+    /// complete and contain no incompatible item, but its order is unspecified.
+    fn partners(&self, position: usize, state: &State) -> &[usize];
+}
+
+/// Creates the sibling index chosen by a decomposition automaton's algebra.
+///
+/// The factory is separate from the decomposition automaton so sibling finding
+/// remains an optional parsing strategy rather than part of [`BottomUpTa`]. The
+/// engine is generic over both `D` and this factory, so calls to [`add`](BinarySiblingIndex::add)
+/// and [`partners`](BinarySiblingIndex::partners) are statically dispatched and
+/// can compile to direct array access.
+///
+/// A factory is normally a zero-sized value. It receives the actual
+/// decomposition automaton when constructing an index because input-dependent
+/// dimensions, such as the number of string boundaries, belong to that
+/// automaton.
+pub trait SiblingIndexFactory<D: BottomUpTa> {
+    /// Concrete index type, statically dispatched by the materializer.
+    type Index: BinarySiblingIndex<D::State>;
+
+    /// Create an empty index for one binary occurrence of `symbol`.
+    ///
+    /// Return `None` if sibling finding does not support that operation. The
+    /// materialization then fails with
+    /// [`SiblingIntersectionError::SiblingIndexUnavailable`].
+    fn new_index(&self, decomp: &D, symbol: Symbol) -> Option<Self::Index>;
 }
 
 /// Failure while constructing a sibling-finder intersection.
@@ -49,9 +82,9 @@ pub enum SiblingIntersectionError {
     /// Parsing was cancelled through the supplied control.
     #[error("parsing was cancelled")]
     Cancelled,
-    /// The selected decomposition algebra does not provide sibling keys.
-    #[error("the decomposition algebra does not provide sibling keys")]
-    UnsupportedDecomposition,
+    /// No sibling index is available for the requested decomposition operation.
+    #[error("no sibling index is available for a binary target operation")]
+    SiblingIndexUnavailable,
     /// A homomorphic image contains a target operation above binary rank.
     #[error("sibling intersection supports target rank at most 2, but {symbol:?} has rank {arity}")]
     UnsupportedTargetArity {
@@ -79,7 +112,7 @@ pub struct SiblingIntersectionStats {
     pub agenda_pops: usize,
     /// New facts inserted into homomorphism-term charts.
     pub term_items: usize,
-    /// Equal-key partner candidates considered.
+    /// Compatible sibling candidates considered.
     pub partner_candidates: usize,
     /// Calls to the decomposition automaton's transition oracle.
     pub right_step_calls: usize,
@@ -87,31 +120,74 @@ pub struct SiblingIntersectionStats {
     pub root_items: usize,
 }
 
+/// Location of a term-program node in its parent's child list.
 #[derive(Clone, Copy)]
 struct ParentLink {
     node: usize,
     position: usize,
 }
 
+/// Compiled data needed to evaluate one algebra operation.
 struct CompiledOperation {
     symbol: Symbol,
     children: SmallVec<[usize; 2]>,
 }
 
-struct NodePlan {
-    parent: Option<ParentLink>,
-    operation: Option<CompiledOperation>,
-    assignment_width: usize,
+/// One node of a compiled homomorphism term.
+///
+/// Variables are activation points for product states. Operations are evaluated
+/// after their child items become available. Keeping the cases explicit avoids
+/// representing a variable as an operation that happens to be absent.
+enum CompiledNode {
+    Variable {
+        parent: Option<ParentLink>,
+    },
+    Operation {
+        parent: Option<ParentLink>,
+        operation: CompiledOperation,
+        assignment_width: usize,
+    },
 }
 
+impl CompiledNode {
+    fn parent(&self) -> Option<ParentLink> {
+        match self {
+            Self::Variable { parent } | Self::Operation { parent, .. } => *parent,
+        }
+    }
+
+    fn operation(&self) -> Option<&CompiledOperation> {
+        match self {
+            Self::Variable { .. } => None,
+            Self::Operation { operation, .. } => Some(operation),
+        }
+    }
+
+    fn assignment_width(&self) -> usize {
+        match self {
+            Self::Variable { .. } => 1,
+            Self::Operation {
+                assignment_width, ..
+            } => *assignment_width,
+        }
+    }
+}
+
+/// Input-independent program for one homomorphism right-hand side.
+///
+/// The program is shared by every source rule whose label has this image. It
+/// contains no decomposition states; those live in a per-input running program.
 struct CompiledTerm {
-    nodes: Vec<NodePlan>,
+    /// Term nodes in preorder; the root therefore has ID [`ROOT_NODE`].
+    nodes: Vec<CompiledNode>,
+    /// Node activated by each source-rule child position.
     variable_nodes: Vec<usize>,
     /// Root assignment offsets in source-child order; empty means identity.
     root_permutation: SmallVec<[usize; 4]>,
 }
 
 impl CompiledTerm {
+    /// Number of children of every source rule represented by this program.
     fn arity(&self) -> usize {
         self.variable_nodes.len()
     }
@@ -119,29 +195,35 @@ impl CompiledTerm {
 
 const ROOT_NODE: usize = 0;
 
+/// Compile a homomorphism term into the parent/child links used for propagation.
+///
+/// `arity` is the arity of the source rule, not the rank of the target root.
+/// The homomorphism is nondeleting, so every source position must occur once in
+/// `variable_nodes`. Target operations above binary rank are rejected here,
+/// before any input-sized chart is allocated.
 fn compile_term(
     arena: &TreeArena<HomLabel>,
     root: Tree,
     arity: usize,
 ) -> Result<CompiledTerm, SiblingIntersectionError> {
+    // Reserve a preorder ID before visiting the children so every child can
+    // record its parent without a second tree traversal. The temporary `None`
+    // is consumed before the compiled term escapes this function.
     fn visit(
         arena: &TreeArena<HomLabel>,
         term: Tree,
         parent: Option<ParentLink>,
-        nodes: &mut Vec<NodePlan>,
+        nodes: &mut Vec<Option<CompiledNode>>,
         variables: &mut [usize],
     ) -> Result<(usize, SmallVec<[usize; 4]>), SiblingIntersectionError> {
         let id = nodes.len();
-        nodes.push(NodePlan {
-            parent,
-            operation: None,
-            assignment_width: 0,
-        });
+        nodes.push(None);
 
-        let (kind, node_variables) = match *arena.get_label(term) {
+        let node_variables = match *arena.get_label(term) {
             HomLabel::Var(position) => {
                 variables[position] = id;
-                (None, smallvec::smallvec![position])
+                nodes[id] = Some(CompiledNode::Variable { parent });
+                smallvec::smallvec![position]
             }
             HomLabel::Symbol(symbol) => {
                 let term_children = arena.get_children(term);
@@ -164,11 +246,14 @@ fn compile_term(
                     children.push(child);
                     node_variables.extend_from_slice(&child_variables);
                 }
-                (Some(CompiledOperation { symbol, children }), node_variables)
+                nodes[id] = Some(CompiledNode::Operation {
+                    parent,
+                    operation: CompiledOperation { symbol, children },
+                    assignment_width: node_variables.len(),
+                });
+                node_variables
             }
         };
-        nodes[id].operation = kind;
-        nodes[id].assignment_width = node_variables.len();
         Ok((id, node_variables))
     }
 
@@ -188,6 +273,10 @@ fn compile_term(
     {
         root_permutation.clear();
     }
+    let nodes = nodes
+        .into_iter()
+        .map(|node| node.expect("every compiled node is initialized"))
+        .collect();
     Ok(CompiledTerm {
         nodes,
         variable_nodes,
@@ -195,51 +284,23 @@ fn compile_term(
     })
 }
 
-enum PositionIndex<K> {
-    Hashed(FxHashMap<K, Vec<usize>>),
-    Dense(Vec<Vec<usize>>),
-}
-
-impl<K: Eq + Hash> PositionIndex<K> {
-    fn get(&self, key: &K, dense_key: Option<usize>) -> &[usize] {
-        match self {
-            Self::Hashed(index) => index.get(key).map_or(&[], Vec::as_slice),
-            Self::Dense(index) => &index[dense_key.expect("dense sibling key is missing")],
-        }
-    }
-
-    fn push(&mut self, key: K, dense_key: Option<usize>, item: usize) {
-        match self {
-            Self::Hashed(index) => index.entry(key).or_default().push(item),
-            Self::Dense(index) => {
-                index[dense_key.expect("dense sibling key is missing")].push(item)
-            }
-        }
-    }
-}
-
-struct BinaryIndex<K> {
-    positions: [PositionIndex<K>; 2],
-}
-
-impl<K> BinaryIndex<K> {
-    fn new(dense_key_count: Option<usize>) -> Self {
-        Self {
-            positions: std::array::from_fn(|_| match dense_key_count {
-                Some(count) => PositionIndex::Dense((0..count).map(|_| Vec::new()).collect()),
-                None => PositionIndex::Hashed(FxHashMap::default()),
-            }),
-        }
-    }
-}
-
 /// Materialize the complete bottom-up intersection of `left` with the inverse
-/// homomorphic image of `decomp`, using equality-indexed sibling lookup.
+/// homomorphic image of `decomp`, using `sibling_indexes` for binary joins.
+///
+/// Equal homomorphism right-hand sides share one term program and one term
+/// chart. The returned automaton is the complete packed parse chart, not a
+/// one-best or goal-directed result. Its state IDs index both the returned
+/// `pairs` vector and the states of the returned `Explicit` automaton.
+///
+/// Target operations inside a homomorphic image may have rank at most two, but
+/// source rules may have any arity. Unsupported binary target operations and
+/// higher-rank target operations are reported as errors.
 #[allow(clippy::type_complexity)]
-pub fn materialize_sibling_intersection<D>(
+pub fn materialize_sibling_intersection<D, F>(
     left: &Explicit,
     decomp: &D,
     hom: &Homomorphism,
+    sibling_indexes: &F,
 ) -> Result<
     (
         Explicit,
@@ -250,65 +311,22 @@ pub fn materialize_sibling_intersection<D>(
     SiblingIntersectionError,
 >
 where
-    D: SiblingKeyedTa,
+    D: BottomUpTa,
     D::State: Clone + Eq + Hash,
+    F: SiblingIndexFactory<D>,
 {
-    materialize_sibling_intersection_controlled(left, decomp, hom, &ParseControl::new())
+    let compiled = CompiledSiblingGrammar::new(left, hom)?;
+    engine::materialize_compiled(decomp, &compiled, sibling_indexes, &ParseControl::new())
 }
 
-/// Cancellable counterpart of [`materialize_sibling_intersection`].
-#[allow(clippy::type_complexity)]
-pub(crate) fn materialize_sibling_intersection_controlled<D>(
-    left: &Explicit,
-    decomp: &D,
-    hom: &Homomorphism,
-    control: &ParseControl,
-) -> Result<
-    (
-        Explicit,
-        Interner<D::State>,
-        Vec<(StateId, StateId)>,
-        SiblingIntersectionStats,
-    ),
-    SiblingIntersectionError,
->
-where
-    D: SiblingKeyedTa,
-    D::State: Clone + Eq + Hash,
-{
-    condensed::materialize(left, decomp, hom, control)
-}
-
-#[allow(clippy::type_complexity)]
-pub(crate) fn materialize_sibling_intersection_compiled_controlled<D>(
-    left: &Explicit,
-    decomp: &D,
-    compiled: &CompiledSiblingGrammar,
-    control: &ParseControl,
-) -> Result<
-    (
-        Explicit,
-        Interner<D::State>,
-        Vec<(StateId, StateId)>,
-        SiblingIntersectionStats,
-    ),
-    SiblingIntersectionError,
->
-where
-    D: SiblingKeyedTa,
-    D::State: Clone + Eq + Hash,
-{
-    condensed::materialize_compiled(left, decomp, compiled, control)
-}
-
-mod condensed;
-pub(crate) use condensed::CompiledSiblingGrammar;
+mod engine;
+pub(crate) use engine::{CompiledSiblingGrammar, materialize_compiled};
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        ExplicitBuilder, FxHashSet, StringAlgebra,
+        ExplicitBuilder, FxHashSet, StringAlgebra, StringSiblingIndexFactory,
         materialize_indexed_condensed_intersection_with_pairs,
     };
 
@@ -393,11 +411,14 @@ mod tests {
         let left = builder.build();
 
         let invhom = crate::InvHom::new(decomp.clone(), &hom);
+        let sibling_indexes = StringSiblingIndexFactory;
         let (indexed, indexed_states, indexed_pairs, _) =
             materialize_indexed_condensed_intersection_with_pairs(&left, &invhom);
-        let (sibling, sibling_states, sibling_pairs, _) =
-            materialize_sibling_intersection(&left, &decomp, &hom).unwrap();
+        let (sibling, sibling_states, sibling_pairs, sibling_stats) =
+            materialize_sibling_intersection(&left, &decomp, &hom, &sibling_indexes).unwrap();
 
+        assert_eq!(sibling.rules().count(), indexed.rules().count());
+        assert_eq!(sibling_stats.output_rules, sibling.rules().count());
         assert_eq!(
             normalized_chart(&sibling, &sibling_states, &sibling_pairs),
             normalized_chart(&indexed, &indexed_states, &indexed_pairs)

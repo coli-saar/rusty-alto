@@ -92,7 +92,7 @@ pub enum ParseStrategy {
     TopDownCondensed,
     /// Child-indexed condensed intersection.
     IndexedCondensed,
-    /// Bottom-up equality-indexed sibling-finder intersection.
+    /// Bottom-up sibling-indexed intersection.
     SiblingFinder,
     /// Generic A* with the zero heuristic.
     AstarZero {

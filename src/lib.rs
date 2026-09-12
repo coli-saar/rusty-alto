@@ -115,8 +115,9 @@ pub use algebras::{
     FS_PROJECT_PREFIX, FS_REMAP_PREFIX, FS_UNIFY, FeatureStructure, FeatureStructureAlgebra,
     FeatureStructureAttribute, FeatureStructureFilter, FeatureStructureNode,
     FeatureStructureNodeId, FeatureStructureParseError, SentenceSxHeuristic, Span, StringAlgebra,
-    StringDecompositionAutomaton, TAG_E, TAG_EE, TAG_HOLE, TAG_SUBSTITUTE, TagSpan,
-    TagStringAlgebra, TagStringDecompositionAutomaton, TagStringValue, TagTreeAlgebra,
+    StringDecompositionAutomaton, StringSiblingIndex, StringSiblingIndexFactory, TAG_E, TAG_EE,
+    TAG_HOLE, TAG_SUBSTITUTE, TagSpan, TagStringAlgebra, TagStringDecompositionAutomaton,
+    TagStringSiblingIndex, TagStringSiblingIndexFactory, TagStringValue, TagTreeAlgebra,
     TagTreeContext, TagTreeDecompositionAutomaton, TreeAlgebra, TreeValue, UniversalSxHeuristic,
     WRAP21, WRAP22,
 };
@@ -180,7 +181,7 @@ pub use run::{DetRun, NonDetRun, StateSet, run_det, run_nondet};
 pub use score::{LogProbabilityScorer, ProbabilityScorer, WeightScorer};
 pub use set_trie::{KeySet, SetTrie};
 pub use sibling::{
-    SiblingIntersectionError, SiblingIntersectionStats, SiblingKeyedTa,
+    BinarySiblingIndex, SiblingIndexFactory, SiblingIntersectionError, SiblingIntersectionStats,
     materialize_sibling_intersection,
 };
 pub use signature::{Signature, SignatureError};

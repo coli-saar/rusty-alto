@@ -1,9 +1,9 @@
 use super::Algebra;
 use crate::{
-    BottomUpTa, CondensedTa, DetBottomUpTa, Explicit, FxHashMap, IndexedBottomUpTa, InvHom,
-    OutputCodec, ProbabilityScorer, SiblingKeyedTa, Signature, SpaceJoinCodec, StateId,
-    StateUniverse, Symbol, SymbolSet, TextVisualizationCodec, TopDownTa, VisualRepresentation,
-    WeightScorer,
+    BinarySiblingIndex, BottomUpTa, CondensedTa, DetBottomUpTa, Explicit, FxHashMap,
+    IndexedBottomUpTa, InvHom, OutputCodec, ProbabilityScorer, SiblingIndexFactory, Signature,
+    SpaceJoinCodec, StateId, StateUniverse, Symbol, SymbolSet, TextVisualizationCodec, TopDownTa,
+    VisualRepresentation, WeightScorer,
     heuristic::IntersectionHeuristic,
     homomorphism::{HomLabel, Homomorphism},
 };
@@ -288,6 +288,53 @@ pub struct StringDecompositionAutomaton {
     positions_by_word: FxHashMap<Symbol, Vec<usize>>,
 }
 
+/// Creates dense sibling indexes for a string decomposition automaton.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StringSiblingIndexFactory;
+
+/// Dense partner index for string concatenation.
+#[derive(Debug)]
+pub struct StringSiblingIndex {
+    by_end: Vec<Vec<usize>>,
+    by_start: Vec<Vec<usize>>,
+}
+
+impl BinarySiblingIndex<Span> for StringSiblingIndex {
+    #[inline]
+    fn add(&mut self, position: usize, state: &Span, item: usize) {
+        match position {
+            0 => self.by_end[state.end].push(item),
+            1 => self.by_start[state.start].push(item),
+            _ => unreachable!("binary child position must be zero or one"),
+        }
+    }
+
+    #[inline]
+    fn partners(&self, position: usize, state: &Span) -> &[usize] {
+        match position {
+            0 => &self.by_start[state.end],
+            1 => &self.by_end[state.start],
+            _ => unreachable!("binary child position must be zero or one"),
+        }
+    }
+}
+
+impl SiblingIndexFactory<StringDecompositionAutomaton> for StringSiblingIndexFactory {
+    type Index = StringSiblingIndex;
+
+    fn new_index(
+        &self,
+        decomp: &StringDecompositionAutomaton,
+        symbol: Symbol,
+    ) -> Option<Self::Index> {
+        let boundaries = decomp.len() + 1;
+        (symbol == decomp.concat).then(|| StringSiblingIndex {
+            by_end: (0..boundaries).map(|_| Vec::new()).collect(),
+            by_start: (0..boundaries).map(|_| Vec::new()).collect(),
+        })
+    }
+}
+
 impl StringDecompositionAutomaton {
     /// Build a lazy decomposition automaton for `sentence`.
     pub fn new(concat: Symbol, sentence: Vec<Symbol>) -> Self {
@@ -363,29 +410,6 @@ impl BottomUpTa for StringDecompositionAutomaton {
 
     fn is_accepting(&self, q: &Span) -> bool {
         *q == Span::new(0, self.len())
-    }
-}
-
-impl SiblingKeyedTa for StringDecompositionAutomaton {
-    type Key = usize;
-
-    fn sibling_key(&self, f: Symbol, position: usize, state: &Span) -> Option<Self::Key> {
-        if f != self.concat || !self.valid_span(*state) {
-            return None;
-        }
-        match position {
-            0 => Some(state.end),
-            1 => Some(state.start),
-            _ => None,
-        }
-    }
-
-    fn dense_sibling_key_count(&self) -> Option<usize> {
-        Some(self.len() + 1)
-    }
-
-    fn dense_sibling_key(&self, key: &Self::Key) -> Option<usize> {
-        Some(*key)
     }
 }
 
@@ -1576,15 +1600,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sibling_keys_use_dense_boundary_indices() {
+    fn sibling_index_returns_exact_adjacent_spans() {
         let mut algebra = StringAlgebra::new();
         let word = algebra.intern_word("a");
         let decomposition = algebra.decompose(vec![word, word, word]);
+        let factory = StringSiblingIndexFactory;
+        let mut index = factory
+            .new_index(&decomposition, decomposition.concat_symbol())
+            .unwrap();
+        assert_eq!(index.by_end.len(), 4);
+        assert_eq!(index.by_start.len(), 4);
+        index.add(0, &Span::new(0, 2), 7);
+        index.add(0, &Span::new(1, 3), 8);
 
-        assert_eq!(decomposition.dense_sibling_key_count(), Some(4));
-        for boundary in 0..=3 {
-            assert_eq!(decomposition.dense_sibling_key(&boundary), Some(boundary));
-        }
+        assert_eq!(index.partners(1, &Span::new(2, 3)), &[7]);
+        assert!(index.partners(1, &Span::new(0, 1)).is_empty());
     }
 
     #[test]

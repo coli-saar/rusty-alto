@@ -82,9 +82,12 @@ fn run_sibling_workload(
 ) -> Result<(), String> {
     run_benchmark(args, "implicit", workload, || {
         let result = match args.intersection {
-            IntersectionMode::Sibling => {
-                materialize_sibling_intersection(&workload.left, &workload.decomp, &workload.hom)
-            }
+            IntersectionMode::Sibling => materialize_sibling_intersection(
+                &workload.left,
+                &workload.decomp,
+                &workload.hom,
+                &rusty_alto::StringSiblingIndexFactory,
+            ),
             _ => unreachable!("non-sibling workloads use run_workload"),
         };
         let (chart, _, _, stats) =
@@ -738,8 +741,13 @@ mod tests {
         let (indexed_chart, indexed_states, indexed_pairs, _) =
             materialize_indexed_condensed_intersection_with_pairs(&workload.left, &invhom);
         let (sibling_chart, sibling_states, sibling_pairs, sibling_stats) =
-            materialize_sibling_intersection(&workload.left, &workload.decomp, &workload.hom)
-                .unwrap();
+            materialize_sibling_intersection(
+                &workload.left,
+                &workload.decomp,
+                &workload.hom,
+                &rusty_alto::StringSiblingIndexFactory,
+            )
+            .unwrap();
 
         assert_eq!(indexed.states, eager.states);
         assert_eq!(indexed.rules, eager.rules);

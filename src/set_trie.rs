@@ -151,6 +151,26 @@ where
     }
 }
 
+impl<K, V, S> KeySet<K> for hashbrown::HashMap<K, V, S>
+where
+    K: Eq + Hash,
+    S: BuildHasher,
+{
+    fn len(&self) -> usize {
+        self.len()
+    }
+
+    fn contains(&self, key: &K) -> bool {
+        self.contains_key(key)
+    }
+
+    fn for_each(&self, out: &mut dyn FnMut(&K)) {
+        for key in self.keys() {
+            out(key);
+        }
+    }
+}
+
 impl<K, T> KeySet<K> for &T
 where
     T: KeySet<K> + ?Sized,
@@ -171,7 +191,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::FxHashSet;
+    use crate::{FxHashMap, FxHashSet};
 
     #[test]
     fn visits_values_matching_key_sets() {
@@ -206,5 +226,20 @@ mod tests {
         values.sort_unstable();
 
         assert_eq!(values, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn map_keys_can_constrain_a_lookup_without_an_adapter() {
+        let mut trie = SetTrie::new();
+        trie.get_or_insert_with(&[1], Vec::new).push("a");
+        trie.get_or_insert_with(&[2], Vec::new).push("b");
+
+        let allowed = FxHashMap::from_iter([(2, "associated value is ignored")]);
+        let mut values = Vec::new();
+        trie.for_each_value_for_key_sets(&[&allowed], |found| {
+            values.extend(found.iter().copied());
+        });
+
+        assert_eq!(values, vec!["b"]);
     }
 }

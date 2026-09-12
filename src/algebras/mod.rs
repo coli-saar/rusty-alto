@@ -15,7 +15,8 @@ use std::hash::Hash;
 pub(crate) use string::SpanProductSibling;
 pub(crate) use string::SpanProductSiblingFinder;
 pub use string::{
-    SentenceSxHeuristic, Span, StringAlgebra, StringDecompositionAutomaton, UniversalSxHeuristic,
+    SentenceSxHeuristic, Span, StringAlgebra, StringDecompositionAutomaton, StringSiblingIndex,
+    StringSiblingIndexFactory, UniversalSxHeuristic,
 };
 #[cfg(feature = "experimental-lazy-astar")]
 pub(crate) use string_astar::SpanBinarySiblingGroup;
@@ -24,7 +25,8 @@ pub(crate) use string_astar::{
 };
 pub use tag_string::{
     CONC11, CONC12, CONC21, TAG_E, TAG_EE, TagSpan, TagStringAlgebra,
-    TagStringDecompositionAutomaton, TagStringValue, WRAP21, WRAP22,
+    TagStringDecompositionAutomaton, TagStringSiblingIndex, TagStringSiblingIndexFactory,
+    TagStringValue, WRAP21, WRAP22,
 };
 pub use tag_tree::{
     BinarizedTagTreeDecompositionAutomaton, BinarizedTagTreeState, TAG_HOLE, TAG_SUBSTITUTE,
