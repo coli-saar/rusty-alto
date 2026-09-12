@@ -845,7 +845,7 @@ fn run_chart_strategy(
     let (finalized_states, output_rules) = chart
         .stats
         .first()
-        .map(|s| (s.output_states, s.output_rules))
+        .map(|s| (s.output_states(), s.output_rules()))
         .unwrap_or((0, 0));
 
     let top_start = Instant::now();

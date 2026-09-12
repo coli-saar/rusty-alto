@@ -144,9 +144,12 @@ homomorphism-based string parsing. It builds:
 - the condensed inverse homomorphism of that decomposition automaton.
 
 The benchmark then materializes the intersection of the source automaton with
-the condensed inverse homomorphism. Lexical source labels map to word constants,
-and all binary source labels map to `*(?0, ?1)`, so the workload directly tests
-whether shared homomorphic images are exploited as label sets.
+the inverse homomorphism. Lexical source labels map to word constants, and all
+binary source labels map to `*(?0, ?1)`, so the workload directly tests whether
+shared homomorphic images are exploited as label sets. The Rust harness accepts
+`--intersection eager`, `indexed-condensed`, or `sibling`; the sibling mode
+combines inverse homomorphism and intersection without constructing a separate
+inverse-hom automaton.
 
 Run it with:
 

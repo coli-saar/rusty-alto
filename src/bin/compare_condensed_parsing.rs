@@ -4,8 +4,7 @@ use packed_term_arena::tree::TreeArena;
 use rusty_alto::{
     CondensedTa, Explicit, ExplicitBuilder, HomLabel, Homomorphism, InvHom, Rule, StateId,
     StateUniverse, StringDecompositionAutomaton, Symbol, SymbolSet,
-    materialize_indexed_condensed_intersection, materialize_rule_local_sibling_intersection,
-    materialize_sibling_intersection,
+    materialize_indexed_condensed_intersection, materialize_sibling_intersection,
 };
 use smallvec::SmallVec;
 use std::collections::VecDeque;
@@ -43,19 +42,13 @@ fn run() -> Result<(), String> {
 
     match workload {
         Workload::Explicit(workload) => {
-            if matches!(
-                args.intersection,
-                IntersectionMode::Sibling | IntersectionMode::RuleLocalSibling
-            ) {
+            if matches!(args.intersection, IntersectionMode::Sibling) {
                 return Err("sibling intersection requires the implicit decomposition".to_owned());
             }
             run_workload(&args, "explicit", &workload)
         }
         Workload::Implicit(workload) => {
-            if matches!(
-                args.intersection,
-                IntersectionMode::Sibling | IntersectionMode::RuleLocalSibling
-            ) {
+            if matches!(args.intersection, IntersectionMode::Sibling) {
                 run_sibling_workload(&args, &workload)
             } else {
                 run_workload(&args, "implicit", &workload)
@@ -92,11 +85,6 @@ fn run_sibling_workload(
             IntersectionMode::Sibling => {
                 materialize_sibling_intersection(&workload.left, &workload.decomp, &workload.hom)
             }
-            IntersectionMode::RuleLocalSibling => materialize_rule_local_sibling_intersection(
-                &workload.left,
-                &workload.decomp,
-                &workload.hom,
-            ),
             _ => unreachable!("non-sibling workloads use run_workload"),
         };
         let (chart, _, _, stats) =
@@ -175,7 +163,7 @@ where
                 term_items: 0,
             }
         }
-        IntersectionMode::Sibling | IntersectionMode::RuleLocalSibling => {
+        IntersectionMode::Sibling => {
             unreachable!("sibling workloads use run_sibling_workload")
         }
     }
@@ -263,13 +251,12 @@ enum IntersectionMode {
     Eager,
     IndexedCondensed,
     Sibling,
-    RuleLocalSibling,
 }
 
 impl IntersectionMode {
     fn family_name(self) -> &'static str {
         match self {
-            Self::Sibling | Self::RuleLocalSibling => "sibling-intersection",
+            Self::Sibling => "sibling-intersection",
             Self::Eager | Self::IndexedCondensed => "condensed-invhom",
         }
     }
@@ -279,7 +266,6 @@ impl IntersectionMode {
             Self::Eager => "eager",
             Self::IndexedCondensed => "indexed-condensed",
             Self::Sibling => "sibling",
-            Self::RuleLocalSibling => "rule-local-sibling",
         }
     }
 }
@@ -673,9 +659,8 @@ fn parse_intersection(args: &mut impl Iterator<Item = String>) -> Result<Interse
         "eager" => Ok(IntersectionMode::Eager),
         "indexed-condensed" => Ok(IntersectionMode::IndexedCondensed),
         "sibling" => Ok(IntersectionMode::Sibling),
-        "rule-local-sibling" => Ok(IntersectionMode::RuleLocalSibling),
         other => Err(format!(
-            "invalid value for --intersection: {other:?}; expected eager, indexed-condensed, sibling, or rule-local-sibling"
+            "invalid value for --intersection: {other:?}; expected eager, indexed-condensed, or sibling"
         )),
     }
 }
@@ -686,12 +671,48 @@ fn next_arg(args: &mut impl Iterator<Item = String>, name: &str) -> Result<Strin
 }
 
 fn usage() -> &'static str {
-    "usage: compare_condensed_parsing [--states N] [--len N] [--vocab N] [--lexical-labels N] [--binary-labels N] [--iterations N] [--warmup N] [--decomp explicit|implicit] [--intersection eager|indexed-condensed|sibling|rule-local-sibling]"
+    "usage: compare_condensed_parsing [--states N] [--len N] [--vocab N] [--lexical-labels N] [--binary-labels N] [--iterations N] [--warmup N] [--decomp explicit|implicit] [--intersection eager|indexed-condensed|sibling]"
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusty_alto::{BottomUpTa, Interner, materialize_indexed_condensed_intersection_with_pairs};
+
+    fn normalized_chart(
+        chart: &Explicit,
+        right_states: &Interner<rusty_alto::algebras::Span>,
+        pairs: &[(StateId, StateId)],
+    ) -> (FxHashSet<String>, FxHashSet<String>) {
+        let state = |id: StateId| {
+            let (left, right) = pairs[id.index()];
+            format!("{}:{:?}", left.index(), right_states.resolve(right))
+        };
+        let rules = chart
+            .rules()
+            .map(|rule| {
+                format!(
+                    "{:?}({:?})->{}@{:016x}",
+                    rule.symbol,
+                    rule.children
+                        .iter()
+                        .map(|&child| state(child))
+                        .collect::<Vec<_>>(),
+                    state(rule.result),
+                    rule.weight.to_bits()
+                )
+            })
+            .collect();
+        let accepting = pairs
+            .iter()
+            .enumerate()
+            .filter_map(|(id, _)| {
+                let id = StateId(id as u32);
+                chart.is_accepting(&id).then(|| state(id))
+            })
+            .collect();
+        (rules, accepting)
+    }
 
     #[test]
     fn condensed_algorithms_match_eager_and_share_rhs_items() {
@@ -713,23 +734,21 @@ mod tests {
             &workload.decomp,
             &workload.hom,
         );
-        let (sibling_chart, _, _, sibling_stats) =
+        let invhom = InvHom::new(workload.decomp.clone(), &workload.hom);
+        let (indexed_chart, indexed_states, indexed_pairs, _) =
+            materialize_indexed_condensed_intersection_with_pairs(&workload.left, &invhom);
+        let (sibling_chart, sibling_states, sibling_pairs, sibling_stats) =
             materialize_sibling_intersection(&workload.left, &workload.decomp, &workload.hom)
                 .unwrap();
-        let (rule_local_chart, _, _, rule_local_stats) =
-            materialize_rule_local_sibling_intersection(
-                &workload.left,
-                &workload.decomp,
-                &workload.hom,
-            )
-            .unwrap();
 
         assert_eq!(indexed.states, eager.states);
         assert_eq!(indexed.rules, eager.rules);
         assert_eq!(sibling_chart.num_states() as usize, eager.states);
         assert_eq!(sibling_chart.num_rules(), eager.rules);
-        assert_eq!(rule_local_chart.num_states(), sibling_chart.num_states());
-        assert_eq!(rule_local_chart.num_rules(), sibling_chart.num_rules());
-        assert!(sibling_stats.term_items < rule_local_stats.term_items);
+        assert_eq!(
+            normalized_chart(&sibling_chart, &sibling_states, &sibling_pairs),
+            normalized_chart(&indexed_chart, &indexed_states, &indexed_pairs)
+        );
+        assert!(sibling_stats.term_items > 0);
     }
 }

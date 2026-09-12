@@ -25,7 +25,8 @@ scores.
 - Weighted explicit automata with lazy, arity-specialized indexes.
 - Automaton combinators for products, inverse homomorphisms, symbol mappings,
   and determinization.
-- Efficient condensed intersection for IRTG parsing.
+- Complete-chart IRTG parsing with top-down condensed, child-indexed, and
+  equality-indexed sibling-finder intersection strategies.
 - Exact one-best A* parsing with zero, outside, SX, and SXF heuristics.
 - Viterbi extraction, sorted language enumeration, corpus output, and
   EVALB-style Parseval scoring.

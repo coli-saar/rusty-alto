@@ -191,7 +191,7 @@ pub(crate) struct ProductStateMap {
 }
 
 impl ProductStateMap {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
@@ -207,6 +207,10 @@ impl ProductStateMap {
                 .resize_with(right.index() + 1, FxHashMap::default);
         }
         self.by_right[right.index()].insert(left, product);
+    }
+
+    pub(crate) fn left_partners(&self, right: StateId) -> Option<&FxHashMap<StateId, StateId>> {
+        self.by_right.get(right.index())
     }
 }
 
@@ -1145,7 +1149,7 @@ where
     }
 }
 
-fn current_product_is_latest(
+pub(crate) fn current_product_is_latest(
     children: &SmallVec<[StateId; 2]>,
     current_position: usize,
     current_product: StateId,

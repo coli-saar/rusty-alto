@@ -23,7 +23,10 @@ use crate::{
         materialize_topdown_condensed_intersection,
         materialize_topdown_condensed_intersection_with_pairs_controlled,
     },
-    sibling::materialize_sibling_intersection_controlled,
+    sibling::{
+        SiblingIntersectionError, SiblingIntersectionStats,
+        materialize_sibling_intersection_controlled,
+    },
 };
 use lalrpop_util::ParseError;
 use packed_term_arena::tree::{Tree, TreeArena};
@@ -41,8 +44,18 @@ type GenericChartOutput = (
     Explicit,
     Vec<String>,
     Vec<Vec<String>>,
-    Option<IndexedCondensedIntersectionStats>,
+    Option<MaterializationStats>,
 );
+
+fn map_sibling_error(interpretation: &str, error: SiblingIntersectionError) -> IrtgError {
+    match error {
+        SiblingIntersectionError::Cancelled => IrtgError::Cancelled,
+        error => IrtgError::SiblingIntersection {
+            interpretation: interpretation.to_owned(),
+            source: error,
+        },
+    }
+}
 
 type StringAstarChartOutput = (
     Explicit,
@@ -560,7 +573,7 @@ impl Irtg {
                             state_names =
                                 string_product_state_names(&state_names, &right_states, &pairs);
                             state_parts = product_state_parts(&state_parts, &right_states, &pairs);
-                            stats.push(stat);
+                            stats.push(MaterializationStats::Condensed(stat));
                             c
                         }
                         MaterializationStrategy::IndexedCondensed => {
@@ -572,26 +585,22 @@ impl Irtg {
                             state_names =
                                 string_product_state_names(&state_names, &right_states, &pairs);
                             state_parts = product_state_parts(&state_parts, &right_states, &pairs);
-                            stats.push(stat);
+                            stats.push(MaterializationStats::Condensed(stat));
                             c
                         }
                         MaterializationStrategy::SiblingFinder => {
-                            let (c, right_states, pairs, _stat) =
+                            let (c, right_states, pairs, stat) =
                                 materialize_sibling_intersection_controlled(
                                     &chart,
                                     invhom.inner(),
                                     &interpretation.homomorphism,
                                     control,
                                 )
-                                .map_err(|error| {
-                                    IrtgError::SiblingIntersection {
-                                        interpretation: interpretation.name.clone(),
-                                        message: error.to_string(),
-                                    }
-                                })?;
+                                .map_err(|error| map_sibling_error(&interpretation.name, error))?;
                             state_names =
                                 string_product_state_names(&state_names, &right_states, &pairs);
                             state_parts = product_state_parts(&state_parts, &right_states, &pairs);
+                            stats.push(MaterializationStats::Sibling(stat));
                             c
                         }
                         MaterializationStrategy::Astar {
@@ -623,24 +632,19 @@ impl Irtg {
                     let decomp = interpretation.decompose_tag_string(value)?;
                     let (next_chart, next_names, next_parts, stat) = match strategy {
                         MaterializationStrategy::SiblingFinder => {
-                            let (c, right_states, pairs, _sibling_stats) =
+                            let (c, right_states, pairs, sibling_stats) =
                                 materialize_sibling_intersection_controlled(
                                     &chart,
                                     &decomp,
                                     &interpretation.homomorphism,
                                     control,
                                 )
-                                .map_err(|error| {
-                                    IrtgError::SiblingIntersection {
-                                        interpretation: interpretation.name.clone(),
-                                        message: error.to_string(),
-                                    }
-                                })?;
+                                .map_err(|error| map_sibling_error(&interpretation.name, error))?;
                             (
                                 c,
                                 product_state_names(&state_names, &right_states, &pairs),
                                 product_state_parts(&state_parts, &right_states, &pairs),
-                                None,
+                                Some(MaterializationStats::Sibling(sibling_stats)),
                             )
                         }
                         _ => self.run_generic_chart(
@@ -932,7 +936,12 @@ impl Irtg {
                     .map_err(|_| IrtgError::Cancelled)?;
                 let names = product_state_names(left_state_names, &right_states, &pairs);
                 let parts = product_state_parts(left_state_parts, &right_states, &pairs);
-                Ok((chart, names, parts, Some(stats)))
+                Ok((
+                    chart,
+                    names,
+                    parts,
+                    Some(MaterializationStats::Condensed(stats)),
+                ))
             }
             MaterializationStrategy::IndexedCondensed => {
                 let (chart, right_states, pairs, stats) =
@@ -942,11 +951,16 @@ impl Irtg {
                     .map_err(|_| IrtgError::Cancelled)?;
                 let names = product_state_names(left_state_names, &right_states, &pairs);
                 let parts = product_state_parts(left_state_parts, &right_states, &pairs);
-                Ok((chart, names, parts, Some(stats)))
+                Ok((
+                    chart,
+                    names,
+                    parts,
+                    Some(MaterializationStats::Condensed(stats)),
+                ))
             }
             MaterializationStrategy::SiblingFinder => Err(IrtgError::SiblingIntersection {
                 interpretation: interpretation.to_owned(),
-                message: "the decomposition algebra does not provide sibling keys".to_owned(),
+                source: SiblingIntersectionError::UnsupportedDecomposition,
             }),
             MaterializationStrategy::Astar { heuristic, options } => {
                 let options = AstarOptions {
@@ -1876,8 +1890,37 @@ pub struct ParseChart {
     /// that automaton. For example, string and TAG-string decomposition states
     /// display as `[0-2]` and `[0-2, 3-5]`.
     pub state_parts: Vec<Vec<String>>,
-    /// Per-intersection materialization statistics.
-    pub stats: Vec<IndexedCondensedIntersectionStats>,
+    /// Statistics reported by each chart materialization strategy.
+    ///
+    /// A* chart construction currently does not add an entry.
+    pub stats: Vec<MaterializationStats>,
+}
+
+/// Statistics from one complete-chart materialization step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MaterializationStats {
+    /// Top-down or child-indexed condensed intersection statistics.
+    Condensed(IndexedCondensedIntersectionStats),
+    /// Equality-indexed sibling-finder intersection statistics.
+    Sibling(SiblingIntersectionStats),
+}
+
+impl MaterializationStats {
+    /// Number of product states produced by this materialization step.
+    pub fn output_states(&self) -> usize {
+        match self {
+            Self::Condensed(stats) => stats.output_states,
+            Self::Sibling(stats) => stats.output_states,
+        }
+    }
+
+    /// Number of product rules produced by this materialization step.
+    pub fn output_rules(&self) -> usize {
+        match self {
+            Self::Condensed(stats) => stats.output_rules,
+            Self::Sibling(stats) => stats.output_rules,
+        }
+    }
 }
 
 /// Errors returned by IRTG parsing, construction, and parsing.
@@ -1945,13 +1988,13 @@ pub enum IrtgError {
     },
     /// Sibling-finder intersection is unavailable for an interpretation.
     #[error(
-        "sibling intersection is incompatible with interpretation {interpretation:?}: {message}"
+        "sibling intersection is incompatible with interpretation {interpretation:?}: {source}"
     )]
     SiblingIntersection {
         /// Interpretation name.
         interpretation: String,
-        /// Human-readable incompatibility.
-        message: String,
+        /// Typed reason the strategy cannot process this interpretation.
+        source: SiblingIntersectionError,
     },
     /// A parse strategy selected a heuristic that is not defined for this algebra.
     #[error("heuristic is incompatible with interpretation {interpretation:?}: {message}")]
@@ -2285,6 +2328,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sibling_cancellation_preserves_public_error_contract() {
+        assert!(matches!(
+            map_sibling_error("input", SiblingIntersectionError::Cancelled),
+            IrtgError::Cancelled
+        ));
+    }
+
+    #[test]
     fn parses_tiny_string_irtg_and_accepts_compatible_input() {
         let irtg = parse_irtg(
             br#"
@@ -2569,6 +2620,12 @@ mod tests {
             sibling.automaton.language_cardinality()
         );
         assert!(sibling.automaton.viterbi().is_some());
+        assert_eq!(sibling.stats.len(), 1);
+        let MaterializationStats::Sibling(stats) = sibling.stats[0] else {
+            panic!("sibling parsing must report sibling-finder statistics");
+        };
+        assert_eq!(stats.output_states, sibling.automaton.num_states() as usize);
+        assert_eq!(stats.output_rules, sibling.automaton.num_rules());
     }
 
     #[test]

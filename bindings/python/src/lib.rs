@@ -9,10 +9,11 @@ use rusty_alto::{
     APPEND_SYMBOL, Algebra, AstarHeuristic, AstarOptions, BinarizedTagTreeDecompositionAutomaton,
     BinarizedTagTreeState, Binarizing, BottomUpTa, CondensedTa, DecompositionAutomaton, Explicit,
     ExplicitBuilder, ExplicitWithSignature, FeatureStructure, IndexedBottomUpTa,
-    InputCodecRegistry, Irtg, LanguageCardinality, MaterializationStrategy, ParseControl,
-    Signature, Span, StateId, StateUniverse, StringAlgebra, StringDecompositionAutomaton, Symbol,
-    TagSpan, TagStringAlgebra, TagStringDecompositionAutomaton, TagTreeAlgebra, TagTreeContext,
-    TagTreeDecompositionAutomaton, TopDownTa, VisualRepresentation, ViterbiTree, parse_irtg,
+    InputCodecRegistry, Irtg, LanguageCardinality, MaterializationStats, MaterializationStrategy,
+    ParseControl, Signature, Span, StateId, StateUniverse, StringAlgebra,
+    StringDecompositionAutomaton, Symbol, TagSpan, TagStringAlgebra,
+    TagStringDecompositionAutomaton, TagTreeAlgebra, TagTreeContext, TagTreeDecompositionAutomaton,
+    TopDownTa, VisualRepresentation, ViterbiTree, parse_irtg,
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -2154,13 +2155,16 @@ impl PyIrtg {
         let stats = chart
             .stats
             .iter()
-            .map(|stat| {
-                (
+            .map(|stat| match stat {
+                MaterializationStats::Condensed(stat) => (
                     stat.output_states,
                     stat.output_rules,
                     stat.right_nullary_rules,
                     stat.right_indexed_queries,
-                )
+                ),
+                MaterializationStats::Sibling(stat) => {
+                    (stat.output_states, stat.output_rules, 0, 0)
+                }
             })
             .collect();
         Ok(PyParseChart {

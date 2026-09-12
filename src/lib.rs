@@ -161,8 +161,8 @@ pub use ids::{Arity, StateId, Symbol};
 pub use interner::Interner;
 pub use irtg::{
     AstarHeuristic, DecompositionAutomaton, EvaluatedAlgebraValue, Interpretation, Irtg, IrtgError,
-    MaterializationStrategy, NonNullFilteredChart, ParseChart, ParseInput, TypedInterpretation,
-    parse_irtg,
+    MaterializationStats, MaterializationStrategy, NonNullFilteredChart, ParseChart, ParseInput,
+    TypedInterpretation, parse_irtg,
 };
 pub use language_cardinality::LanguageCardinality;
 pub use materialize::{
@@ -181,7 +181,7 @@ pub use score::{LogProbabilityScorer, ProbabilityScorer, WeightScorer};
 pub use set_trie::{KeySet, SetTrie};
 pub use sibling::{
     SiblingIntersectionError, SiblingIntersectionStats, SiblingKeyedTa,
-    materialize_rule_local_sibling_intersection, materialize_sibling_intersection,
+    materialize_sibling_intersection,
 };
 pub use signature::{Signature, SignatureError};
 pub use sorted_language::{SortedLanguageIterator, WeightedTree};

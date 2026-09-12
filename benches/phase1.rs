@@ -494,7 +494,7 @@ fn irtg_condensed_parsing(c: &mut Criterion) {
                 .unwrap();
             black_box((
                 chart.automaton.rules().count(),
-                chart.stats[0].output_states,
+                chart.stats[0].output_states(),
             ))
         })
     });
