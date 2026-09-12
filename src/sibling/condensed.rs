@@ -3,22 +3,26 @@
 use super::*;
 use crate::{KeySet, SetTrie};
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct RhsItem {
     right: StateId,
-    children: SmallVec<[StateId; 4]>,
 }
 
 struct RhsNodeChart<K> {
     items: Vec<RhsItem>,
+    // Row-major child assignments; every item occupies this node's stride.
+    assignments: Vec<StateId>,
+    assignment_width: usize,
     seen_by_hash: FxHashMap<u64, SmallVec<[usize; 1]>>,
     binary_index: BinaryIndex<K>,
 }
 
-impl<K> Default for RhsNodeChart<K> {
-    fn default() -> Self {
+impl<K> RhsNodeChart<K> {
+    fn new(assignment_width: usize) -> Self {
         Self {
             items: Vec::new(),
+            assignments: Vec::new(),
+            assignment_width,
             seen_by_hash: FxHashMap::default(),
             binary_index: BinaryIndex::default(),
         }
@@ -31,6 +35,7 @@ impl<K> Default for RhsNodeChart<K> {
 struct RhsChart<K> {
     nodes: Vec<RhsNodeChart<K>>,
     agenda: Vec<(usize, usize)>,
+    assignment_scratch: Vec<StateId>,
     root_by_child: Vec<FxHashMap<StateId, Vec<usize>>>,
     // Product IDs below this cutoff already existed when the root was first
     // matched. Later partner-triggered matches need only consider newer IDs.
@@ -40,36 +45,61 @@ struct RhsChart<K> {
 }
 
 impl<K> RhsChart<K> {
-    fn new(node_count: usize, arity: usize) -> Self {
+    fn new(plan: &CompiledTerm) -> Self {
         Self {
-            nodes: (0..node_count).map(|_| RhsNodeChart::default()).collect(),
+            nodes: plan
+                .nodes
+                .iter()
+                .map(|node| RhsNodeChart::new(node.assignment_width))
+                .collect(),
             agenda: Vec::new(),
-            root_by_child: (0..arity).map(|_| FxHashMap::default()).collect(),
+            assignment_scratch: Vec::with_capacity(plan.arity),
+            root_by_child: (0..plan.arity).map(|_| FxHashMap::default()).collect(),
             root_birth: Vec::new(),
-            activated: (0..arity).map(|_| crate::FxHashSet::default()).collect(),
+            activated: (0..plan.arity)
+                .map(|_| crate::FxHashSet::default())
+                .collect(),
             initialized: false,
         }
     }
 }
 
 impl<K: Clone + Eq + Hash> RhsChart<K> {
-    fn insert(&mut self, node: usize, item: RhsItem, stats: &mut SiblingIntersectionStats) {
+    fn insert(
+        &mut self,
+        node: usize,
+        right: StateId,
+        assignment: &[StateId],
+        stats: &mut SiblingIntersectionStats,
+    ) {
         let chart = &mut self.nodes[node];
+        let width = chart.assignment_width;
+        debug_assert_eq!(assignment.len(), width);
         let mut hasher = rustc_hash::FxHasher::default();
-        item.hash(&mut hasher);
+        right.hash(&mut hasher);
+        assignment.hash(&mut hasher);
         let hash = hasher.finish();
-        if chart
-            .seen_by_hash
-            .get(&hash)
-            .is_some_and(|ids| ids.iter().any(|&id| chart.items[id] == item))
-        {
+        if chart.seen_by_hash.get(&hash).is_some_and(|ids| {
+            ids.iter().any(|&id| {
+                let start = id * width;
+                chart.items[id].right == right
+                    && chart.assignments[start..start + width] == assignment[..]
+            })
+        }) {
             return;
         }
         let item_id = chart.items.len();
-        chart.items.push(item);
+        chart.items.push(RhsItem { right });
+        chart.assignments.extend_from_slice(assignment);
         chart.seen_by_hash.entry(hash).or_default().push(item_id);
         self.agenda.push((node, item_id));
         stats.term_items += 1;
+    }
+
+    fn assignment(&self, node: usize, item: usize) -> &[StateId] {
+        let chart = &self.nodes[node];
+        let start = item * chart.assignment_width;
+        &chart.assignments[start..start + chart.assignment_width]
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -87,6 +117,8 @@ impl<K: Clone + Eq + Hash> RhsChart<K> {
     {
         if !self.initialized {
             self.initialized = true;
+            let mut assignment = std::mem::take(&mut self.assignment_scratch);
+            assignment.clear();
             for (node, node_plan) in plan.nodes.iter().enumerate() {
                 let CompiledNode::Operation { symbol, children } = &node_plan.kind else {
                     continue;
@@ -100,16 +132,11 @@ impl<K: Clone + Eq + Hash> RhsChart<K> {
                     results.push(right_states.intern(result));
                 });
                 for right in results {
-                    self.insert(
-                        node,
-                        RhsItem {
-                            right,
-                            children: smallvec::smallvec![StateId::STUCK; plan.arity],
-                        },
-                        stats,
-                    );
+                    self.insert(node, right, &assignment, stats);
                 }
             }
+            assignment.clear();
+            self.assignment_scratch = assignment;
         }
         self.propagate(plan, decomp, right_states, new_roots, stats, control)
     }
@@ -134,13 +161,12 @@ impl<K: Clone + Eq + Hash> RhsChart<K> {
         }
         self.initialize(plan, decomp, right_states, new_roots, stats, control)?;
         self.activated[variable].insert(right);
-        let mut children = smallvec::smallvec![StateId::STUCK; plan.arity];
-        children[variable] = right;
-        self.insert(
-            plan.variable_nodes[variable],
-            RhsItem { right, children },
-            stats,
-        );
+        let mut assignment = std::mem::take(&mut self.assignment_scratch);
+        assignment.clear();
+        assignment.push(right);
+        self.insert(plan.variable_nodes[variable], right, &assignment, stats);
+        assignment.clear();
+        self.assignment_scratch = assignment;
         self.propagate(plan, decomp, right_states, new_roots, stats, control)
     }
 
@@ -157,14 +183,15 @@ impl<K: Clone + Eq + Hash> RhsChart<K> {
     where
         D::State: Clone,
     {
+        let mut assignment = std::mem::take(&mut self.assignment_scratch);
         while let Some((node, item_id)) = self.agenda.pop() {
             control.check()?;
             if node == plan.root {
-                let item = &self.nodes[node].items[item_id];
                 if self.root_birth.len() <= item_id {
                     self.root_birth.resize(item_id + 1, usize::MAX);
                 }
-                for (position, &child) in item.children.iter().enumerate() {
+                for position in 0..plan.arity {
+                    let child = self.assignment(node, item_id)[position];
                     self.root_by_child[position]
                         .entry(child)
                         .or_default()
@@ -183,26 +210,24 @@ impl<K: Clone + Eq + Hash> RhsChart<K> {
             };
             match children.len() {
                 1 => {
-                    let item = self.nodes[node].items[item_id].clone();
+                    let item = self.nodes[node].items[item_id];
                     let raw = right_states.resolve(item.right).clone();
                     stats.right_step_calls += 1;
                     let mut results = SmallVec::<[StateId; 2]>::new();
                     decomp.step(*symbol, &[raw], &mut |result| {
                         results.push(right_states.intern(result));
                     });
+                    copy_assignment_into(
+                        self.assignment(node, item_id),
+                        (link.node == plan.root).then_some(plan.root_permutation.as_slice()),
+                        &mut assignment,
+                    );
                     for right in results {
-                        self.insert(
-                            link.node,
-                            RhsItem {
-                                right,
-                                children: item.children.clone(),
-                            },
-                            stats,
-                        );
+                        self.insert(link.node, right, &assignment, stats);
                     }
                 }
                 2 => {
-                    let item = self.nodes[node].items[item_id].clone();
+                    let item = self.nodes[node].items[item_id];
                     let raw = right_states.resolve(item.right).clone();
                     let Some(key) = decomp.sibling_key(*symbol, link.position, &raw) else {
                         continue;
@@ -225,14 +250,21 @@ impl<K: Clone + Eq + Hash> RhsChart<K> {
                         stats.partner_candidates += 1;
                         let partner = &self.nodes[other_node].items[partner_id];
                         let (left, right) = if link.position == 0 {
-                            (&item, partner)
+                            (item, *partner)
                         } else {
-                            (partner, &item)
+                            (*partner, item)
                         };
-                        let Some(assignments) = merge_assignments(&left.children, &right.children)
-                        else {
-                            continue;
+                        let (left_node, left_id, right_node, right_id) = if link.position == 0 {
+                            (node, item_id, other_node, partner_id)
+                        } else {
+                            (other_node, partner_id, node, item_id)
                         };
+                        merge_assignments_into(
+                            self.assignment(left_node, left_id),
+                            self.assignment(right_node, right_id),
+                            (link.node == plan.root).then_some(plan.root_permutation.as_slice()),
+                            &mut assignment,
+                        );
                         let raw_children = [
                             right_states.resolve(left.right).clone(),
                             right_states.resolve(right.right).clone(),
@@ -243,25 +275,23 @@ impl<K: Clone + Eq + Hash> RhsChart<K> {
                             results.push(right_states.intern(result));
                         });
                         for right in results {
-                            self.insert(
-                                link.node,
-                                RhsItem {
-                                    right,
-                                    children: assignments.clone(),
-                                },
-                                stats,
-                            );
+                            self.insert(link.node, right, &assignment, stats);
                         }
                     }
                 }
                 _ => unreachable!("rank above two was rejected while compiling"),
             }
         }
+        assignment.clear();
+        self.assignment_scratch = assignment;
         Ok(())
     }
 
-    fn root(&self, plan: &CompiledTerm, root: usize) -> &RhsItem {
-        &self.nodes[plan.root].items[root]
+    fn root<'a>(&'a self, plan: &CompiledTerm, root: usize) -> (StateId, &'a [StateId]) {
+        (
+            self.nodes[plan.root].items[root].right,
+            self.assignment(plan.root, root),
+        )
     }
 
     fn roots_with_child(&self, position: usize, right: StateId) -> &[usize] {
@@ -282,18 +312,40 @@ impl<K: Clone + Eq + Hash> RhsChart<K> {
     }
 }
 
-fn merge_assignments(left: &[StateId], right: &[StateId]) -> Option<SmallVec<[StateId; 4]>> {
-    let mut merged = SmallVec::from_slice(left);
-    for (slot, &state) in right.iter().enumerate() {
-        if state == StateId::STUCK {
-            continue;
+fn merge_assignments_into(
+    left: &[StateId],
+    right: &[StateId],
+    permutation: Option<&[usize]>,
+    merged: &mut Vec<StateId>,
+) {
+    merged.clear();
+    let Some(permutation) = permutation.filter(|order| !order.is_empty()) else {
+        merged.extend_from_slice(left);
+        merged.extend_from_slice(right);
+        return;
+    };
+    merged.reserve(permutation.len());
+    for &offset in permutation {
+        if offset < left.len() {
+            merged.push(left[offset]);
+        } else {
+            merged.push(right[offset - left.len()]);
         }
-        if merged[slot] != StateId::STUCK && merged[slot] != state {
-            return None;
-        }
-        merged[slot] = state;
     }
-    Some(merged)
+}
+
+fn copy_assignment_into(
+    source: &[StateId],
+    permutation: Option<&[usize]>,
+    target: &mut Vec<StateId>,
+) {
+    target.clear();
+    let Some(permutation) = permutation.filter(|order| !order.is_empty()) else {
+        target.extend_from_slice(source);
+        return;
+    };
+    target.reserve(permutation.len());
+    target.extend(permutation.iter().map(|&offset| source[offset]));
 }
 
 struct ProductLeftSet<'a>(&'a FxHashMap<StateId, StateId>);
@@ -317,7 +369,8 @@ impl KeySet<StateId> for ProductLeftSet<'_> {
 #[allow(clippy::too_many_arguments)]
 fn try_emit<D: BottomUpTa>(
     rule_id: usize,
-    root: &RhsItem,
+    root_right: StateId,
+    root_children: &[StateId],
     rules: &[LeftRule],
     left: &Explicit,
     decomp: &D,
@@ -333,7 +386,7 @@ fn try_emit<D: BottomUpTa>(
         return;
     }
     let mut product_children = SmallVec::<[StateId; 2]>::new();
-    for (&left_child, &right_child) in rule.children.iter().zip(&root.children) {
+    for (&left_child, &right_child) in rule.children.iter().zip(root_children) {
         let Some(product) = products.get(left_child, right_child) else {
             return;
         };
@@ -356,7 +409,7 @@ fn try_emit<D: BottomUpTa>(
     }
     let (parent, is_new) = product_id(
         rule.result,
-        root.right,
+        root_right,
         left,
         decomp,
         right_states,
@@ -365,7 +418,7 @@ fn try_emit<D: BottomUpTa>(
         builder,
     );
     if is_new {
-        agenda.push_back((rule.result, root.right, parent));
+        agenda.push_back((rule.result, root_right, parent));
     }
     builder.add_weighted_rule_inline(rule.symbol, product_children, parent, rule.weight);
 }
@@ -438,10 +491,7 @@ where
         }
     }
 
-    let mut charts: Vec<RhsChart<D::Key>> = programs
-        .iter()
-        .map(|program| RhsChart::new(program.nodes.len(), program.arity))
-        .collect();
+    let mut charts: Vec<RhsChart<D::Key>> = programs.iter().map(RhsChart::new).collect();
     let mut right_states = Interner::new();
     let mut products = ProductMap::default();
     let mut pairs = Vec::new();
@@ -471,14 +521,15 @@ where
         )?;
         for root_id in new_roots.drain(..) {
             charts[program].mark_root_born(root_id, pairs.len());
-            let root = charts[program].root(&programs[program], root_id);
+            let (root_right, root_children) = charts[program].root(&programs[program], root_id);
             program_left_indexes[program].for_each_value_for_key_sets(
                 &[] as &[ProductLeftSet<'_>],
                 |candidate_rules| {
                     for &rule_id in candidate_rules {
                         try_emit(
                             rule_id,
-                            root,
+                            root_right,
+                            root_children,
                             &rules,
                             left,
                             decomp,
@@ -527,10 +578,10 @@ where
 
             for root_id in new_roots.drain(..) {
                 charts[program].mark_root_born(root_id, pairs.len());
-                let root = charts[program].root(&programs[program], root_id);
+                let (root_right, root_children) = charts[program].root(&programs[program], root_id);
                 let mut child_sets = SmallVec::<[ProductLeftSet<'_>; 4]>::new();
                 let mut complete = true;
-                for child in &root.children {
+                for child in root_children {
                     if let Some(row) = products.by_right.get(child.index()) {
                         child_sets.push(ProductLeftSet(row));
                     } else {
@@ -549,7 +600,8 @@ where
                 for &candidate in &candidate_rules {
                     try_emit(
                         candidate,
-                        root,
+                        root_right,
+                        root_children,
                         &rules,
                         left,
                         decomp,
@@ -570,11 +622,12 @@ where
             let root_count = existing_counts[slot];
             for index in 0..root_count {
                 let root_id = charts[program].roots_with_child(position, right_state)[index];
-                let root = charts[program].root(&programs[program], root_id);
+                let (root_right, root_children) = charts[program].root(&programs[program], root_id);
                 let root_birth = charts[program].root_birth(root_id);
                 try_emit(
                     rule_id,
-                    root,
+                    root_right,
+                    root_children,
                     &rules,
                     left,
                     decomp,
@@ -596,4 +649,84 @@ where
     let chart = builder.build_trusted();
     stats.output_rules = chart.rules().count();
     Ok((chart, right_states, pairs, stats))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assignments_use_node_local_width_and_participate_in_item_identity() {
+        let plan = CompiledTerm {
+            nodes: vec![
+                NodePlan {
+                    parent: None,
+                    kind: CompiledNode::Pending,
+                    assignment_width: 1,
+                },
+                NodePlan {
+                    parent: None,
+                    kind: CompiledNode::Pending,
+                    assignment_width: 3,
+                },
+            ],
+            root: 1,
+            variable_nodes: Vec::new(),
+            root_permutation: SmallVec::new(),
+            arity: 3,
+        };
+        let mut chart = RhsChart::<usize>::new(&plan);
+        let mut stats = SiblingIntersectionStats::default();
+        let first = [StateId(0), StateId(1), StateId(2)];
+        let second = [StateId(0), StateId(1), StateId(3)];
+
+        chart.insert(0, StateId(7), &[StateId(1)], &mut stats);
+        chart.insert(1, StateId(7), &first, &mut stats);
+        chart.insert(1, StateId(7), &first, &mut stats);
+        chart.insert(1, StateId(7), &second, &mut stats);
+
+        assert_eq!(chart.nodes[0].assignments.len(), 1);
+        assert_eq!(chart.nodes[1].items.len(), 2);
+        assert_eq!(chart.nodes[1].assignments.len(), 6);
+        assert_eq!(chart.assignment(1, 0), first);
+        assert_eq!(chart.assignment(1, 1), second);
+        assert_eq!(stats.term_items, 3);
+    }
+
+    #[test]
+    fn root_assignment_is_reordered_without_per_item_storage() {
+        let mut assignment = Vec::new();
+        merge_assignments_into(
+            &[StateId(10), StateId(20)],
+            &[StateId(30)],
+            Some(&[2, 0, 1]),
+            &mut assignment,
+        );
+        assert_eq!(assignment, [StateId(30), StateId(10), StateId(20)]);
+
+        copy_assignment_into(
+            &[StateId(10), StateId(20), StateId(30)],
+            Some(&[2, 0, 1]),
+            &mut assignment,
+        );
+        assert_eq!(assignment, [StateId(30), StateId(10), StateId(20)]);
+    }
+
+    #[test]
+    fn compilation_records_only_a_root_permutation() {
+        let mut arena = TreeArena::new();
+        let variable_one = arena.add_node(HomLabel::Var(1), Vec::new());
+        let variable_zero = arena.add_node(HomLabel::Var(0), Vec::new());
+        let root = arena.add_node(
+            HomLabel::Symbol(Symbol(0)),
+            vec![variable_one, variable_zero],
+        );
+
+        let plan = compile_term(&arena, root, 2).unwrap();
+
+        assert_eq!(plan.root_permutation.as_slice(), [1, 0]);
+        assert_eq!(plan.nodes[plan.variable_nodes[1]].assignment_width, 1);
+        assert_eq!(plan.nodes[plan.variable_nodes[0]].assignment_width, 1);
+        assert_eq!(plan.nodes[plan.root].assignment_width, 2);
+    }
 }

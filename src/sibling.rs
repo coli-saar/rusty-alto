@@ -100,12 +100,15 @@ enum CompiledNode {
 struct NodePlan {
     parent: Option<ParentLink>,
     kind: CompiledNode,
+    assignment_width: usize,
 }
 
 struct CompiledTerm {
     nodes: Vec<NodePlan>,
     root: usize,
     variable_nodes: Vec<usize>,
+    /// Root assignment offsets in source-child order; empty means identity.
+    root_permutation: SmallVec<[usize; 4]>,
     arity: usize,
 }
 
@@ -120,17 +123,18 @@ fn compile_term(
         parent: Option<ParentLink>,
         nodes: &mut Vec<NodePlan>,
         variables: &mut [usize],
-    ) -> Result<usize, SiblingIntersectionError> {
+    ) -> Result<(usize, SmallVec<[usize; 4]>), SiblingIntersectionError> {
         let id = nodes.len();
         nodes.push(NodePlan {
             parent,
             kind: CompiledNode::Pending,
+            assignment_width: 0,
         });
 
-        nodes[id].kind = match *arena.get_label(term) {
+        let (kind, node_variables) = match *arena.get_label(term) {
             HomLabel::Var(position) => {
                 variables[position] = id;
-                CompiledNode::Variable
+                (CompiledNode::Variable, smallvec::smallvec![position])
             }
             HomLabel::Symbol(symbol) => {
                 let term_children = arena.get_children(term);
@@ -141,29 +145,46 @@ fn compile_term(
                     });
                 }
                 let mut children = SmallVec::new();
+                let mut node_variables = SmallVec::new();
                 for (position, &child) in term_children.iter().enumerate() {
-                    children.push(visit(
+                    let (child, child_variables) = visit(
                         arena,
                         child,
                         Some(ParentLink { node: id, position }),
                         nodes,
                         variables,
-                    )?);
+                    )?;
+                    children.push(child);
+                    node_variables.extend_from_slice(&child_variables);
                 }
-                CompiledNode::Operation { symbol, children }
+                (CompiledNode::Operation { symbol, children }, node_variables)
             }
         };
-        Ok(id)
+        nodes[id].kind = kind;
+        nodes[id].assignment_width = node_variables.len();
+        Ok((id, node_variables))
     }
 
     let mut nodes = Vec::new();
     let mut variable_nodes = vec![usize::MAX; arity];
-    let root = visit(arena, root, None, &mut nodes, &mut variable_nodes)?;
+    let (root, root_variables) = visit(arena, root, None, &mut nodes, &mut variable_nodes)?;
     debug_assert!(variable_nodes.iter().all(|&node| node != usize::MAX));
+    let mut root_permutation = smallvec::smallvec![0; arity];
+    for (offset, &variable) in root_variables.iter().enumerate() {
+        root_permutation[variable] = offset;
+    }
+    if root_permutation
+        .iter()
+        .enumerate()
+        .all(|(source, &offset)| source == offset)
+    {
+        root_permutation.clear();
+    }
     Ok(CompiledTerm {
         nodes,
         root,
         variable_nodes,
+        root_permutation,
         arity,
     })
 }
